@@ -1,0 +1,14 @@
+server:
+  port: 8443
+
+app.broker:
+  configs:
+    local:
+      queueManager: QM1
+      channel: DEV.APP.SVRCONN
+      connName: localhost(1414)
+      user: app
+      password: passw0rd
+      sslClipherSuite: ""
+      request: REQUEST.QUEUE
+      response: RESPONSE.QUEUE
