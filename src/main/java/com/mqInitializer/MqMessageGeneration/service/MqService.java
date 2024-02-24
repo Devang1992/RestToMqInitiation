@@ -22,7 +22,7 @@ public class MqService {
             case null, default -> queueProperties.getConfigs().get("default").getRequest();
         };
         mqinitiator.sendMessage(destination, request,
-                httpHeaders.getFirst(CORRELATION_ID_HEADER_NAME));
+                httpHeaders.getFirst(CORRELATION_ID_HEADER_NAME), httpHeaders.getFirst(ENVIRONMENT_HEADER_NAME));
         return new ResponseEntities(type, httpHeaders.getFirst(CORRELATION_ID_HEADER_NAME), destination);
     }
 }

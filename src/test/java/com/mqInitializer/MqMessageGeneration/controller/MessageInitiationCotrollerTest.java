@@ -21,7 +21,7 @@ class MessageInitiationCotrollerTest {
     @BeforeEach
     void init() {
         requestBody = "TestBody";
-        responseEntities = new ResponseEntities("Test", "Test1", "Destination");
+        responseEntities = new ResponseEntities("JSON", "Test1", "Destination");
         httpHeaders = new HttpHeaders();
         httpHeaders.set("jms-correlation-id", "Test1");
         mqService = mock(MqService.class);
