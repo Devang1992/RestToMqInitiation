@@ -18,7 +18,7 @@ public class MqService {
     public ResponseEntities mqServiceInitiator(HttpHeaders httpHeaders, String request) {
         String type = request.contains("</") ? "XML" : "JSON";
         String destination = switch (httpHeaders.getFirst(ENVIRONMENT_HEADER_NAME)) {
-            case "dev" -> queueProperties.getConfigs().get("dev").getRequest();
+            case "local" -> queueProperties.getConfigs().get("local").getRequest();
             case null, default -> queueProperties.getConfigs().get("default").getRequest();
         };
         mqinitiator.sendMessage(destination, request,

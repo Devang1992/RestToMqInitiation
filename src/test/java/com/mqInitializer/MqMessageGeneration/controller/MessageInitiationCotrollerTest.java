@@ -8,8 +8,7 @@ import org.springframework.http.HttpHeaders;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.*;
 
 class MessageInitiationCotrollerTest {
 
@@ -17,9 +16,11 @@ class MessageInitiationCotrollerTest {
     private MqService mqService;
     private HttpHeaders httpHeaders;
     private ResponseEntities responseEntities;
+    private String requestBody;
 
     @BeforeEach
     void init() {
+        requestBody = "TestBody";
         responseEntities = new ResponseEntities("Test", "Test1", "Destination");
         httpHeaders = new HttpHeaders();
         httpHeaders.set("jms-correlation-id", "Test1");
@@ -31,7 +32,8 @@ class MessageInitiationCotrollerTest {
 
     @Test
     void mqMessageInitiator() {
-        assertEquals(responseEntities,
-                messageInitiationCotroller.mqMessageInitiator(httpHeaders, "Test"));
+        ResponseEntities testEntities = messageInitiationCotroller.mqMessageInitiator(httpHeaders, requestBody);
+        assertEquals(responseEntities, testEntities);
+        verify(mqService, times(1)).mqServiceInitiator(httpHeaders, requestBody);
     }
 }
