@@ -8,3 +8,7 @@ Download IBM MQ in docker. Follow instructions to run IBM mq locally for develop
 
 ### Postman Collection
 * scr/test/resources/postman.json
+
+### Future Scope:
+
+* Add Listener (For Upstream async communication), Kafka, UI Capabilities 

@@ -1,0 +1,49 @@
+{
+	"info": {
+		"_postman_id": "ef9bbcbe-abb5-407c-8495-5a069a752543",
+		"name": "MQ Message Initiatior",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		"_exporter_id": "17856082"
+	},
+	"item": [
+		{
+			"name": "New Request",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "jms-correlation-id",
+						"value": "123",
+						"type": "text"
+					},
+					{
+						"key": "env-id",
+						"value": "local",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\"testFiled\": \"TestFiled\"}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "http://localhost:8443/v1",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8443",
+					"path": [
+						"v1"
+					]
+				}
+			},
+			"response": []
+		}
+	]
+}
