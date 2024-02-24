@@ -10,5 +10,5 @@ app.broker:
       user: app
       password: passw0rd
       sslClipherSuite: ""
-      request: REQUEST.QUEUE
-      response: RESPONSE.QUEUE
+      request: DEV.QUEUE.1
+#      response: RESPONSE.QUEUE
