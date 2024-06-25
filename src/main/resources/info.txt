@@ -1,0 +1,135 @@
+<dependencies>
+    <!-- Spring Boot Starter for JMS -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-jms</artifactId>
+    </dependency>
+
+    <!-- IBM MQ -->
+    <dependency>
+        <groupId>com.ibm.mq</groupId>
+        <artifactId>com.ibm.mq.allclient</artifactId>
+        <version>9.2.0.1</version>
+    </dependency>
+
+    <!-- Atomikos dependencies -->
+    <dependency>
+        <groupId>com.atomikos</groupId>
+        <artifactId>transactions-jta</artifactId>
+        <version>5.0.9</version>
+    </dependency>
+    <dependency>
+        <groupId>com.atomikos</groupId>
+        <artifactId>transactions-spring</artifactId>
+        <version>5.0.9</version>
+    </dependency>
+</dependencies>
+
+import com.atomikos.icatch.jta.UserTransactionImp;
+import com.atomikos.icatch.jta.UserTransactionManager;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.transaction.jta.JtaTransactionManager;
+
+import javax.transaction.TransactionManager;
+import javax.transaction.UserTransaction;
+
+@Configuration
+public class JtaTransactionManagerConfig {
+
+    @Bean(name = "userTransaction")
+    public UserTransaction userTransaction() throws Throwable {
+        UserTransactionImp userTransactionImp = new UserTransactionImp();
+        userTransactionImp.setTransactionTimeout(300);
+        return userTransactionImp;
+    }
+
+    @Bean(name = "atomikosTransactionManager", initMethod = "init")
+    public TransactionManager atomikosTransactionManager() throws Throwable {
+        UserTransactionManager userTransactionManager = new UserTransactionManager();
+        userTransactionManager.setForceShutdown(false);
+        return userTransactionManager;
+    }
+
+    @Bean
+    public JtaTransactionManager transactionManager() throws Throwable {
+        return new JtaTransactionManager(userTransaction(), atomikosTransactionManager());
+    }
+}
+
+
+import com.ibm.mq.jms.MQXAConnectionFactory;
+import com.atomikos.jms.AtomikosConnectionFactoryBean;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.jms.annotation.EnableJms;
+import org.springframework.jms.core.JmsTemplate;
+
+import javax.jms.JMSException;
+
+@Configuration
+@EnableJms
+public class JmsConfig {
+
+    @Bean
+    public AtomikosConnectionFactoryBean connectionFactory1() throws JMSException {
+        MQXAConnectionFactory mqxaConnectionFactory = new MQXAConnectionFactory();
+        mqxaConnectionFactory.setHostName("hostname1");
+        mqxaConnectionFactory.setPort(1414);
+        mqxaConnectionFactory.setQueueManager("QM1");
+        mqxaConnectionFactory.setChannel("CHANNEL1");
+
+        AtomikosConnectionFactoryBean atomikosConnectionFactory = new AtomikosConnectionFactoryBean();
+        atomikosConnectionFactory.setUniqueResourceName("mq1");
+        atomikosConnectionFactory.setXaConnectionFactory(mqxaConnectionFactory);
+        atomikosConnectionFactory.setPoolSize(10);
+        return atomikosConnectionFactory;
+    }
+
+    @Bean
+    public AtomikosConnectionFactoryBean connectionFactory2() throws JMSException {
+        MQXAConnectionFactory mqxaConnectionFactory = new MQXAConnectionFactory();
+        mqxaConnectionFactory.setHostName("hostname2");
+        mqxaConnectionFactory.setPort(1414);
+        mqxaConnectionFactory.setQueueManager("QM2");
+        mqxaConnectionFactory.setChannel("CHANNEL2");
+
+        AtomikosConnectionFactoryBean atomikosConnectionFactory = new AtomikosConnectionFactoryBean();
+        atomikosConnectionFactory.setUniqueResourceName("mq2");
+        atomikosConnectionFactory.setXaConnectionFactory(mqxaConnectionFactory);
+        atomikosConnectionFactory.setPoolSize(10);
+        return atomikosConnectionFactory;
+    }
+
+    @Bean
+    public JmsTemplate jmsTemplate1() throws JMSException {
+        return new JmsTemplate(connectionFactory1());
+    }
+
+    @Bean
+    public JmsTemplate jmsTemplate2() throws JMSException {
+        return new JmsTemplate(connectionFactory2());
+    }
+}
+
+import org.springframework.jms.core.JmsTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class JmsTransactionalService {
+
+    private final JmsTemplate jmsTemplate1;
+    private final JmsTemplate jmsTemplate2;
+
+    public JmsTransactionalService(JmsTemplate jmsTemplate1, JmsTemplate jmsTemplate2) {
+        this.jmsTemplate1 = jmsTemplate1;
+        this.jmsTemplate2 = jmsTemplate2;
+    }
+
+    @Transactional
+    public void sendMessages() {
+        jmsTemplate1.convertAndSend("queue1", "Message to Queue 1");
+        jmsTemplate2.convertAndSend("queue2", "Message to Queue 2");
+    }
+}
