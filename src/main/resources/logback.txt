@@ -1,0 +1,111 @@
+Steps to Implement Audit Logging for MQ Operations
+Configure Logging Framework: Ensure you have a logging framework (like SLF4J with Logback) configured in your Spring Boot application.
+
+Create an Audit Logger: Define a logger specifically for audit purposes.
+
+Log Audit Events: Add audit logging at strategic points in your code, particularly when messages are consumed from or sent to a queue.
+
+Example Implementation
+Configure Logging Framework
+Ensure you have the necessary dependencies and configuration in your pom.xml and application.properties or logback-spring.xml.
+
+Dependencies (pom.xml):
+
+xml
+Copy code
+<dependencies>
+    <!-- Logging Dependencies -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-logging</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>ch.qos.logback</groupId>
+        <artifactId>logback-classic</artifactId>
+    </dependency>
+</dependencies>
+Logging Configuration (logback-spring.xml):
+
+xml
+Copy code
+<configuration>
+    <!-- Audit logs configuration -->
+    <appender name="AUDIT_LOG" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>audit.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <fileNamePattern>audit.%d{yyyy-MM-dd}.log</fileNamePattern>
+        </rollingPolicy>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss} %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <logger name="AuditLogger" level="INFO" additivity="false">
+        <appender-ref ref="AUDIT_LOG" />
+    </logger>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE" />
+    </root>
+</configuration>
+Create an Audit Logger
+Audit Logger Component:
+
+java
+Copy code
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+@Component
+public class AuditLogger {
+    private static final Logger auditLogger = LoggerFactory.getLogger("AuditLogger");
+
+    public void logMessage(String message) {
+        auditLogger.info(message);
+    }
+}
+Log Audit Events in MQ Operations
+MQ Listener and Sender Service:
+
+java
+Copy code
+import org.springframework.jms.annotation.JmsListener;
+import org.springframework.jms.core.JmsTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class MqService {
+
+    private final JmsTemplate jmsTemplate;
+    private final AuditLogger auditLogger;
+
+    public MqService(JmsTemplate jmsTemplate, AuditLogger auditLogger) {
+        this.jmsTemplate = jmsTemplate;
+        this.auditLogger = auditLogger;
+    }
+
+    @JmsListener(destination = "sourceQueue")
+    @Transactional
+    public void receiveMessage(String message) {
+        auditLogger.logMessage("Received message from sourceQueue: " + message);
+
+        // Process the message
+        String processedMessage = processMessage(message);
+
+        // Send to another queue
+        jmsTemplate.convertAndSend("destinationQueue", processedMessage);
+        auditLogger.logMessage("Sent message to destinationQueue: " + processedMessage);
+    }
+
+    private String processMessage(String message) {
+        // Message processing logic
+        return "Processed: " + message;
+    }
+}
+Summary
+Logging Framework: Ensure SLF4J with Logback is configured correctly.
+Audit Logger: Create a dedicated logger for audit purposes.
+MQ Operations: Integrate audit logging into your MQ listener and sender operations.
+This setup ensures that important events, such as receiving and sending messages, are logged for auditing purposes. This approach provides a clear audit trail that can be monitored and analyzed for security and compliance purposes.
