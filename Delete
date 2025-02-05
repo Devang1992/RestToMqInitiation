@@ -230,3 +230,11 @@ const App = () => {
 };
 
 export default App;
+
+
+
+npx create-next-app@latest my-app --typescript --tailwind --eslint
+cd my-app
+npx shadcn-ui@latest init
+
+npx shadcn-ui@latest add card input button select textarea alert
