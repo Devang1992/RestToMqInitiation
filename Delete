@@ -1,0 +1,232 @@
+import React, { useState } from 'react';
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Textarea } from "@/components/ui/textarea";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Home, Archive, Settings } from 'lucide-react';
+
+const App = () => {
+  const [activeTab, setActiveTab] = useState('initiate');
+  const [formData, setFormData] = useState({
+    correlationId: "",
+    consumerId: "",
+    environmentId: "local",
+    shouldSend: "",
+    howMany: "",
+    queueName: "",
+    correlationIdBytes: "",
+    payload: ""
+  });
+  const [error, setError] = useState(null);
+  const [response, setResponse] = useState(null);
+
+  const handleChange = (name, value) => {
+    setFormData(prev => ({
+      ...prev,
+      [name]: value
+    }));
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setError(null);
+    setResponse(null);
+
+    // ... rest of your submit logic
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-b from-gray-50 to-gray-100">
+      <nav className="bg-white border-b border-gray-200">
+        <div className="max-w-7xl mx-auto px-4">
+          <div className="flex h-16 items-center justify-between">
+            <div className="flex items-center">
+              <Settings className="h-8 w-8 text-blue-600" />
+              <span className="ml-2 text-xl font-bold bg-gradient-to-r from-blue-600 to-blue-400 bg-clip-text text-transparent">
+                MQ Admin Console
+              </span>
+            </div>
+            <div className="flex space-x-8">
+              <button
+                onClick={() => setActiveTab('initiate')}
+                className={`flex items-center space-x-2 px-3 py-2 rounded-md transition-colors ${
+                  activeTab === 'initiate' 
+                    ? 'bg-blue-50 text-blue-600' 
+                    : 'text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                <Home className="h-5 w-5" />
+                <span>Initiate</span>
+              </button>
+              <button
+                onClick={() => setActiveTab('archival')}
+                className={`flex items-center space-x-2 px-3 py-2 rounded-md transition-colors ${
+                  activeTab === 'archival' 
+                    ? 'bg-blue-50 text-blue-600' 
+                    : 'text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                <Archive className="h-5 w-5" />
+                <span>Message Archival</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </nav>
+
+      <main className="max-w-7xl mx-auto py-8 px-4">
+        {activeTab === 'initiate' ? (
+          <Card className="bg-white/50 backdrop-blur-sm border-0 shadow-xl">
+            <CardHeader className="border-b border-gray-100">
+              <CardTitle className="text-2xl font-semibold text-gray-800">Message Queue Initiation</CardTitle>
+            </CardHeader>
+            <CardContent className="pt-6">
+              <form onSubmit={handleSubmit} className="space-y-6">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-gray-700 flex items-center">
+                      Correlation ID
+                      <span className="ml-1 text-red-500">*</span>
+                    </label>
+                    <Input
+                      type="text"
+                      value={formData.correlationId}
+                      onChange={(e) => handleChange("correlationId", e.target.value)}
+                      className="border-gray-200 focus:ring-blue-500"
+                      placeholder="Enter correlation ID"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-gray-700">
+                      Consumer ID
+                    </label>
+                    <Input
+                      type="text"
+                      value={formData.consumerId}
+                      onChange={(e) => handleChange("consumerId", e.target.value)}
+                      className="border-gray-200 focus:ring-blue-500"
+                      placeholder="Enter consumer ID"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-gray-700">
+                      Environment
+                    </label>
+                    <Select 
+                      value={formData.environmentId}
+                      onValueChange={(value) => handleChange("environmentId", value)}
+                    >
+                      <SelectTrigger className="border-gray-200">
+                        <SelectValue placeholder="Select environment" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="local">Local</SelectItem>
+                        <SelectItem value="SIT1">SIT1</SelectItem>
+                        <SelectItem value="SIT2">SIT2</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-gray-700">
+                      Should Send More?
+                    </label>
+                    <Input
+                      type="text"
+                      value={formData.shouldSend}
+                      onChange={(e) => handleChange("shouldSend", e.target.value)}
+                      className="border-gray-200 focus:ring-blue-500"
+                      placeholder="Yes/No"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-gray-700">
+                      Number of Times
+                    </label>
+                    <Input
+                      type="number"
+                      value={formData.howMany}
+                      onChange={(e) => handleChange("howMany", e.target.value)}
+                      className="border-gray-200 focus:ring-blue-500"
+                      placeholder="Enter count"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-gray-700">
+                      Queue Name
+                    </label>
+                    <Input
+                      type="text"
+                      value={formData.queueName}
+                      onChange={(e) => handleChange("queueName", e.target.value)}
+                      className="border-gray-200 focus:ring-blue-500"
+                      placeholder="Enter queue name"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-gray-700">
+                      Correlation ID in bytes
+                    </label>
+                    <Input
+                      type="text"
+                      value={formData.correlationIdBytes}
+                      onChange={(e) => handleChange("correlationIdBytes", e.target.value)}
+                      className="border-gray-200 focus:ring-blue-500"
+                      placeholder="Enter bytes"
+                    />
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-sm font-medium text-gray-700">
+                    Payload
+                  </label>
+                  <Textarea
+                    value={formData.payload}
+                    onChange={(e) => handleChange("payload", e.target.value)}
+                    className="min-h-[100px] border-gray-200 focus:ring-blue-500"
+                    placeholder="Enter payload data"
+                  />
+                </div>
+
+                {error && (
+                  <Alert variant="destructive" className="bg-red-50 border-red-200">
+                    <AlertDescription>{error}</AlertDescription>
+                  </Alert>
+                )}
+
+                {response && (
+                  <Alert className="bg-green-50 border-green-200">
+                    <AlertDescription>
+                      <pre className="whitespace-pre-wrap">{JSON.stringify(response, null, 2)}</pre>
+                    </AlertDescription>
+                  </Alert>
+                )}
+
+                <Button 
+                  type="submit" 
+                  className="w-full bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-700 hover:to-blue-600"
+                >
+                  Send Message
+                </Button>
+              </form>
+            </CardContent>
+          </Card>
+        ) : (
+          <div className="flex items-center justify-center h-64 text-gray-500">
+            Message Archival feature coming soon...
+          </div>
+        )}
+      </main>
+    </div>
+  );
+};
+
+export default App;
