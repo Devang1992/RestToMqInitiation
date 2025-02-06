@@ -1,28 +1,46 @@
-import React, { useState } from 'react';
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Button } from "@/components/ui/button";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Textarea } from "@/components/ui/textarea";
-import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Home, Archive, Settings } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import SockJS from 'sockjs-client';
+import Stomp from 'stompjs';
+import './App.css';
 
-const App = () => {
-  const [activeTab, setActiveTab] = useState('initiate');
+function App() {
   const [formData, setFormData] = useState({
     correlationId: "",
     consumerId: "",
-    environmentId: "local",
+    environmentId: "",
     shouldSend: "",
     howMany: "",
     queueName: "",
     correlationIdBytes: "",
     payload: ""
   });
-  const [error, setError] = useState(null);
   const [response, setResponse] = useState(null);
+  const [error, setError] = useState(null);
+  const [socketMessage, setSocketMessage] = useState("");
 
-  const handleChange = (name, value) => {
+  useEffect(() => {
+    const socket = new SockJS('http://localhost:8180/ws-endpoint');
+    const stompClient = Stomp.over(socket);
+
+    stompClient.connect({}, () => {
+      console.log('WebSocket Connected!');
+      stompClient.subscribe('/topic/messages', (message) => {
+        console.log('Received:', message.body);
+        setSocketMessage(message.body);
+      });
+    }, (err) => {
+      console.error('WebSocket Error:', err);
+    });
+
+    return () => {
+      if (stompClient) {
+        stompClient.disconnect();
+      }
+    };
+  }, []);
+
+  const handleChange = (e) => {
+    const { name, value } = e.target;
     setFormData(prev => ({
       ...prev,
       [name]: value
@@ -34,207 +52,93 @@ const App = () => {
     setError(null);
     setResponse(null);
 
-    // ... rest of your submit logic
+    if (!formData.correlationId || !formData.queueName || !formData.payload) {
+      setError("Mandatory fields missing");
+      return;
+    }
+
+    try {
+      const res = await fetch("http://localhost:8180/v1/initiation", {
+        method: "POST",
+        headers: {
+          "Content-Type": "text/plain",
+          "x-correlation-id": formData.correlationId,
+          "x-consumer-id": formData.consumerId,
+          "x-should-send": formData.shouldSend,
+          "x-times": formData.howMany,
+          "x-destination-name": formData.queueName,
+          "x-environment-id": formData.environmentId,
+          "x-is-bytes-needed": formData.correlationIdBytes
+        },
+        body: formData.payload
+      });
+
+      const data = await res.json();
+      setResponse(data);
+    } catch (err) {
+      setError("Network error");
+    }
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-gray-50 to-gray-100">
-      <nav className="bg-white border-b border-gray-200">
-        <div className="max-w-7xl mx-auto px-4">
-          <div className="flex h-16 items-center justify-between">
-            <div className="flex items-center">
-              <Settings className="h-8 w-8 text-blue-600" />
-              <span className="ml-2 text-xl font-bold bg-gradient-to-r from-blue-600 to-blue-400 bg-clip-text text-transparent">
-                MQ Admin Console
-              </span>
-            </div>
-            <div className="flex space-x-8">
-              <button
-                onClick={() => setActiveTab('initiate')}
-                className={`flex items-center space-x-2 px-3 py-2 rounded-md transition-colors ${
-                  activeTab === 'initiate' 
-                    ? 'bg-blue-50 text-blue-600' 
-                    : 'text-gray-600 hover:bg-gray-50'
-                }`}
-              >
-                <Home className="h-5 w-5" />
-                <span>Initiate</span>
-              </button>
-              <button
-                onClick={() => setActiveTab('archival')}
-                className={`flex items-center space-x-2 px-3 py-2 rounded-md transition-colors ${
-                  activeTab === 'archival' 
-                    ? 'bg-blue-50 text-blue-600' 
-                    : 'text-gray-600 hover:bg-gray-50'
-                }`}
-              >
-                <Archive className="h-5 w-5" />
-                <span>Message Archival</span>
-              </button>
-            </div>
-          </div>
+    <div className="app-container">
+      <h1>MQ Initiation</h1>
+      <form onSubmit={handleSubmit} className="form">
+        <div>
+          <label>x-correlation-id (Mandatory):</label>
+          <input type="text" name="correlationId" value={formData.correlationId} onChange={handleChange} />
         </div>
-      </nav>
+        <div>
+          <label>x-consumer-id:</label>
+          <input type="text" name="consumerId" value={formData.consumerId} onChange={handleChange} />
+        </div>
+        <div>
+          <label>x-environment-id:</label>
+          <select name="environmentId" value={formData.environmentId} onChange={handleChange}>
+            <option value="">Select</option>
+            <option value="local">Local</option>
+            <option value="SIT1">SIT1</option>
+            <option value="SIT2">SIT2</option>
+          </select>
+        </div>
+        <div>
+          <label>Should send more?:</label>
+          <input type="text" name="shouldSend" value={formData.shouldSend} onChange={handleChange} />
+        </div>
+        <div>
+          <label>Enter how many times:</label>
+          <input type="text" name="howMany" value={formData.howMany} onChange={handleChange} />
+        </div>
+        <div>
+          <label>Destination Queue Name:</label>
+          <input type="text" name="queueName" value={formData.queueName} onChange={handleChange} />
+        </div>
+        <div>
+          <label>CorrelationId in bytes?:</label>
+          <input type="text" name="correlationIdBytes" value={formData.correlationIdBytes} onChange={handleChange} />
+        </div>
+        <div>
+          <label>Payload:</label>
+          <textarea name="payload" value={formData.payload} onChange={handleChange} />
+        </div>
+        <button type="submit">Submit</button>
+      </form>
 
-      <main className="max-w-7xl mx-auto py-8 px-4">
-        {activeTab === 'initiate' ? (
-          <Card className="bg-white/50 backdrop-blur-sm border-0 shadow-xl">
-            <CardHeader className="border-b border-gray-100">
-              <CardTitle className="text-2xl font-semibold text-gray-800">Message Queue Initiation</CardTitle>
-            </CardHeader>
-            <CardContent className="pt-6">
-              <form onSubmit={handleSubmit} className="space-y-6">
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-gray-700 flex items-center">
-                      Correlation ID
-                      <span className="ml-1 text-red-500">*</span>
-                    </label>
-                    <Input
-                      type="text"
-                      value={formData.correlationId}
-                      onChange={(e) => handleChange("correlationId", e.target.value)}
-                      className="border-gray-200 focus:ring-blue-500"
-                      placeholder="Enter correlation ID"
-                    />
-                  </div>
-
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-gray-700">
-                      Consumer ID
-                    </label>
-                    <Input
-                      type="text"
-                      value={formData.consumerId}
-                      onChange={(e) => handleChange("consumerId", e.target.value)}
-                      className="border-gray-200 focus:ring-blue-500"
-                      placeholder="Enter consumer ID"
-                    />
-                  </div>
-
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-gray-700">
-                      Environment
-                    </label>
-                    <Select 
-                      value={formData.environmentId}
-                      onValueChange={(value) => handleChange("environmentId", value)}
-                    >
-                      <SelectTrigger className="border-gray-200">
-                        <SelectValue placeholder="Select environment" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="local">Local</SelectItem>
-                        <SelectItem value="SIT1">SIT1</SelectItem>
-                        <SelectItem value="SIT2">SIT2</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-gray-700">
-                      Should Send More?
-                    </label>
-                    <Input
-                      type="text"
-                      value={formData.shouldSend}
-                      onChange={(e) => handleChange("shouldSend", e.target.value)}
-                      className="border-gray-200 focus:ring-blue-500"
-                      placeholder="Yes/No"
-                    />
-                  </div>
-
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-gray-700">
-                      Number of Times
-                    </label>
-                    <Input
-                      type="number"
-                      value={formData.howMany}
-                      onChange={(e) => handleChange("howMany", e.target.value)}
-                      className="border-gray-200 focus:ring-blue-500"
-                      placeholder="Enter count"
-                    />
-                  </div>
-
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-gray-700">
-                      Queue Name
-                    </label>
-                    <Input
-                      type="text"
-                      value={formData.queueName}
-                      onChange={(e) => handleChange("queueName", e.target.value)}
-                      className="border-gray-200 focus:ring-blue-500"
-                      placeholder="Enter queue name"
-                    />
-                  </div>
-
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-gray-700">
-                      Correlation ID in bytes
-                    </label>
-                    <Input
-                      type="text"
-                      value={formData.correlationIdBytes}
-                      onChange={(e) => handleChange("correlationIdBytes", e.target.value)}
-                      className="border-gray-200 focus:ring-blue-500"
-                      placeholder="Enter bytes"
-                    />
-                  </div>
-                </div>
-
-                <div className="space-y-2">
-                  <label className="text-sm font-medium text-gray-700">
-                    Payload
-                  </label>
-                  <Textarea
-                    value={formData.payload}
-                    onChange={(e) => handleChange("payload", e.target.value)}
-                    className="min-h-[100px] border-gray-200 focus:ring-blue-500"
-                    placeholder="Enter payload data"
-                  />
-                </div>
-
-                {error && (
-                  <Alert variant="destructive" className="bg-red-50 border-red-200">
-                    <AlertDescription>{error}</AlertDescription>
-                  </Alert>
-                )}
-
-                {response && (
-                  <Alert className="bg-green-50 border-green-200">
-                    <AlertDescription>
-                      <pre className="whitespace-pre-wrap">{JSON.stringify(response, null, 2)}</pre>
-                    </AlertDescription>
-                  </Alert>
-                )}
-
-                <Button 
-                  type="submit" 
-                  className="w-full bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-700 hover:to-blue-600"
-                >
-                  Send Message
-                </Button>
-              </form>
-            </CardContent>
-          </Card>
-        ) : (
-          <div className="flex items-center justify-center h-64 text-gray-500">
-            Message Archival feature coming soon...
-          </div>
-        )}
-      </main>
+      {error && <div className="error">{error}</div>}
+      {response && (
+        <div className="response">
+          <h2>Response:</h2>
+          <pre>{JSON.stringify(response, null, 2)}</pre>
+        </div>
+      )}
+      {socketMessage && (
+        <div className="websocket-message">
+          <h2>WebSocket Message:</h2>
+          <pre>{socketMessage}</pre>
+        </div>
+      )}
     </div>
   );
-};
+}
 
 export default App;
-
-
-
-npx create-next-app@latest my-app --typescript --tailwind --eslint
-cd my-app
-npx shadcn-ui@latest init
-
-npx shadcn-ui@latest add card input button select textarea alert
