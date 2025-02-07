@@ -1,144 +1,32 @@
-import React, { useState, useEffect } from 'react';
-import SockJS from 'sockjs-client';
-import Stomp from 'stompjs';
-import './App.css';
+// components/Navbar.js
+import React from 'react';
 
-function App() {
-  const [formData, setFormData] = useState({
-    correlationId: "",
-    consumerId: "",
-    environmentId: "",
-    shouldSend: "",
-    howMany: "",
-    queueName: "",
-    correlationIdBytes: "",
-    payload: ""
-  });
-  const [response, setResponse] = useState(null);
-  const [error, setError] = useState(null);
-  const [socketMessage, setSocketMessage] = useState("");
+const Navbar = () => {
+ return (
+   <nav className="bg-white border-b border-gray-200">
+     <div className="max-w-7xl mx-auto px-4">
+       <div className="flex h-16 items-center justify-between">
+         <div className="flex items-center">
+           <span className="text-xl font-bold bg-gradient-to-r from-blue-600 to-blue-400 bg-clip-text text-transparent">
+             MQ Admin Console
+           </span>
+         </div>
+         <div className="flex space-x-8">
+           <button
+             className="flex items-center space-x-2 px-3 py-2 rounded-md bg-blue-50 text-blue-600"
+           >
+             <span>Initiate</span>
+           </button>
+           <button
+             className="flex items-center space-x-2 px-3 py-2 rounded-md text-gray-600 hover:bg-gray-50"
+           >
+             <span>Message Archival</span>
+           </button>
+         </div>
+       </div>
+     </div>
+   </nav>
+ );
+};
 
-  useEffect(() => {
-    const socket = new SockJS('http://localhost:8180/ws-endpoint');
-    const stompClient = Stomp.over(socket);
-
-    stompClient.connect({}, () => {
-      console.log('WebSocket Connected!');
-      stompClient.subscribe('/topic/messages', (message) => {
-        console.log('Received:', message.body);
-        setSocketMessage(message.body);
-      });
-    }, (err) => {
-      console.error('WebSocket Error:', err);
-    });
-
-    return () => {
-      if (stompClient) {
-        stompClient.disconnect();
-      }
-    };
-  }, []);
-
-  const handleChange = (e) => {
-    const { name, value } = e.target;
-    setFormData(prev => ({
-      ...prev,
-      [name]: value
-    }));
-  };
-
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    setError(null);
-    setResponse(null);
-
-    if (!formData.correlationId || !formData.queueName || !formData.payload) {
-      setError("Mandatory fields missing");
-      return;
-    }
-
-    try {
-      const res = await fetch("http://localhost:8180/v1/initiation", {
-        method: "POST",
-        headers: {
-          "Content-Type": "text/plain",
-          "x-correlation-id": formData.correlationId,
-          "x-consumer-id": formData.consumerId,
-          "x-should-send": formData.shouldSend,
-          "x-times": formData.howMany,
-          "x-destination-name": formData.queueName,
-          "x-environment-id": formData.environmentId,
-          "x-is-bytes-needed": formData.correlationIdBytes
-        },
-        body: formData.payload
-      });
-
-      const data = await res.json();
-      setResponse(data);
-    } catch (err) {
-      setError("Network error");
-    }
-  };
-
-  return (
-    <div className="app-container">
-      <h1>MQ Initiation</h1>
-      <form onSubmit={handleSubmit} className="form">
-        <div>
-          <label>x-correlation-id (Mandatory):</label>
-          <input type="text" name="correlationId" value={formData.correlationId} onChange={handleChange} />
-        </div>
-        <div>
-          <label>x-consumer-id:</label>
-          <input type="text" name="consumerId" value={formData.consumerId} onChange={handleChange} />
-        </div>
-        <div>
-          <label>x-environment-id:</label>
-          <select name="environmentId" value={formData.environmentId} onChange={handleChange}>
-            <option value="">Select</option>
-            <option value="local">Local</option>
-            <option value="SIT1">SIT1</option>
-            <option value="SIT2">SIT2</option>
-          </select>
-        </div>
-        <div>
-          <label>Should send more?:</label>
-          <input type="text" name="shouldSend" value={formData.shouldSend} onChange={handleChange} />
-        </div>
-        <div>
-          <label>Enter how many times:</label>
-          <input type="text" name="howMany" value={formData.howMany} onChange={handleChange} />
-        </div>
-        <div>
-          <label>Destination Queue Name:</label>
-          <input type="text" name="queueName" value={formData.queueName} onChange={handleChange} />
-        </div>
-        <div>
-          <label>CorrelationId in bytes?:</label>
-          <input type="text" name="correlationIdBytes" value={formData.correlationIdBytes} onChange={handleChange} />
-        </div>
-        <div>
-          <label>Payload:</label>
-          <textarea name="payload" value={formData.payload} onChange={handleChange} />
-        </div>
-        <button type="submit">Submit</button>
-      </form>
-
-      {error && <div className="error">{error}</div>}
-      {response && (
-        <div className="response">
-          <h2>Response:</h2>
-          <pre>{JSON.stringify(response, null, 2)}</pre>
-        </div>
-      )}
-      {socketMessage && (
-        <div className="websocket-message">
-          <h2>WebSocket Message:</h2>
-          <pre>{socketMessage}</pre>
-        </div>
-      )}
-    </div>
-  );
-}
-
-export default App;
+export default Navbar;
