@@ -1,32 +1,77 @@
-// components/Navbar.js
-import React from 'react';
+import React, { useState } from 'react';
 
-const Navbar = () => {
- return (
-   <nav className="bg-white border-b border-gray-200">
-     <div className="max-w-7xl mx-auto px-4">
-       <div className="flex h-16 items-center justify-between">
-         <div className="flex items-center">
-           <span className="text-xl font-bold bg-gradient-to-r from-blue-600 to-blue-400 bg-clip-text text-transparent">
-             MQ Admin Console
-           </span>
-         </div>
-         <div className="flex space-x-8">
-           <button
-             className="flex items-center space-x-2 px-3 py-2 rounded-md bg-blue-50 text-blue-600"
-           >
-             <span>Initiate</span>
-           </button>
-           <button
-             className="flex items-center space-x-2 px-3 py-2 rounded-md text-gray-600 hover:bg-gray-50"
-           >
-             <span>Message Archival</span>
-           </button>
-         </div>
-       </div>
-     </div>
-   </nav>
- );
+const PreviewMonitor = () => {
+  const [queues, setQueues] = useState([]);
+  const [selectedQueue, setSelectedQueue] = useState(null);
+
+  const simulateWebsocket = () => {
+    // Simulating websocket response
+    setQueues(['ESF.QUEUE.1', 'ESF.QUEUE.2', 'SIT.QUEUE.1', 'DEV.QUEUE.1']);
+  };
+
+  return (
+    <div className="flex min-h-screen bg-gray-100">
+      <div className="w-[30%] p-4 border-r border-gray-200 bg-white shadow-sm">
+        <button 
+          onClick={simulateWebsocket}
+          className="w-full mb-6 py-3 px-4 bg-blue-600 text-white rounded-lg hover:bg-blue-700 shadow-sm font-medium"
+        >
+          View Active Queues
+        </button>
+        
+        <div className="space-y-2">
+          {queues.length === 0 ? (
+            <div className="text-gray-500 text-center p-4 border-2 border-dashed border-gray-200 rounded-lg">
+              No active queues found
+            </div>
+          ) : (
+            queues.map((queue, index) => (
+              <button
+                key={index}
+                onClick={() => setSelectedQueue(queue)}
+                className={`w-full p-3 text-left rounded-lg transition-all duration-200 ${
+                  selectedQueue === queue
+                    ? 'bg-blue-50 text-blue-700 border border-blue-200 shadow-sm'
+                    : 'hover:bg-gray-50 text-gray-700'
+                }`}
+              >
+                <div className="font-medium">{queue}</div>
+                <div className="text-sm text-gray-500">Active</div>
+              </button>
+            ))
+          )}
+        </div>
+      </div>
+
+      <div className="w-[70%] p-6 bg-white">
+        {selectedQueue ? (
+          <div className="space-y-4">
+            <h2 className="text-xl font-semibold text-gray-800">Queue: {selectedQueue}</h2>
+            <div className="p-4 bg-gray-50 rounded-lg border border-gray-100">
+              <div className="text-sm text-gray-500 mb-2">Queue Information</div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="p-3 bg-white rounded border border-gray-200">
+                  <div className="text-sm text-gray-500">Status</div>
+                  <div className="font-medium text-green-600">ACTIVE</div>
+                </div>
+                <div className="p-3 bg-white rounded border border-gray-200">
+                  <div className="text-sm text-gray-500">Messages</div>
+                  <div className="font-medium">42</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="flex items-center justify-center h-full text-gray-500">
+            <div className="text-center">
+              <div className="text-lg font-medium">No Queue Selected</div>
+              <div className="text-sm">Choose a queue from the left panel to view details</div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
 };
 
-export default Navbar;
+export default PreviewMonitor;
