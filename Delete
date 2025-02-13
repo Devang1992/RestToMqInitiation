@@ -1,77 +1,103 @@
 import React, { useState } from 'react';
 
-const PreviewMonitor = () => {
+const QueueMonitorPreview = () => {
   const [queues, setQueues] = useState([]);
   const [selectedQueue, setSelectedQueue] = useState(null);
 
-  const simulateWebsocket = () => {
+  const simulateFetch = () => {
     // Simulating websocket response
-    setQueues(['ESF.QUEUE.1', 'ESF.QUEUE.2', 'SIT.QUEUE.1', 'DEV.QUEUE.1']);
+    setQueues(['ESF.QUEUE.1', 'SIT1.QUEUE.1', 'DEV.QUEUE.1']);
   };
 
+  const containerStyle = {
+    width: '500px',
+    height: '400px',
+    border: '1px solid #ccc',
+    borderRadius: '8px',
+    overflow: 'hidden',
+    backgroundColor: '#f5f5f5',
+    fontFamily: 'Arial, sans-serif'
+  };
+
+  const buttonStyle = {
+    width: '100%',
+    padding: '10px',
+    backgroundColor: '#0066cc',
+    color: 'white',
+    border: 'none',
+    borderRadius: '4px',
+    cursor: 'pointer',
+    marginBottom: '10px'
+  };
+
+  const queueButtonStyle = (isSelected) => ({
+    width: '100%',
+    padding: '8px',
+    margin: '4px 0',
+    backgroundColor: isSelected ? '#e6f0ff' : 'white',
+    border: '1px solid #ddd',
+    borderRadius: '4px',
+    textAlign: 'left',
+    cursor: 'pointer'
+  });
+
   return (
-    <div className="flex min-h-screen bg-gray-100">
-      <div className="w-[30%] p-4 border-r border-gray-200 bg-white shadow-sm">
-        <button 
-          onClick={simulateWebsocket}
-          className="w-full mb-6 py-3 px-4 bg-blue-600 text-white rounded-lg hover:bg-blue-700 shadow-sm font-medium"
-        >
-          View Active Queues
-        </button>
-        
-        <div className="space-y-2">
+    <div style={containerStyle}>
+      <div style={{ display: 'flex', height: '100%' }}>
+        <div style={{ width: '30%', padding: '15px', borderRight: '1px solid #ddd', backgroundColor: 'white' }}>
+          <button style={buttonStyle} onClick={simulateFetch}>
+            View Queues
+          </button>
+
           {queues.length === 0 ? (
-            <div className="text-gray-500 text-center p-4 border-2 border-dashed border-gray-200 rounded-lg">
-              No active queues found
+            <div style={{ textAlign: 'center', color: '#666', marginTop: '20px' }}>
+              No queues are being listened
             </div>
           ) : (
-            queues.map((queue, index) => (
-              <button
-                key={index}
-                onClick={() => setSelectedQueue(queue)}
-                className={`w-full p-3 text-left rounded-lg transition-all duration-200 ${
-                  selectedQueue === queue
-                    ? 'bg-blue-50 text-blue-700 border border-blue-200 shadow-sm'
-                    : 'hover:bg-gray-50 text-gray-700'
-                }`}
-              >
-                <div className="font-medium">{queue}</div>
-                <div className="text-sm text-gray-500">Active</div>
-              </button>
-            ))
+            <div>
+              {queues.map((queue, index) => (
+                <button
+                  key={index}
+                  style={queueButtonStyle(selectedQueue === queue)}
+                  onClick={() => setSelectedQueue(queue)}
+                >
+                  {queue}
+                </button>
+              ))}
+            </div>
           )}
         </div>
-      </div>
 
-      <div className="w-[70%] p-6 bg-white">
-        {selectedQueue ? (
-          <div className="space-y-4">
-            <h2 className="text-xl font-semibold text-gray-800">Queue: {selectedQueue}</h2>
-            <div className="p-4 bg-gray-50 rounded-lg border border-gray-100">
-              <div className="text-sm text-gray-500 mb-2">Queue Information</div>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="p-3 bg-white rounded border border-gray-200">
-                  <div className="text-sm text-gray-500">Status</div>
-                  <div className="font-medium text-green-600">ACTIVE</div>
-                </div>
-                <div className="p-3 bg-white rounded border border-gray-200">
-                  <div className="text-sm text-gray-500">Messages</div>
-                  <div className="font-medium">42</div>
-                </div>
+        <div style={{ width: '70%', padding: '15px', backgroundColor: 'white' }}>
+          {selectedQueue ? (
+            <div>
+              <h3 style={{ margin: '0 0 15px 0', color: '#333' }}>Queue: {selectedQueue}</h3>
+              <div style={{ 
+                padding: '10px', 
+                backgroundColor: '#f8f9fa', 
+                borderRadius: '4px',
+                border: '1px solid #e9ecef'
+              }}>
+                <p style={{ margin: '5px 0' }}>Status: Active</p>
+                <p style={{ margin: '5px 0' }}>Messages: 42</p>
+                <p style={{ margin: '5px 0' }}>Last Updated: Just now</p>
               </div>
             </div>
-          </div>
-        ) : (
-          <div className="flex items-center justify-center h-full text-gray-500">
-            <div className="text-center">
-              <div className="text-lg font-medium">No Queue Selected</div>
-              <div className="text-sm">Choose a queue from the left panel to view details</div>
+          ) : (
+            <div style={{ 
+              display: 'flex', 
+              height: '100%', 
+              alignItems: 'center', 
+              justifyContent: 'center',
+              color: '#666' 
+            }}>
+              Select a queue to view details
             </div>
-          </div>
-        )}
+          )}
+        </div>
       </div>
     </div>
   );
 };
 
-export default PreviewMonitor;
+export default QueueMonitorPreview;
