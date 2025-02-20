@@ -1,3 +1,42 @@
+const [queues, setQueues] = useState([]);
+const [selectedQueue, setSelectedQueue] = useState(null);
+
+// This goes in your useEffect or callback function
+stompClient.subscribe('/topic/queue', (response) => {
+  console.log('Received message:', response.body);
+  
+  // Parse the JSON response if it's in string format
+  const queueData = JSON.parse(response.body);
+  
+  // Update state with the received queues
+  setQueues(queueData);
+  setSocketMessage(response.body);
+});
+
+
+
+
+{queues.length === 0 ? (
+  <div style={{ textAlign: 'center', color: '#666', marginTop: '20px' }}>
+    No queues are being listened
+  </div>
+) : (
+  <div>
+    {queues.map((queue, index) => (
+      <button
+        key={index}
+        style={queueButtonStyle(selectedQueue === queue)}
+        onClick={() => setSelectedQueue(queue)}
+      >
+        {queue}
+      </button>
+    ))}
+  </div>
+)}
+
+
+
+
 import React, { useState } from 'react';
 
 const QueueMonitorPreview = () => {
