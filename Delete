@@ -1,3 +1,22 @@
+@Controller
+public class ForwardController {
+    @GetMapping(value = {"/", "/{x:[\\w\\-]+}", "/{x:^(?!api$).*$}/*/*"})
+    public String getIndex() {
+        return "index.html";
+    }
+}
+
+@Configuration
+public class SecurityConfig extends WebSecurityConfigurerAdapter {
+    @Override
+    public void configure(HttpSecurity http) throws Exception {
+        http
+            .authorizeRequests()
+            .antMatchers("/**").permitAll();
+    }
+}
+
+
 const [queues, setQueues] = useState([]);
 const [selectedQueue, setSelectedQueue] = useState(null);
 
