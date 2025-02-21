@@ -1,3 +1,5 @@
+"/{path:^(?!api|static).*$}/**"
+
 @Controller
 public class ForwardController {
     @GetMapping(value = {"/", "/{x:[\\w\\-]+}", "/{x:^(?!api$).*$}/*/*"})
