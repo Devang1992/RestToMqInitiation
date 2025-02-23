@@ -1,3 +1,6 @@
+registry.addViewController("/{path:^(?!api|.*\\..*$).*$}")
+                .setViewName("forward:/index.html");
+
 "/{path:^(?!api|static).*$}/**"
 
 @Controller
