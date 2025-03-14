@@ -1,3 +1,251 @@
+import jakarta.validation.ConstraintViolation;
+import jakarta.validation.Validation;
+import jakarta.validation.Validator;
+import jakarta.validation.ValidatorFactory;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.test.context.TestPropertySource;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.*;
+
+class WebClientPropertiesValidationTest {
+
+    private Validator validator;
+    
+    @BeforeEach
+    void setUp() {
+        ValidatorFactory factory = Validation.buildDefaultValidatorFactory();
+        validator = factory.getValidator();
+    }
+    
+    @Test
+    void whenAllFieldsValid_thenNoViolations() {
+        // Given
+        WebClientProperties properties = createValidProperties();
+        
+        // When
+        Set<ConstraintViolation<WebClientProperties>> violations = validator.validate(properties);
+        
+        // Then
+        assertTrue(violations.isEmpty(), "No violations should be found for valid properties");
+    }
+    
+    @Test
+    void whenBaseUrlMissing_thenViolation() {
+        // Given
+        WebClientProperties properties = createValidProperties();
+        properties.setBaseUrl(null);
+        
+        // When
+        Set<ConstraintViolation<WebClientProperties>> violations = validator.validate(properties);
+        
+        // Then
+        assertEquals(1, violations.size(), "Should have exactly one violation");
+        assertEquals("BaseUrl configuration value is not found. Invalid configuration", 
+                     violations.iterator().next().getMessage());
+    }
+    
+    @Test
+    void whenBaseUrlEmpty_thenViolation() {
+        // Given
+        WebClientProperties properties = createValidProperties();
+        properties.setBaseUrl("");
+        
+        // When
+        Set<ConstraintViolation<WebClientProperties>> violations = validator.validate(properties);
+        
+        // Then
+        assertEquals(1, violations.size(), "Should have exactly one violation");
+        assertEquals("BaseUrl configuration value is not found. Invalid configuration", 
+                     violations.iterator().next().getMessage());
+    }
+    
+    @Test
+    void whenTimeoutsMissing_thenViolations() {
+        // Given
+        WebClientProperties properties = createValidProperties();
+        properties.setReadTimeout(null);
+        properties.setWriteTimeout(null);
+        properties.setConnectTimeout(null);
+        
+        // When
+        Set<ConstraintViolation<WebClientProperties>> violations = validator.validate(properties);
+        
+        // Then
+        assertEquals(3, violations.size(), "Should have three violations");
+        
+        List<String> messages = violations.stream()
+                .map(ConstraintViolation::getMessage)
+                .toList();
+        
+        assertTrue(messages.contains("Missing read-timeout"), "Should contain read-timeout violation");
+        assertTrue(messages.contains("Missing write-timeout"), "Should contain write-timeout violation");
+        assertTrue(messages.contains("Missing connect-timeout"), "Should contain connect-timeout violation");
+    }
+    
+    @Test
+    void whenIgnoreSslMissing_thenViolation() {
+        // Given
+        WebClientProperties properties = createValidProperties();
+        properties.setIgnoreSsl(null);
+        
+        // When
+        Set<ConstraintViolation<WebClientProperties>> violations = validator.validate(properties);
+        
+        // Then
+        assertEquals(1, violations.size(), "Should have exactly one violation");
+        assertEquals("Missing ignore-ssl", violations.iterator().next().getMessage());
+    }
+    
+    @Test
+    void whenHeadersEmpty_thenViolation() {
+        // Given
+        WebClientProperties properties = createValidProperties();
+        properties.setHeader(new ArrayList<>());
+        
+        // When
+        Set<ConstraintViolation<WebClientProperties>> violations = validator.validate(properties);
+        
+        // Then
+        assertEquals(1, violations.size(), "Should have exactly one violation");
+        assertEquals("Missing header configuration", violations.iterator().next().getMessage());
+    }
+    
+    @Test
+    void whenHeaderNameMissing_thenViolation() {
+        // Given
+        WebClientProperties properties = createValidProperties();
+        WebClientHeaderProperties header = new WebClientHeaderProperties();
+        header.setValue("application/json");
+        // Missing name
+        properties.setHeader(List.of(header));
+        
+        // When
+        Set<ConstraintViolation<WebClientProperties>> violations = validator.validate(properties);
+        
+        // Then
+        assertEquals(1, violations.size(), "Should have exactly one violation");
+        assertTrue(violations.iterator().next().getMessage().contains("Missing header name"));
+    }
+    
+    @Test
+    void whenHeaderValueAndSourceBothNull_thenViolation() {
+        // Given
+        WebClientProperties properties = createValidProperties();
+        WebClientHeaderProperties header = new WebClientHeaderProperties();
+        header.setName("Content-Type");
+        // Both value and source are null
+        properties.setHeader(List.of(header));
+        
+        // When
+        Set<ConstraintViolation<WebClientProperties>> violations = validator.validate(properties);
+        
+        // Then
+        assertEquals(1, violations.size(), "Should have exactly one violation");
+        assertEquals("Header value and source cannot both be null", violations.iterator().next().getMessage());
+    }
+    
+    @Test
+    void whenOAuthPropertiesMissing_thenValidationPasses() {
+        // Given
+        WebClientProperties properties = createValidProperties();
+        properties.setOauth(null); // OAuth is optional
+        
+        // When
+        Set<ConstraintViolation<WebClientProperties>> violations = validator.validate(properties);
+        
+        // Then
+        assertTrue(violations.isEmpty(), "No violations should be found when OAuth is null");
+    }
+    
+    @Test
+    void whenOAuthPropertiesInvalid_thenViolations() {
+        // Given
+        WebClientProperties properties = createValidProperties();
+        ClientCredentialProperties oauth = new ClientCredentialProperties();
+        // Missing required fields
+        properties.setOauth(oauth);
+        
+        // When
+        Set<ConstraintViolation<WebClientProperties>> violations = validator.validate(properties);
+        
+        // Then
+        assertFalse(violations.isEmpty(), "Should have violations for invalid OAuth properties");
+        
+        List<String> messages = violations.stream()
+                .map(ConstraintViolation::getMessage)
+                .toList();
+        
+        assertTrue(messages.contains("Missing client-id"), "Should contain client-id violation");
+        assertTrue(messages.contains("Missing minutes-too-close-to-expiry"), "Should contain minutes violation");
+        // Other OAuth validations...
+    }
+    
+    @Test
+    void testWebClientConfigurationPropertiesInitialization() {
+        // Given
+        WebClientConfigurationProperties configProperties = new WebClientConfigurationProperties();
+        
+        // Set up default properties
+        WebClientProperties defaultProps = createValidProperties();
+        configProperties.setClientDefault(defaultProps);
+        
+        // Set up client-specific properties (incomplete)
+        WebClientProperties clientProps = new WebClientProperties();
+        clientProps.setBaseUrl("http://override.example.com");
+        // Missing other required fields - should inherit from default
+        
+        // Add to clients map
+        Map<String, WebClientProperties> clients = Map.of("test-client", clientProps);
+        configProperties.setClient(clients);
+        
+        // When
+        configProperties.init(); // This should merge properties and validate
+        
+        // Then
+        WebClientProperties mergedProps = configProperties.getClient().get("test-client");
+        assertNotNull(mergedProps, "Merged properties should exist");
+        assertEquals("http://override.example.com", mergedProps.getBaseUrl(), "Should keep overridden base URL");
+        assertEquals(defaultProps.getReadTimeout(), mergedProps.getReadTimeout(), "Should inherit read timeout");
+        assertEquals(defaultProps.getWriteTimeout(), mergedProps.getWriteTimeout(), "Should inherit write timeout");
+    }
+    
+    private WebClientProperties createValidProperties() {
+        WebClientProperties properties = new WebClientProperties();
+        properties.setBaseUrl("http://example.com");
+        properties.setReadTimeout(30000);
+        properties.setWriteTimeout(30000);
+        properties.setConnectTimeout(30000);
+        properties.setIgnoreSsl(false);
+        
+        WebClientHeaderProperties header = new WebClientHeaderProperties();
+        header.setName("Content-Type");
+        header.setValue("application/json");
+        properties.setHeader(List.of(header));
+        
+        return properties;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
