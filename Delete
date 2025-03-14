@@ -1,166 +1,116 @@
-registry.addViewController("/{path:^(?!api|.*\\..*$).*$}")
-                .setViewName("forward:/index.html");
+import javax.validation.Valid;
+import javax.validation.constraints.NotBlank;
+import javax.validation.constraints.NotNull;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.validation.annotation.Validated;
+import java.util.List;
 
-"/{path:^(?!api|static).*$}/**"
-
-@Controller
-public class ForwardController {
-    @GetMapping(value = {"/", "/{x:[\\w\\-]+}", "/{x:^(?!api$).*$}/*/*"})
-    public String getIndex() {
-        return "index.html";
+@Data
+@ConfigurationProperties("wrsvc.web")
+@Validated
+public class WebClientConfigurationProperties {
+    
+    private WebClientProperties clientDefault;
+    private Map<String, WebClientProperties> client = new LinkedHashMap<>();
+    
+    // Keep your initialization method for backward compatibility if needed
+    @PostConstruct
+    public void init() {
+        Map<String, WebClientProperties> newClientProperties = new LinkedHashMap<>();
+        
+        client.forEach((name, props) -> {
+            WebClientProperties webClientProperties = 
+                createDefaultInstance().mergeFrom(clientDefault).mergeFrom(props);
+            
+            // Only retain this OAuth name setting logic
+            if (Objects.nonNull(webClientProperties.getOauth())) {
+                webClientProperties.getOauth().setName(name);
+            }
+            
+            newClientProperties.put(name, webClientProperties);
+        });
+        
+        client = newClientProperties;
+    }
+    
+    // Define your nested properties class with validation annotations
+    @Data
+    @Validated
+    public static class WebClientProperties {
+        
+        @NotBlank(message = "BaseUrl configuration value is not found. Invalid configuration")
+        private String baseUrl;
+        
+        @NotNull(message = "Missing read-timeout")
+        private Duration readTimeout;
+        
+        @NotNull(message = "Missing write-timeout")
+        private Duration writeTimeout;
+        
+        @NotNull(message = "Missing connect-timeout")
+        private Duration connectTimeout;
+        
+        @NotNull(message = "Missing ignore-ssl")
+        private Boolean ignoreSsl;
+        
+        @Valid
+        @NotEmpty(message = "Missing header configuration")
+        private List<WebClientHeaderProperties> header;
+        
+        @Valid
+        private OAuthProperties oauth;
+        
+        // Your mergeFrom methods would remain
+    }
+    
+    @Data
+    @Validated
+    public static class WebClientHeaderProperties {
+        @NotBlank(message = "Missing header name")
+        private String name;
+        
+        private String value;
+        private String source;
+        
+        @AssertTrue(message = "Header value and source cannot both be null")
+        public boolean isValueOrSourcePresent() {
+            return value != null || source != null;
+        }
+    }
+    
+    @Data
+    @Validated
+    public static class OAuthProperties {
+        private String name;
+        
+        @NotBlank(message = "Missing client-id")
+        private String clientId;
+        
+        @NotNull(message = "Missing minutes-too-close-to-expiry")
+        private Integer minutesTooCloseToExpiry;
+        
+        @NotBlank(message = "Missing secret")
+        private String secret;
+        
+        @NotBlank(message = "Missing scope")
+        private String scope;
+        
+        @NotBlank(message = "Missing grant-type")
+        private String grantType;
+        
+        @NotBlank(message = "Missing ping-oauth-uri")
+        private String pingOauthUri;
+        
+        private boolean defaultOauth2AuthorizedClient;
+    }
+    
+    // Your utility method can remain
+    public static <T> T coalesce(T... items) {
+        for (T i : items) {
+            if (i != null) {
+                return i;
+            }
+        }
+        return null;
     }
 }
-
-@Configuration
-public class SecurityConfig extends WebSecurityConfigurerAdapter {
-    @Override
-    public void configure(HttpSecurity http) throws Exception {
-        http
-            .authorizeRequests()
-            .antMatchers("/**").permitAll();
-    }
-}
-
-
-const [queues, setQueues] = useState([]);
-const [selectedQueue, setSelectedQueue] = useState(null);
-
-// This goes in your useEffect or callback function
-stompClient.subscribe('/topic/queue', (response) => {
-  console.log('Received message:', response.body);
-  
-  // Parse the JSON response if it's in string format
-  const queueData = JSON.parse(response.body);
-  
-  // Update state with the received queues
-  setQueues(queueData);
-  setSocketMessage(response.body);
-});
-
-
-
-
-{queues.length === 0 ? (
-  <div style={{ textAlign: 'center', color: '#666', marginTop: '20px' }}>
-    No queues are being listened
-  </div>
-) : (
-  <div>
-    {queues.map((queue, index) => (
-      <button
-        key={index}
-        style={queueButtonStyle(selectedQueue === queue)}
-        onClick={() => setSelectedQueue(queue)}
-      >
-        {queue}
-      </button>
-    ))}
-  </div>
-)}
-
-
-
-
-import React, { useState } from 'react';
-
-const QueueMonitorPreview = () => {
-  const [queues, setQueues] = useState([]);
-  const [selectedQueue, setSelectedQueue] = useState(null);
-
-  const simulateFetch = () => {
-    // Simulating websocket response
-    setQueues(['ESF.QUEUE.1', 'SIT1.QUEUE.1', 'DEV.QUEUE.1']);
-  };
-
-  const containerStyle = {
-    width: '500px',
-    height: '400px',
-    border: '1px solid #ccc',
-    borderRadius: '8px',
-    overflow: 'hidden',
-    backgroundColor: '#f5f5f5',
-    fontFamily: 'Arial, sans-serif'
-  };
-
-  const buttonStyle = {
-    width: '100%',
-    padding: '10px',
-    backgroundColor: '#0066cc',
-    color: 'white',
-    border: 'none',
-    borderRadius: '4px',
-    cursor: 'pointer',
-    marginBottom: '10px'
-  };
-
-  const queueButtonStyle = (isSelected) => ({
-    width: '100%',
-    padding: '8px',
-    margin: '4px 0',
-    backgroundColor: isSelected ? '#e6f0ff' : 'white',
-    border: '1px solid #ddd',
-    borderRadius: '4px',
-    textAlign: 'left',
-    cursor: 'pointer'
-  });
-
-  return (
-    <div style={containerStyle}>
-      <div style={{ display: 'flex', height: '100%' }}>
-        <div style={{ width: '30%', padding: '15px', borderRight: '1px solid #ddd', backgroundColor: 'white' }}>
-          <button style={buttonStyle} onClick={simulateFetch}>
-            View Queues
-          </button>
-
-          {queues.length === 0 ? (
-            <div style={{ textAlign: 'center', color: '#666', marginTop: '20px' }}>
-              No queues are being listened
-            </div>
-          ) : (
-            <div>
-              {queues.map((queue, index) => (
-                <button
-                  key={index}
-                  style={queueButtonStyle(selectedQueue === queue)}
-                  onClick={() => setSelectedQueue(queue)}
-                >
-                  {queue}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
-
-        <div style={{ width: '70%', padding: '15px', backgroundColor: 'white' }}>
-          {selectedQueue ? (
-            <div>
-              <h3 style={{ margin: '0 0 15px 0', color: '#333' }}>Queue: {selectedQueue}</h3>
-              <div style={{ 
-                padding: '10px', 
-                backgroundColor: '#f8f9fa', 
-                borderRadius: '4px',
-                border: '1px solid #e9ecef'
-              }}>
-                <p style={{ margin: '5px 0' }}>Status: Active</p>
-                <p style={{ margin: '5px 0' }}>Messages: 42</p>
-                <p style={{ margin: '5px 0' }}>Last Updated: Just now</p>
-              </div>
-            </div>
-          ) : (
-            <div style={{ 
-              display: 'flex', 
-              height: '100%', 
-              alignItems: 'center', 
-              justifyContent: 'center',
-              color: '#666' 
-            }}>
-              Select a queue to view details
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-};
-
-export default QueueMonitorPreview;
