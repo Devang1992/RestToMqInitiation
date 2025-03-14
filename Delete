@@ -1,116 +1,98 @@
-import javax.validation.Valid;
-import javax.validation.constraints.NotBlank;
-import javax.validation.constraints.NotNull;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.NotEmpty;
+import jakarta.validation.constraints.AssertTrue;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.validation.annotation.Validated;
 import java.util.List;
+import java.util.ArrayList;
 
 @Data
-@ConfigurationProperties("wrsvc.web")
 @Validated
-public class WebClientConfigurationProperties {
+public class WebClientProperties {
+
+    private static final int DEFAULT_TIMEOUT = 10000;
+
+    @NotNull(message = "Missing connect-timeout")
+    private Integer connectTimeout;
     
-    private WebClientProperties clientDefault;
-    private Map<String, WebClientProperties> client = new LinkedHashMap<>();
+    @NotNull(message = "Missing read-timeout")
+    private Integer readTimeout;
     
-    // Keep your initialization method for backward compatibility if needed
-    @PostConstruct
-    public void init() {
-        Map<String, WebClientProperties> newClientProperties = new LinkedHashMap<>();
-        
-        client.forEach((name, props) -> {
-            WebClientProperties webClientProperties = 
-                createDefaultInstance().mergeFrom(clientDefault).mergeFrom(props);
-            
-            // Only retain this OAuth name setting logic
-            if (Objects.nonNull(webClientProperties.getOauth())) {
-                webClientProperties.getOauth().setName(name);
-            }
-            
-            newClientProperties.put(name, webClientProperties);
-        });
-        
-        client = newClientProperties;
+    @NotNull(message = "Missing write-timeout")
+    private Integer writeTimeout;
+    
+    @NotBlank(message = "BaseUrl configuration value is not found. Invalid configuration")
+    private String baseUrl;
+    
+    @NotNull(message = "Missing ignore-ssl")
+    private Boolean ignoreSsl;
+    
+    @Valid
+    @NotEmpty(message = "Missing header configuration")
+    private List<WebClientHeaderProperties> header = new ArrayList<>();
+    
+    @Valid
+    private ClientCredentialProperties oauth;
+    
+    @Deprecated
+    private String authorizationHeader; // Use oauth.authorizationHeader instead
+    
+    /**
+     * Creates default web client configuration populating read, write and connection timeouts and base URL.
+     *
+     * @return Default web client configuration
+     */
+    public static WebClientProperties createDefaultInstance() {
+        WebClientProperties properties = new WebClientProperties();
+        properties.setConnectTimeout(DEFAULT_TIMEOUT);
+        properties.setReadTimeout(DEFAULT_TIMEOUT);
+        properties.setWriteTimeout(DEFAULT_TIMEOUT);
+        // Set other default values as needed
+        return properties;
     }
     
-    // Define your nested properties class with validation annotations
-    @Data
-    @Validated
-    public static class WebClientProperties {
-        
-        @NotBlank(message = "BaseUrl configuration value is not found. Invalid configuration")
-        private String baseUrl;
-        
-        @NotNull(message = "Missing read-timeout")
-        private Duration readTimeout;
-        
-        @NotNull(message = "Missing write-timeout")
-        private Duration writeTimeout;
-        
-        @NotNull(message = "Missing connect-timeout")
-        private Duration connectTimeout;
-        
-        @NotNull(message = "Missing ignore-ssl")
-        private Boolean ignoreSsl;
-        
-        @Valid
-        @NotEmpty(message = "Missing header configuration")
-        private List<WebClientHeaderProperties> header;
-        
-        @Valid
-        private OAuthProperties oauth;
-        
-        // Your mergeFrom methods would remain
-    }
+    // Your mergeFrom method would remain
+}
+
+@Data
+@Validated
+public class WebClientHeaderProperties {
+    @NotBlank(message = "Missing header name")
+    private String name;
     
-    @Data
-    @Validated
-    public static class WebClientHeaderProperties {
-        @NotBlank(message = "Missing header name")
-        private String name;
-        
-        private String value;
-        private String source;
-        
-        @AssertTrue(message = "Header value and source cannot both be null")
-        public boolean isValueOrSourcePresent() {
-            return value != null || source != null;
-        }
-    }
+    private String value;
+    private String source;
     
-    @Data
-    @Validated
-    public static class OAuthProperties {
-        private String name;
-        
-        @NotBlank(message = "Missing client-id")
-        private String clientId;
-        
-        @NotNull(message = "Missing minutes-too-close-to-expiry")
-        private Integer minutesTooCloseToExpiry;
-        
-        @NotBlank(message = "Missing secret")
-        private String secret;
-        
-        @NotBlank(message = "Missing scope")
-        private String scope;
-        
-        @NotBlank(message = "Missing grant-type")
-        private String grantType;
-        
-        @NotBlank(message = "Missing ping-oauth-uri")
-        private String pingOauthUri;
-        
-        private boolean defaultOauth2AuthorizedClient;
+    @AssertTrue(message = "Header value and source cannot both be null")
+    public boolean isValueOrSourcePresent() {
+        return value != null || source != null;
     }
+}
+
+@Data
+@Validated
+public class ClientCredentialProperties {
+    private String name;
     
-    // Your utility method can remain
-    public static <T> T coalesce(T... items) {
-        for (T i : items) {
-            if (i != null) {
-                return i;
-            }
-        }
-        return null;
-    }
+    @NotBlank(message = "Missing client-id")
+    private String clientId;
+    
+    @NotNull(message = "Missing minutes-too-close-to-expiry")
+    private Integer minutesTooCloseToExpiry;
+    
+    @NotBlank(message = "Missing secret")
+    private String secret;
+    
+    @NotBlank(message = "Missing scope")
+    private String scope;
+    
+    @NotBlank(message = "Missing grant-type")
+    private String grantType;
+    
+    @NotBlank(message = "Missing ping-oauth-uri")
+    private String pingOauthUri;
+    
+    private boolean defaultOauth2AuthorizedClient;
 }
