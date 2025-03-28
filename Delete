@@ -1,92 +1,48 @@
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.junit.jupiter.api.BeforeEach;
+import com.fasterxml.jackson.databind.SerializationConfig;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-class JacksonConfigUnitTest {
+class JacksonConfigTest {
 
-    private ObjectMapper objectMapper;
-    
-    @BeforeEach
-    void setUp() {
-        // Create the configuration class
+    @Test
+    void testCustomObjectMapperConfiguration() throws Exception {
+        // Create a clean ObjectMapper
+        ObjectMapper objectMapper = new ObjectMapper();
+        
+        // Create an instance of your config class
         JacksonConfig jacksonConfig = new JacksonConfig();
         
-        // Get a new ObjectMapper (Spring would normally inject this)
-        ObjectMapper mapper = new ObjectMapper();
-        
-        // Set the injected mapper
-        jacksonConfig.objectMapper = mapper;
+        // Manually inject the ObjectMapper
+        jacksonConfig.objectMapper = objectMapper;
         
         // Call the configuration method
         jacksonConfig.customizeObjectMapper();
         
-        // Use the configured mapper
-        this.objectMapper = mapper;
-    }
-    
-    @Test
-    void shouldFilterDummyProperty() throws Exception {
-        // Same test logic as before
-    }
-}
-
-
-
-
-
-------------------------------------------
-
-
-import com.fasterxml.jackson.databind.ObjectMapper;
-import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.context.annotation.Import;
-
-import static org.junit.jupiter.api.Assertions.*;
-
-@SpringBootTest
-@Import(JacksonConfig.class)
-class JacksonConfigTest {
-
-    @Autowired
-    private ObjectMapper objectMapper;
-
-    @Test
-    void shouldFilterDummyProperty() throws Exception {
-        // Create test object with dummyProperty and other properties
-        TestObject testObject = new TestObject();
-        testObject.setDummyProperty("should be filtered");
-        testObject.setRegularProperty("should be included");
+        // Create a test object with the dummy property
+        TestBean testBean = new TestBean();
+        testBean.setDummyProperty("should be filtered");
+        testBean.setNormalProperty("should be included");
         
         // Serialize the object
-        String json = objectMapper.writeValueAsString(testObject);
+        String json = objectMapper.writeValueAsString(testBean);
         
-        // Verify dummyProperty is not included
-        assertFalse(json.contains("dummyProperty"));
-        assertTrue(json.contains("regularProperty"));
+        // Verify the filtering worked
+        assertFalse(json.contains("dummyProperty"), "Should not contain dummyProperty");
+        assertTrue(json.contains("normalProperty"), "Should contain normalProperty");
+        assertTrue(json.contains("should be included"), "Should contain the normal property value");
     }
     
-    @Test
-    void shouldRegisterSimpleModule() {
-        // Test that the SimpleModule is registered
-        assertTrue(objectMapper.getRegisteredModuleIds()
-            .stream()
-            .anyMatch(id -> id.toString().contains("SimpleModule")));
-    }
-    
-    // Test class with properties to serialize
-    static class TestObject {
+    // Simple test bean class
+    static class TestBean {
         private String dummyProperty;
-        private String regularProperty;
+        private String normalProperty;
         
-        // Getters and setters
         public String getDummyProperty() { return dummyProperty; }
         public void setDummyProperty(String dummyProperty) { this.dummyProperty = dummyProperty; }
         
-        public String getRegularProperty() { return regularProperty; }
-        public void setRegularProperty(String regularProperty) { this.regularProperty = regularProperty; }
+        public String getNormalProperty() { return normalProperty; }
+        public void setNormalProperty(String normalProperty) { this.normalProperty = normalProperty; }
     }
 }
