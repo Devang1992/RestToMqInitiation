@@ -1,0 +1,92 @@
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class JacksonConfigUnitTest {
+
+    private ObjectMapper objectMapper;
+    
+    @BeforeEach
+    void setUp() {
+        // Create the configuration class
+        JacksonConfig jacksonConfig = new JacksonConfig();
+        
+        // Get a new ObjectMapper (Spring would normally inject this)
+        ObjectMapper mapper = new ObjectMapper();
+        
+        // Set the injected mapper
+        jacksonConfig.objectMapper = mapper;
+        
+        // Call the configuration method
+        jacksonConfig.customizeObjectMapper();
+        
+        // Use the configured mapper
+        this.objectMapper = mapper;
+    }
+    
+    @Test
+    void shouldFilterDummyProperty() throws Exception {
+        // Same test logic as before
+    }
+}
+
+
+
+
+
+------------------------------------------
+
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.annotation.Import;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+@SpringBootTest
+@Import(JacksonConfig.class)
+class JacksonConfigTest {
+
+    @Autowired
+    private ObjectMapper objectMapper;
+
+    @Test
+    void shouldFilterDummyProperty() throws Exception {
+        // Create test object with dummyProperty and other properties
+        TestObject testObject = new TestObject();
+        testObject.setDummyProperty("should be filtered");
+        testObject.setRegularProperty("should be included");
+        
+        // Serialize the object
+        String json = objectMapper.writeValueAsString(testObject);
+        
+        // Verify dummyProperty is not included
+        assertFalse(json.contains("dummyProperty"));
+        assertTrue(json.contains("regularProperty"));
+    }
+    
+    @Test
+    void shouldRegisterSimpleModule() {
+        // Test that the SimpleModule is registered
+        assertTrue(objectMapper.getRegisteredModuleIds()
+            .stream()
+            .anyMatch(id -> id.toString().contains("SimpleModule")));
+    }
+    
+    // Test class with properties to serialize
+    static class TestObject {
+        private String dummyProperty;
+        private String regularProperty;
+        
+        // Getters and setters
+        public String getDummyProperty() { return dummyProperty; }
+        public void setDummyProperty(String dummyProperty) { this.dummyProperty = dummyProperty; }
+        
+        public String getRegularProperty() { return regularProperty; }
+        public void setRegularProperty(String regularProperty) { this.regularProperty = regularProperty; }
+    }
+}
