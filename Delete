@@ -76,3 +76,63 @@ public void testAllExceptionHandlingMethods() {
     assertNotNull(hmnrResponse2);
     verify(errorHandlingSupport).getStatus(eq(ErrorStatus.ERR_400_BAD_REQUEST), eq("Error message"));
 }
+
+
+
+=-------------
+
+@Test
+void shouldHandleHttpMessageNotReadable() {
+    // Create a Status object and set basic properties
+    Status status = new Status();
+    status.setSeverity(Status.Severity.Error);
+    status.setServerStatusCode("400");
+    
+    // Create AdditionalStatus with all required fields
+    List<AdditionalStatus> additionalStatuses = new ArrayList<>();
+    AdditionalStatus additionalStatus1 = new AdditionalStatus();
+    additionalStatus1.setStatusDesc("Status 1 - %s");
+    additionalStatus1.setCode("INVALID_FORMAT"); // Add code if required by your implementation
+    additionalStatus1.setType("ERROR"); // Add type if required by your implementation
+    additionalStatus1.setSeverity(Severity.ERROR); // Add severity if required
+    
+    // Add to collection
+    additionalStatuses.add(additionalStatus1);
+    
+    // Set the collection on the status
+    status.setAdditionalStatus(additionalStatuses);
+    
+    // Mock the dependencies
+    when(errorHandlingSupport.getStatusWithoutPopulatingAdditionalStatus(any(ErrorStatusBase.class))).thenReturn(status);
+    when(errorHandlingSupport.getStatus(any(ErrorStatusBase.class))).thenReturn(status);
+    
+    // Create mock request objects
+    WebRequest webRequest = mock(WebRequest.class);
+    HttpInputMessage inputMessage = mock(HttpInputMessage.class);
+    
+    // Create the exception
+    HttpMessageNotReadableException e = new HttpMessageNotReadableException("test", inputMessage);
+    e.addSuppressed(new Throwable());
+    
+    // Call the method
+    ResponseEntity<Object> responseEntity = commonApiExceptionHandler.handleHttpMessageNotReadable(
+            e, new HttpHeaders(), HttpStatus.BAD_REQUEST, webRequest);
+    
+    // Assertions
+    assertNotNull(responseEntity);
+    assertEquals(HttpStatus.BAD_REQUEST, responseEntity.getStatusCode());
+    
+    // Verify the Status object inside the response
+    if (responseEntity.getBody() instanceof Status) {
+        Status responseStatus = (Status) responseEntity.getBody();
+        assertEquals(Status.Severity.Error, responseStatus.getSeverity());
+        assertEquals("400", responseStatus.getServerStatusCode());
+        
+        // Verify additional status
+        assertNotNull(responseStatus.getAdditionalStatus());
+        assertFalse(responseStatus.getAdditionalStatus().isEmpty());
+        assertEquals("Status 1 - %s", responseStatus.getAdditionalStatus().get(0).getStatusDesc());
+    } else {
+        fail("Response body should be of type Status");
+    }
+}
