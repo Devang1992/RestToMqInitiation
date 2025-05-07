@@ -1,138 +1,41 @@
-@Test
-public void testAllExceptionHandlingMethods() {
-    // Setup
-    ErrorHandlingSupport errorHandlingSupport = mock(ErrorHandlingSupport.class);
-    
-    // Create instance of the exception handler using reflection or a constructor
-    YourExceptionHandlerClass exceptionHandler = new YourExceptionHandlerClass();
-    // Set the errorHandlingSupport field using reflection or a setter
-    ReflectionTestUtils.setField(exceptionHandler, "errorHandlingSupport", errorHandlingSupport);
-    
-    // Mock various return values
-    Status mockStatus = new Status();
-    ResponseEntity<Status> mockResponseEntity = ResponseEntity.badRequest().body(mockStatus);
-    ResponseEntity<Object> mockObjectResponseEntity = ResponseEntity.badRequest().body("Test");
-    
-    when(errorHandlingSupport.getStatusWithoutPopulatingAdditionalStatus(any(ErrorStatus.class)))
-        .thenReturn(mockStatus);
-    when(errorHandlingSupport.getResponseEntity(any(Status.class)))
-        .thenReturn(mockResponseEntity);
-    when(errorHandlingSupport.getStatus(any(ErrorStatus.class), anyString(), anyString(), anyString(), anyString()))
-        .thenReturn(mockStatus);
-    when(errorHandlingSupport.getStatus(any(ErrorStatus.class), anyString()))
-        .thenReturn(mockStatus);
-    when(errorHandlingSupport.populatePlaceholderInStatusDesc(any(), any(), any()))
-        .thenReturn("Test message");
-    
-    // Test handleConstraintViolationException
-    ConstraintViolationException cvException = mock(ConstraintViolationException.class);
-    Set<ConstraintViolation<?>> violations = new HashSet<>();
-    ConstraintViolation<?> violation = mock(ConstraintViolation.class);
-    when(violation.getMessage()).thenReturn("Validation failed");
-    violations.add(violation);
-    when(cvException.getConstraintViolations()).thenReturn(violations);
-    
-    ResponseEntity<Status> cvResponse = exceptionHandler.handleConstraintViolationException(cvException);
-    assertNotNull(cvResponse);
-    assertEquals(mockResponseEntity, cvResponse);
-    
-    // Test handleMethodArgumentNotValid
-    MethodArgumentNotValidException maException = mock(MethodArgumentNotValidException.class);
-    HttpHeaders headers = new HttpHeaders();
-    HttpStatusCode httpStatus = HttpStatus.BAD_REQUEST;
-    WebRequest request = mock(WebRequest.class);
-    
-    ResponseEntity<Object> maResponse = exceptionHandler.handleMethodArgumentNotValid(
-            maException, headers, httpStatus, request);
-    assertNotNull(maResponse);
-    verify(errorHandlingSupport).getStatusWithoutPopulatingAdditionalStatus(ErrorStatus.ERR_400_BAD_REQUEST);
-    
-    // Test handleInvalidFormatException
-    InvalidFormatException ifException = mock(InvalidFormatException.class);
-    when(ifException.getPath()).thenReturn(Collections.singletonList(mock(JsonMappingException.Reference.class)));
-    when(ifException.getTargetType()).thenReturn(String.class);
-    when(ifException.getLocation()).thenReturn(mock(JsonLocation.class));
-    when(ifException.getLocation().getLineNr()).thenReturn(10);
-    when(ifException.getLocation().getColumnNr()).thenReturn(20);
-    
-    ResponseEntity<Status> ifResponse = exceptionHandler.handleInvalidFormatException(ifException);
-    assertNotNull(ifResponse);
-    verify(errorHandlingSupport).getStatus(eq(ErrorStatus.ERR_400_INVALID_DATATYPE_FORMAT), anyString());
-    
-    // Test handleHttpMessageNotReadable
-    HttpMessageNotReadableException hmnrException = mock(HttpMessageNotReadableException.class);
-    when(hmnrException.getCause()).thenReturn(ifException); // Test the instanceof case
-    
-    ResponseEntity<Object> hmnrResponse = exceptionHandler.handleHttpMessageNotReadable(
-            hmnrException, headers, httpStatus, request);
-    assertNotNull(hmnrResponse);
-    
-    // Test with different cause
-    when(hmnrException.getCause()).thenReturn(new RuntimeException()); // Test the else case
-    when(hmnrException.getMessage()).thenReturn("Error message");
-    
-    ResponseEntity<Object> hmnrResponse2 = exceptionHandler.handleHttpMessageNotReadable(
-            hmnrException, headers, httpStatus, request);
-    assertNotNull(hmnrResponse2);
-    verify(errorHandlingSupport).getStatus(eq(ErrorStatus.ERR_400_BAD_REQUEST), eq("Error message"));
-}
+const [environmentMap, setEnvironmentMap] = useState({});
+const [selectedFields, setSelectedFields] = useState([]);
+
+--
+useEffect(() => {
+  fetch("/api/config/environments")
+    .then(res => res.json())
+    .then(data => setEnvironmentMap(data));
+}, []);
 
 
+---
 
-=-------------
+const handleChange = (e) => {
+  const { name, value } = e.target;
+  setFormData(prev => ({ ...prev, [name]: value }));
 
-@Test
-void shouldHandleHttpMessageNotReadable() {
-    // Create a Status object and set basic properties
-    Status status = new Status();
-    status.setSeverity(Status.Severity.Error);
-    status.setServerStatusCode("400");
-    
-    // Create AdditionalStatus with all required fields
-    List<AdditionalStatus> additionalStatuses = new ArrayList<>();
-    AdditionalStatus additionalStatus1 = new AdditionalStatus();
-    additionalStatus1.setStatusDesc("Status 1 - %s");
-    additionalStatus1.setCode("INVALID_FORMAT"); // Add code if required by your implementation
-    additionalStatus1.setType("ERROR"); // Add type if required by your implementation
-    additionalStatus1.setSeverity(Severity.ERROR); // Add severity if required
-    
-    // Add to collection
-    additionalStatuses.add(additionalStatus1);
-    
-    // Set the collection on the status
-    status.setAdditionalStatus(additionalStatuses);
-    
-    // Mock the dependencies
-    when(errorHandlingSupport.getStatusWithoutPopulatingAdditionalStatus(any(ErrorStatusBase.class))).thenReturn(status);
-    when(errorHandlingSupport.getStatus(any(ErrorStatusBase.class))).thenReturn(status);
-    
-    // Create mock request objects
-    WebRequest webRequest = mock(WebRequest.class);
-    HttpInputMessage inputMessage = mock(HttpInputMessage.class);
-    
-    // Create the exception
-    HttpMessageNotReadableException e = new HttpMessageNotReadableException("test", inputMessage);
-    e.addSuppressed(new Throwable());
-    
-    // Call the method
-    ResponseEntity<Object> responseEntity = commonApiExceptionHandler.handleHttpMessageNotReadable(
-            e, new HttpHeaders(), HttpStatus.BAD_REQUEST, webRequest);
-    
-    // Assertions
-    assertNotNull(responseEntity);
-    assertEquals(HttpStatus.BAD_REQUEST, responseEntity.getStatusCode());
-    
-    // Verify the Status object inside the response
-    if (responseEntity.getBody() instanceof Status) {
-        Status responseStatus = (Status) responseEntity.getBody();
-        assertEquals(Status.Severity.Error, responseStatus.getSeverity());
-        assertEquals("400", responseStatus.getServerStatusCode());
-        
-        // Verify additional status
-        assertNotNull(responseStatus.getAdditionalStatus());
-        assertFalse(responseStatus.getAdditionalStatus().isEmpty());
-        assertEquals("Status 1 - %s", responseStatus.getAdditionalStatus().get(0).getStatusDesc());
-    } else {
-        fail("Response body should be of type Status");
-    }
-}
+  if (name === "environmentId" && environmentMap[value]) {
+    setSelectedFields(environmentMap[value]);
+  }
+};
+
+---
+<select name="environmentId" value={formData.environmentId} onChange={handleChange}>
+  <option value="">Choose one</option>
+  {Object.keys(environmentMap).map(key => (
+    <option key={key} value={key}>{key}</option>
+  ))}
+</select>
+
+{selectedFields.map((fieldName, idx) => (
+  <div key={idx}>
+    <label>{fieldName}</label>
+    <input
+      type="text"
+      name={fieldName}
+      value={formData[fieldName] || ""}
+      onChange={handleChange}
+    />
+  </div>
+))}
