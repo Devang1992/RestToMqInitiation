@@ -1,41 +1,75 @@
-const [environmentMap, setEnvironmentMap] = useState({});
-const [selectedFields, setSelectedFields] = useState([]);
+1. Kafka Examples by fhussonnois
 
---
-useEffect(() => {
-  fetch("/api/config/environments")
-    .then(res => res.json())
-    .then(data => setEnvironmentMap(data));
-}, []);
+Description: This repository contains small examples demonstrating Kafka Producer/Consumer API and Kafka Streams features. It includes examples of implementing custom producer and consumer interceptors.
+
+Key Features:
+
+ProducerWithInterceptor: Demonstrates how to implement a custom producer interceptor to track all records being sent.
+
+ConsumerWithInterceptor: Demonstrates how to implement a custom consumer interceptor to track all records being fetched.
+
+Link: fhussonnois/kafka-examples
+GitHub
+
+🧰 Generic Kafka Producer-Consumer Libraries
+2. JCGenericKafka by jsoft88
+
+Description: A generic Kafka producer-consumer Java library that allows creating custom producers and consumers by extending base abstract classes. This approach offers faster implementation and better customization compared to high-level consumer classes.
+
+Key Features:
+
+Based on SimpleConsumer class, providing more control over partition consumption.
+
+Facilitates custom implementations tailored to specific needs.
+
+Link: jsoft88/JCGenericKafka
+GitHub
+
+🚀 Simple Kafka Producer and Consumer Examples
+3. Kafka Example by thejasbabu
+
+Description: A straightforward Kafka Consumer and Producer example demonstrating the basics of producing and consuming messages.
+
+Key Features:
+
+Step-by-step instructions to run the project.
+
+Manual topic creation and message production/consumption.
+
+Link: thejasbabu/kafka-example
+GitHub
++2
+GitHub
++2
+GitHub
++2
+GitHub
+
+4. Kafka Java Get Started by isaccanedo
+Description: Java-based examples demonstrating how to use Kafka Consumer, Producer, and Streaming APIs.
+Key Features:
+Includes separate projects for Producer-Consumer and Streaming.
+Demonstrates integration with Kafka on HDInsight cluster.
+Link: isaccanedo/kafka-java-get-started
 
 
----
 
-const handleChange = (e) => {
-  const { name, value } = e.target;
-  setFormData(prev => ({ ...prev, [name]: value }));
+https://github.com/jonathan-foucher/spring-boot-kafka-json-example
 
-  if (name === "environmentId" && environmentMap[value]) {
-    setSelectedFields(environmentMap[value]);
-  }
-};
+https://github.com/nks067/Spring-Boot-Kafka
 
----
-<select name="environmentId" value={formData.environmentId} onChange={handleChange}>
-  <option value="">Choose one</option>
-  {Object.keys(environmentMap).map(key => (
-    <option key={key} value={key}>{key}</option>
-  ))}
-</select>
+https://github.com/lydtechconsulting/kafka-springboot-consume-produce
 
-{selectedFields.map((fieldName, idx) => (
-  <div key={idx}>
-    <label>{fieldName}</label>
-    <input
-      type="text"
-      name={fieldName}
-      value={formData[fieldName] || ""}
-      onChange={handleChange}
-    />
-  </div>
-))}
+
+
+
+https://github.com/ayortanli/kafka-with-springboot
+
+https://github.com/thepracticaldeveloper/kafka-spring-boot-example
+
+https://github.com/Yogeshk4124/Kafka-Spring-Boot-Application
+
+
+
+https://github.com/CloudKarafka/springboot-kafka-example
+https://github.com/athrocks/Spring-Apache-Kafka
