@@ -90,3 +90,568 @@ docker run -d \
 
 https://github.com/CloudKarafka/springboot-kafka-example
 https://github.com/athrocks/Spring-Apache-Kafka
+=----------------------
+// application.yml
+spring:
+  application:
+    name: data-processing-service
+  kafka:
+    bootstrap-servers: localhost:9092
+    streams:
+      application-id: data-processor
+      default-key-serde: org.apache.kafka.common.serialization.Serdes$StringSerde
+      default-value-serde: org.springframework.kafka.support.serializer.JsonSerde
+      properties:
+        default.key.serde: org.apache.kafka.common.serialization.Serdes$StringSerde
+        default.value.serde: org.springframework.kafka.support.serializer.JsonSerde
+        commit.interval.ms: 1000
+        cache.max.bytes.buffering: 10240
+        metadata.max.age.ms: 500000
+        auto.offset.reset: earliest
+        security.protocol: PLAINTEXT
+
+app:
+  kafka:
+    topics:
+      input: raw-data-topic
+      output: processed-data-topic
+      error: error-topic
+    processing:
+      batch-size: 100
+      timeout-ms: 5000
+      retry-attempts: 3
+    monitoring:
+      enabled: true
+      metrics-interval: 30
+
+logging:
+  level:
+    org.apache.kafka: INFO
+    com.yourcompany.processor: DEBUG
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,kafka-streams
+  endpoint:
+    health:
+      show-details: always
+
+---
+
+// KafkaStreamsConfig.java
+package com.yourcompany.processor.config;
+
+import lombok.Data;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.validation.annotation.Validated;
+
+import javax.validation.Valid;
+import javax.validation.constraints.NotBlank;
+import javax.validation.constraints.NotNull;
+import javax.validation.constraints.Positive;
+
+@Data
+@Configuration
+@ConfigurationProperties(prefix = "app.kafka")
+@Validated
+public class KafkaStreamsConfig {
+
+    @Valid
+    @NotNull
+    private Topics topics = new Topics();
+
+    @Valid
+    @NotNull
+    private Processing processing = new Processing();
+
+    @Valid
+    @NotNull
+    private Monitoring monitoring = new Monitoring();
+
+    @Data
+    public static class Topics {
+        @NotBlank
+        private String input = "raw-data-topic";
+        
+        @NotBlank
+        private String output = "processed-data-topic";
+        
+        @NotBlank
+        private String error = "error-topic";
+    }
+
+    @Data
+    public static class Processing {
+        @Positive
+        private int batchSize = 100;
+        
+        @Positive
+        private long timeoutMs = 5000;
+        
+        @Positive
+        private int retryAttempts = 3;
+    }
+
+    @Data
+    public static class Monitoring {
+        private boolean enabled = true;
+        
+        @Positive
+        private int metricsInterval = 30;
+    }
+}
+
+---
+
+// StreamsConfiguration.java
+package com.yourcompany.processor.config;
+
+import com.yourcompany.processor.serde.JsonSerde;
+import com.yourcompany.processor.model.InputData;
+import com.yourcompany.processor.model.OutputData;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.errors.LogAndContinueExceptionHandler;
+import org.springframework.boot.autoconfigure.kafka.KafkaProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.annotation.EnableKafkaStreams;
+import org.springframework.kafka.annotation.KafkaStreamsDefaultConfiguration;
+import org.springframework.kafka.config.KafkaStreamsConfiguration;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@Slf4j
+@Configuration
+@EnableKafkaStreams
+@RequiredArgsConstructor
+public class StreamsConfiguration {
+
+    private final KafkaProperties kafkaProperties;
+    private final KafkaStreamsConfig config;
+
+    @Bean(name = KafkaStreamsDefaultConfiguration.DEFAULT_STREAMS_CONFIG_BEAN_NAME)
+    public KafkaStreamsConfiguration kStreamsConfig() {
+        Map<String, Object> props = new HashMap<>();
+        
+        // Basic configuration
+        props.put(StreamsConfig.APPLICATION_ID_CONFIG, kafkaProperties.getStreams().getApplicationId());
+        props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaProperties.getBootstrapServers());
+        
+        // Serialization
+        props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+        props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, JsonSerde.class);
+        
+        // Performance tuning
+        props.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 1000);
+        props.put(StreamsConfig.CACHE_MAX_BYTES_BUFFERING_CONFIG, 10240);
+        props.put(StreamsConfig.METADATA_MAX_AGE_CONFIG, 500000);
+        
+        // Error handling
+        props.put(StreamsConfig.DEFAULT_DESERIALIZATION_EXCEPTION_HANDLER_CLASS_CONFIG, 
+                 LogAndContinueExceptionHandler.class);
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        
+        // Monitoring
+        props.put(StreamsConfig.METRICS_RECORDING_LEVEL_CONFIG, "INFO");
+        
+        // Add custom properties from application.yml
+        props.putAll(kafkaProperties.getStreams().getProperties());
+        
+        log.info("Kafka Streams configuration initialized with application-id: {}", 
+                kafkaProperties.getStreams().getApplicationId());
+        
+        return new KafkaStreamsConfiguration(props);
+    }
+
+    @Bean
+    public JsonSerde<InputData> inputDataSerde() {
+        return new JsonSerde<>(InputData.class);
+    }
+
+    @Bean
+    public JsonSerde<OutputData> outputDataSerde() {
+        return new JsonSerde<>(OutputData.class);
+    }
+}
+
+---
+
+// DataProcessingStream.java
+package com.yourcompany.processor.stream;
+
+import com.yourcompany.processor.config.KafkaStreamsConfig;
+import com.yourcompany.processor.model.InputData;
+import com.yourcompany.processor.model.OutputData;
+import com.yourcompany.processor.service.DataProcessor;
+import com.yourcompany.processor.serde.JsonSerde;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.kstream.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Component;
+
+import java.time.Duration;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class DataProcessingStream {
+
+    private final KafkaStreamsConfig config;
+    private final DataProcessor dataProcessor;
+    private final JsonSerde<InputData> inputDataSerde;
+    private final JsonSerde<OutputData> outputDataSerde;
+
+    @Autowired
+    public void buildPipeline(StreamsBuilder streamsBuilder) {
+        log.info("Building Kafka Streams pipeline...");
+
+        // Create the main processing stream
+        KStream<String, InputData> inputStream = streamsBuilder
+                .stream(config.getTopics().getInput(), 
+                       Consumed.with(Serdes.String(), inputDataSerde))
+                .peek((key, value) -> log.debug("Received message with key: {}", key));
+
+        // Branch the stream for different processing paths
+        Map<String, KStream<String, InputData>> branches = inputStream
+                .split(Named.as("processing-"))
+                .branch((key, value) -> isValidForProcessing(value), Branched.as("valid"))
+                .branch((key, value) -> true, Branched.as("invalid"));
+
+        // Process valid messages
+        processValidMessages(branches.get("processing-valid"));
+
+        // Handle invalid messages
+        handleInvalidMessages(branches.get("processing-invalid"));
+
+        log.info("Kafka Streams pipeline built successfully");
+    }
+
+    private void processValidMessages(KStream<String, InputData> validStream) {
+        validStream
+                .mapValues(this::processData)
+                .filter((key, value) -> value != null)
+                .peek((key, value) -> log.debug("Processed message with key: {}", key))
+                .to(config.getTopics().getOutput(), 
+                   Produced.with(Serdes.String(), outputDataSerde));
+    }
+
+    private void handleInvalidMessages(KStream<String, InputData> invalidStream) {
+        invalidStream
+                .mapValues(this::createErrorMessage)
+                .peek((key, value) -> log.warn("Invalid message sent to error topic with key: {}", key))
+                .to(config.getTopics().getError(), 
+                   Produced.with(Serdes.String(), outputDataSerde));
+    }
+
+    private boolean isValidForProcessing(InputData data) {
+        return data != null && 
+               data.getId() != null && 
+               data.getData() != null && 
+               !data.getData().isEmpty();
+    }
+
+    private OutputData processData(InputData inputData) {
+        try {
+            return dataProcessor.process(inputData);
+        } catch (Exception e) {
+            log.error("Error processing data with id: {}", inputData.getId(), e);
+            return null; // Will be filtered out
+        }
+    }
+
+    private OutputData createErrorMessage(InputData inputData) {
+        return OutputData.builder()
+                .id(inputData != null ? inputData.getId() : "unknown")
+                .status("ERROR")
+                .message("Invalid input data")
+                .timestamp(System.currentTimeMillis())
+                .build();
+    }
+}
+
+---
+
+// DataProcessor.java
+package com.yourcompany.processor.service;
+
+import com.yourcompany.processor.config.KafkaStreamsConfig;
+import com.yourcompany.processor.model.InputData;
+import com.yourcompany.processor.model.OutputData;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.retry.annotation.Backoff;
+import org.springframework.retry.annotation.Retryable;
+import org.springframework.stereotype.Service;
+
+import java.util.concurrent.CompletableFuture;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class DataProcessor {
+
+    private final KafkaStreamsConfig config;
+
+    @Retryable(value = {Exception.class}, maxAttempts = 3, backoff = @Backoff(delay = 1000))
+    public OutputData process(InputData inputData) {
+        log.debug("Processing data with id: {}", inputData.getId());
+
+        try {
+            // Simulate complex processing
+            ProcessingResult result = performComplexProcessing(inputData);
+
+            return OutputData.builder()
+                    .id(inputData.getId())
+                    .originalData(inputData.getData())
+                    .processedData(result.getProcessedValue())
+                    .processingType(result.getProcessingType())
+                    .status("SUCCESS")
+                    .timestamp(System.currentTimeMillis())
+                    .metadata(result.getMetadata())
+                    .build();
+
+        } catch (Exception e) {
+            log.error("Failed to process data with id: {}", inputData.getId(), e);
+            throw new ProcessingException("Processing failed for id: " + inputData.getId(), e);
+        }
+    }
+
+    private ProcessingResult performComplexProcessing(InputData inputData) {
+        // Simulate complex business logic
+        String processedValue = transformData(inputData.getData());
+        String processingType = determineProcessingType(inputData);
+        
+        return ProcessingResult.builder()
+                .processedValue(processedValue)
+                .processingType(processingType)
+                .metadata(generateMetadata(inputData))
+                .build();
+    }
+
+    private String transformData(String data) {
+        // Your complex transformation logic here
+        return data.toUpperCase() + "_PROCESSED_" + System.currentTimeMillis();
+    }
+
+    private String determineProcessingType(InputData inputData) {
+        // Logic to determine processing type
+        return inputData.getData().length() > 100 ? "COMPLEX" : "SIMPLE";
+    }
+
+    private String generateMetadata(InputData inputData) {
+        return String.format("processed_at=%d,original_length=%d", 
+                           System.currentTimeMillis(), 
+                           inputData.getData().length());
+    }
+
+    // Inner classes for processing results
+    @lombok.Data
+    @lombok.Builder
+    public static class ProcessingResult {
+        private String processedValue;
+        private String processingType;
+        private String metadata;
+    }
+
+    public static class ProcessingException extends RuntimeException {
+        public ProcessingException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+}
+
+---
+
+// InputData.java
+package com.yourcompany.processor.model;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class InputData {
+    private String id;
+    private String data;
+    private String type;
+    private Long timestamp;
+}
+
+---
+
+// OutputData.java
+package com.yourcompany.processor.model;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class OutputData {
+    private String id;
+    private String originalData;
+    private String processedData;
+    private String processingType;
+    private String status;
+    private String message;
+    private Long timestamp;
+    private String metadata;
+}
+
+---
+
+// JsonSerde.java
+package com.yourcompany.processor.serde;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.common.serialization.Deserializer;
+import org.apache.kafka.common.serialization.Serde;
+import org.apache.kafka.common.serialization.Serializer;
+
+import java.util.Map;
+
+@Slf4j
+public class JsonSerde<T> implements Serde<T> {
+
+    private final ObjectMapper objectMapper;
+    private final Class<T> targetClass;
+
+    public JsonSerde(Class<T> targetClass) {
+        this.targetClass = targetClass;
+        this.objectMapper = new ObjectMapper();
+        this.objectMapper.registerModule(new JavaTimeModule());
+    }
+
+    @Override
+    public Serializer<T> serializer() {
+        return new JsonSerializer<>(objectMapper);
+    }
+
+    @Override
+    public Deserializer<T> deserializer() {
+        return new JsonDeserializer<>(objectMapper, targetClass);
+    }
+
+    private static class JsonSerializer<T> implements Serializer<T> {
+        private final ObjectMapper objectMapper;
+
+        public JsonSerializer(ObjectMapper objectMapper) {
+            this.objectMapper = objectMapper;
+        }
+
+        @Override
+        public byte[] serialize(String topic, T data) {
+            try {
+                return objectMapper.writeValueAsBytes(data);
+            } catch (Exception e) {
+                log.error("Error serializing data for topic: {}", topic, e);
+                throw new RuntimeException("Failed to serialize data", e);
+            }
+        }
+    }
+
+    private static class JsonDeserializer<T> implements Deserializer<T> {
+        private final ObjectMapper objectMapper;
+        private final Class<T> targetClass;
+
+        public JsonDeserializer(ObjectMapper objectMapper, Class<T> targetClass) {
+            this.objectMapper = objectMapper;
+            this.targetClass = targetClass;
+        }
+
+        @Override
+        public T deserialize(String topic, byte[] data) {
+            try {
+                return objectMapper.readValue(data, targetClass);
+            } catch (Exception e) {
+                log.error("Error deserializing data for topic: {}", topic, e);
+                return null; // Return null for invalid data
+            }
+        }
+    }
+}
+
+---
+
+// StreamsHealthIndicator.java
+package com.yourcompany.processor.health;
+
+import lombok.RequiredArgsConstructor;
+import org.apache.kafka.streams.KafkaStreams;
+import org.springframework.boot.actuator.health.Health;
+import org.springframework.boot.actuator.health.HealthIndicator;
+import org.springframework.kafka.config.StreamsBuilderFactoryBean;
+import org.springframework.stereotype.Component;
+
+@Component
+@RequiredArgsConstructor
+public class StreamsHealthIndicator implements HealthIndicator {
+
+    private final StreamsBuilderFactoryBean streamsBuilderFactoryBean;
+
+    @Override
+    public Health health() {
+        KafkaStreams kafkaStreams = streamsBuilderFactoryBean.getKafkaStreams();
+        
+        if (kafkaStreams == null) {
+            return Health.down().withDetail("kafka-streams", "Not initialized").build();
+        }
+
+        KafkaStreams.State state = kafkaStreams.state();
+        
+        return switch (state) {
+            case RUNNING -> Health.up()
+                    .withDetail("state", state.name())
+                    .withDetail("application-id", kafkaStreams.applicationId())
+                    .build();
+            case ERROR -> Health.down()
+                    .withDetail("state", state.name())
+                    .withDetail("application-id", kafkaStreams.applicationId())
+                    .build();
+            default -> Health.unknown()
+                    .withDetail("state", state.name())
+                    .withDetail("application-id", kafkaStreams.applicationId())
+                    .build();
+        };
+    }
+}
+
+---
+
+// Application.java
+package com.yourcompany.processor;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.retry.annotation.EnableRetry;
+
+@SpringBootApplication
+@EnableConfigurationProperties
+@EnableRetry
+public class Application {
+    public static void main(String[] args) {
+        SpringApplication.run(Application.class, args);
+    }
+}
