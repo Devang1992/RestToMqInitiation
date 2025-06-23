@@ -1,3 +1,8 @@
+docker exec -it kafka-kraft kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --create --topic test-topic --partitions 1 --replication-factor 1
+
+
 docker run -d --name kafka-kraft \
   -e KAFKA_CFG_PROCESS_ROLES=broker,controller \
   -e KAFKA_CFG_NODE_ID=1 \
