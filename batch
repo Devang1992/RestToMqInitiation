@@ -1,0 +1,93 @@
+1. Controller Trigger
+java
+Copy
+Edit
+@RestController
+@RequestMapping("/batch")
+public class BatchController {
+
+    private final BatchService batchService;
+
+    public BatchController(BatchService batchService) {
+        this.batchService = batchService;
+    }
+
+    @PostMapping("/run")
+    public ResponseEntity<String> runBatch() {
+        batchService.startBatchProcess();
+        return ResponseEntity.ok("Batch process triggered.");
+    }
+}
+🧠 2. Batch Service
+java
+Copy
+Edit
+@Service
+public class BatchService {
+
+    private final KafkaBatchConsumer kafkaBatchConsumer;
+
+    public BatchService(KafkaBatchConsumer kafkaBatchConsumer) {
+        this.kafkaBatchConsumer = kafkaBatchConsumer;
+    }
+
+    public void startBatchProcess() {
+        List<String> messages = kafkaBatchConsumer.pollMessages();
+        FileWriterUtil.writeToFile(messages, "output-batch.txt");
+    }
+}
+🛰️ 3. Kafka Consumer (Manual Pull – Not @KafkaListener)
+java
+Copy
+Edit
+@Component
+public class KafkaBatchConsumer {
+
+    private final Consumer<String, String> consumer;
+
+    public KafkaBatchConsumer() {
+        Properties props = new Properties();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "batch-consumer");
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+
+        consumer = new KafkaConsumer<>(props);
+        consumer.subscribe(Collections.singletonList("your-topic-name"));
+    }
+
+    public List<String> pollMessages() {
+        List<String> result = new ArrayList<>();
+        ConsumerRecords<String, String> records = consumer.poll(Duration.ofSeconds(10));
+        for (ConsumerRecord<String, String> record : records) {
+            result.add(record.value());
+        }
+        return result;
+    }
+}
+🗂️ 4. File Writer Utility
+java
+Copy
+Edit
+public class FileWriterUtil {
+
+    public static void writeToFile(List<String> lines, String filename) {
+        try {
+            Path filePath = Paths.get("batches", filename); // output in /batches
+            Files.createDirectories(filePath.getParent());
+            Files.write(filePath, lines, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to write batch file", e);
+        }
+    }
+}
+⚙️ 5. application.yml (for file config, optional)
+yaml
+Copy
+Edit
+batch:
+  output-dir: batches
+  topic-name: your-topic-name
+  file-name-prefix: batch-output-
+You can then bind this using @ConfigurationProperties(prefix = "batch") if you want to configure file name/format dynamically.
