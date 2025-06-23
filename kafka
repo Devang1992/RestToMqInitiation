@@ -1,3 +1,13 @@
+# Start the producer with header parsing enabled
+docker exec -it kafka kafka-console-producer.sh \
+  --topic user-events \
+  --bootstrap-server localhost:9092 \
+  --property "parse.headers=true" \
+  --property "headers.delimiter=:"
+
+# Then type this and press Enter:
+userId:12345	Hello World with header
+
 package com.example.service;
 
 import org.springframework.kafka.annotation.KafkaListener;
