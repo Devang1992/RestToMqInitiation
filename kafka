@@ -1,3 +1,24 @@
+# Create topics using Docker exec
+docker exec kafka kafka-topics.sh --create --topic user-events --bootstrap-server localhost:9092 --partitions 3 --replication-factor 1
+
+docker exec kafka kafka-topics.sh --create --topic order-events --bootstrap-server localhost:9092 --partitions 2 --replication-factor 1
+
+docker exec kafka kafka-topics.sh --create --topic notifications --bootstrap-server localhost:9092 --partitions 1 --replication-factor 1
+
+# List all topics
+docker exec kafka kafka-topics.sh --list --bootstrap-server localhost:9092
+
+# Describe a topic
+docker exec kafka kafka-topics.sh --describe --topic user-events --bootstrap-server localhost:9092
+
+# Test producer from command line
+docker exec -it kafka kafka-console-producer.sh --topic user-events --bootstrap-server localhost:9092
+
+# Test consumer from command line
+docker exec -it kafka kafka-console-consumer.sh --topic user-events --from-beginning --bootstrap-server localhost:9092
+
+
+
 # Create a network for Kafka
 docker network create kafka-network
 
