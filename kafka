@@ -1,6 +1,13 @@
-You're right to check that — Apache Kafka requires Zookeeper (unless you're using KRaft mode in newer versions, which Bitnami doesn’t fully support yet by default).
+docker run -d --name kafka-kraft \
+  -e KAFKA_CFG_PROCESS_ROLES=broker,controller \
+  -e KAFKA_CFG_NODE_ID=1 \
+  -e KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+  -e KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+  -e KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
+  -e KAFKA_KRAFT_CLUSTER_ID=abcdefghij1234567890 \
+  -p 9092:9092 \
+  bitnami/kafka:latest
 
-So if you're using Bitnami Kafka, you must run Zookeeper too.
 
 ✅ Here's how to run Kafka + Zookeeper locally without Docker Compose:
 Since you already have the bitnami/kafka image, let’s go step-by-step:
