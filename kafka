@@ -1,6 +1,57 @@
+Run the following command once to initialize the KRaft metadata:
+
+bash
+Copy
+Edit
+docker run --rm \
+  -e KAFKA_KRAFT_CLUSTER_ID=abcdefghij1234567890 \
+  bitnami/kafka:3.4.0 \
+  kafka-storage.sh format --cluster-id abcdefghij1234567890 --ignore-formatted
+Explanation:
+
+This tells Kafka to prepare its internal metadata storage (no ZooKeeper involved).
+
+--ignore-formatted avoids error if you rerun it by mistake.
+
+🔁 Then: Start Your Kafka Container Again
+bash
+Copy
+Edit
+docker run --name kafka-kraft \
+  -e ALLOW_PLAINTEXT_LISTENER=yes \
+  -e KAFKA_CFG_PROCESS_ROLES=broker,controller \
+  -e KAFKA_CFG_NODE_ID=1 \
+  -e KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+  -e KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+  -e KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
+  -e KAFKA_KRAFT_CLUSTER_ID=abcdefghij1234567890 \
+  -p 9092:9092 -p 9093:9093 \
+  bitnami/kafka:3.4.0
+You should now see logs indicating successful broker startup.
+
+🧪 Bonus: Test That It’s Running
+bash
+Copy
+Edit
+docker exec -it kafka-kraft \
+  kafka-topics.sh --bootstrap-server localhost:9092 --list
+If this lists no topics (but runs), you're good.
+
+If it's still exiting:
+
+Run this: docker logs kafka-kraft | tail -n 50
+
+Share that here so I can help debug exactly where it's failing.
+
+You're almost there — we just need this one-time setup right.
+
+
 docker run -d --name kafka-kraft \
   -e KAFKA_CFG_PROCESS_ROLES=broker,controller \
   -e KAFKA_CFG_NODE_ID=1 \
+
+
+
   -e KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka-kraft:9093 \
   -e KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
   -e KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
