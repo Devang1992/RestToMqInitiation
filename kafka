@@ -1,3 +1,24 @@
+public ConcurrentMessageListenerContainer<String, String> listenerContainer(
+            ConsumerFactory<String, String> consumerFactory) {
+
+        ContainerProperties containerProps = new ContainerProperties("orders-topic");
+
+        containerProps.setMessageListener((MessageListener<String, String>) record -> {
+            Header header = record.headers().lastHeader("status");
+            String status = (header != null)
+                ? new String(header.value(), StandardCharsets.UTF_8)
+                : "unknown";
+
+            if ("completed".equalsIgnoreCase(status)) {
+                System.out.println("✅ Processed: " + record.value());
+            } else {
+                System.out.println("❌ Skipped (status = " + status + "): " + record.value());
+            }
+        });
+
+        return new ConcurrentMessageListenerContainer<>(consumerFactory, containerProps);
+    }
+
 docker exec -it kafka kafka-console-producer.sh \
   --topic user-events \
   --bootstrap-server localhost:9092 \
