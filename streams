@@ -1,0 +1,76 @@
+ 1. Create Your Mapper Service (based on mid)
+
+@Component
+public class MyMapperService {
+
+    public String map(String value, String mid) {
+        // Perform transformation based on `mid` logic
+        // For demo: append mid to value
+        return String.format("{\"mid\":\"%s\",\"payload\":%s}", mid, value);
+    }
+}
+✅ 2. Custom Transformer with Both Headers
+
+public class HeaderFilteringMapperTransformer implements Transformer<String, String, KeyValue<String, String>> {
+
+    private final String requiredStatus;
+    private final MyMapperService mapperService;
+    private ProcessorContext context;
+
+    public HeaderFilteringMapperTransformer(String requiredStatus, MyMapperService mapperService) {
+        this.requiredStatus = requiredStatus;
+        this.mapperService = mapperService;
+    }
+
+    @Override
+    public void init(ProcessorContext context) {
+        this.context = context;
+    }
+
+    @Override
+    public KeyValue<String, String> transform(String key, String value) {
+        String status = headerValue("status");
+        String mid = headerValue("mid");
+
+        if ("completed".equalsIgnoreCase(status)) {
+            String mapped = mapperService.map(value, mid);
+            return KeyValue.pair(key, mapped);
+        }
+        return null;
+    }
+
+    private String headerValue(String name) {
+        Header header = context.headers().lastHeader(name);
+        return header != null ? new String(header.value(), StandardCharsets.UTF_8) : null;
+    }
+
+    @Override
+    public void close() {}
+}
+
+
+
+
+@Configuration
+public class KafkaStreamConfig {
+
+    @Bean
+    public KStream<String, String> kStream(StreamsBuilder builder, MyMapperService mapperService) {
+        return builder
+            .stream("input-topic")
+            .transform(() -> new HeaderFilteringMapperTransformer("completed", mapperService))
+            .to("output-topic", Produced.with(Serdes.String(), Serdes.String()));
+    }
+}
+🧪 Sample Input
+Kafka producer sending:
+
+json
+Copy
+Edit
+// Value:
+{"orderId":"123", "item":"Apple"}
+
+// Headers:
+status=completed
+mid=foo123
