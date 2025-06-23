@@ -1,0 +1,65 @@
+You're right to check that — Apache Kafka requires Zookeeper (unless you're using KRaft mode in newer versions, which Bitnami doesn’t fully support yet by default).
+
+So if you're using Bitnami Kafka, you must run Zookeeper too.
+
+✅ Here's how to run Kafka + Zookeeper locally without Docker Compose:
+Since you already have the bitnami/kafka image, let’s go step-by-step:
+
+🔹 1. Pull & Run Zookeeper
+If you haven’t pulled it:
+
+bash
+Copy
+Edit
+docker pull bitnami/zookeeper:latest
+Run Zookeeper:
+
+bash
+Copy
+Edit
+docker run -d --name zookeeper \
+  -e ALLOW_ANONYMOUS_LOGIN=yes \
+  -p 2181:2181 \
+  bitnami/zookeeper:latest
+🔹 2. Run Kafka and Link it to Zookeeper
+Assuming you've already pulled bitnami/kafka:
+
+bash
+Copy
+Edit
+docker run -d --name kafka \
+  --link zookeeper:zookeeper \
+  -e KAFKA_BROKER_ID=1 \
+  -e KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181 \
+  -e KAFKA_CFG_LISTENERS=PLAINTEXT://:9092 \
+  -e KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
+  -e ALLOW_PLAINTEXT_LISTENER=yes \
+  -p 9092:9092 \
+  bitnami/kafka:latest
+✅ Now Kafka should be running
+Kafka is now listening on port 9092
+
+Zookeeper is running on port 2181
+
+Your Spring Boot app can connect to localhost:9092
+
+🔍 Check Containers:
+bash
+Copy
+Edit
+docker ps
+🧪 Test Kafka (Optional)
+Produce a test message:
+
+bash
+Copy
+Edit
+docker exec -it kafka kafka-console-producer.sh \
+  --broker-list localhost:9092 --topic test-topic
+Consume it:
+
+bash
+Copy
+Edit
+docker exec -it kafka kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic test-topic --from-beginning
