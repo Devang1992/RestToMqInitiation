@@ -1,5 +1,32 @@
 package com.example.service;
 
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.stereotype.Service;
+
+@Service
+public class KafkaConsumerService {
+
+    @KafkaListener(topics = "user-events", groupId = "my-consumer-group")
+    public void consumeUserEvents(String message) {
+        System.out.println("Received user event: " + message);
+        // Process the message here
+    }
+
+    @KafkaListener(topics = "order-events", groupId = "my-consumer-group")
+    public void consumeOrderEvents(String message) {
+        System.out.println("Received order event: " + message);
+        // Process the message here
+    }
+
+    @KafkaListener(topics = "notifications", groupId = "my-consumer-group")
+    public void consumeNotifications(String message) {
+        System.out.println("Received notification: " + message);
+        // Process the message here
+    }
+}
+
+package com.example.service;
+
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
