@@ -1,0 +1,180 @@
+ARCHITECTURE OVERVIEW
+csharp
+Copy
+Edit
+[Controller]
+    ↓
+[BatchService]
+    ↓
+[KafkaConsumerFactory-based Reader]
+    ↓
+[Template-based FileWriter]
+🔧 STEP 1: application.yml
+yaml
+Copy
+Edit
+spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: batch-consumer-group
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+
+batch:
+  topic: my-topic
+  max-empty-polls: 5
+  poll-interval-ms: 1000
+  output-dir: output
+  file-name: batch-output.txt
+🧱 STEP 2: BatchProperties.java
+java
+Copy
+Edit
+@Component
+@ConfigurationProperties(prefix = "batch")
+@Getter @Setter
+public class BatchProperties {
+    private String topic;
+    private int maxEmptyPolls;
+    private int pollIntervalMs;
+    private String outputDir;
+    private String fileName;
+}
+🧠 STEP 3: Kafka Consumer Factory-based Reader
+java
+Copy
+Edit
+@Component
+public class KafkaBatchReader {
+
+    private final ConsumerFactory<String, String> consumerFactory;
+    private final BatchProperties batchProperties;
+
+    public KafkaBatchReader(ConsumerFactory<String, String> consumerFactory, BatchProperties batchProperties) {
+        this.consumerFactory = consumerFactory;
+        this.batchProperties = batchProperties;
+    }
+
+    public List<String> readBatchMessages() {
+        List<String> messages = new ArrayList<>();
+        Consumer<String, String> consumer = consumerFactory.createConsumer();
+        consumer.subscribe(List.of(batchProperties.getTopic()));
+
+        int emptyPolls = 0;
+        while (emptyPolls < batchProperties.getMaxEmptyPolls()) {
+            ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(batchProperties.getPollIntervalMs()));
+            if (records.isEmpty()) {
+                emptyPolls++;
+            } else {
+                emptyPolls = 0;
+                for (ConsumerRecord<String, String> record : records) {
+                    messages.add(record.value());
+                }
+            }
+        }
+
+        consumer.close();
+        return messages;
+    }
+}
+✅ This setup:
+
+Relies fully on YAML
+
+Cleanly shuts down when no messages come in after maxEmptyPolls × pollIntervalMs
+
+📝 STEP 4: File Writer Using a Custom Template
+java
+Copy
+Edit
+@Component
+public class FileWriterService {
+
+    private final BatchProperties batchProperties;
+
+    public FileWriterService(BatchProperties batchProperties) {
+        this.batchProperties = batchProperties;
+    }
+
+    public void writeToFile(List<String> messages, Function<String, String> formatter) {
+        try {
+            Path dir = Paths.get(batchProperties.getOutputDir());
+            Files.createDirectories(dir);
+            Path file = dir.resolve(batchProperties.getFileName());
+
+            List<String> formatted = messages.stream()
+                    .map(formatter)
+                    .collect(Collectors.toList());
+
+            Files.write(file, formatted, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            System.out.println("✅ File written to: " + file.toAbsolutePath());
+        } catch (IOException e) {
+            throw new RuntimeException("Error writing to batch file", e);
+        }
+    }
+}
+💡 You can pass a formatter that maps message JSON to some template string. See below.
+
+🚀 STEP 5: Batch Service & Controller
+BatchService
+java
+Copy
+Edit
+@Service
+public class BatchService {
+
+    private final KafkaBatchReader kafkaBatchReader;
+    private final FileWriterService fileWriterService;
+
+    public BatchService(KafkaBatchReader kafkaBatchReader, FileWriterService fileWriterService) {
+        this.kafkaBatchReader = kafkaBatchReader;
+        this.fileWriterService = fileWriterService;
+    }
+
+    public void runBatch() {
+        List<String> messages = kafkaBatchReader.readBatchMessages();
+
+        fileWriterService.writeToFile(messages, msg -> {
+            // Your custom formatting logic here
+            return "[Message] " + msg;
+        });
+    }
+}
+Controller
+java
+Copy
+Edit
+@RestController
+@RequestMapping("/batch")
+public class BatchController {
+
+    private final BatchService batchService;
+
+    public BatchController(BatchService batchService) {
+        this.batchService = batchService;
+    }
+
+    @PostMapping("/run")
+    public ResponseEntity<String> triggerBatch() {
+        batchService.runBatch();
+        return ResponseEntity.ok("✅ Batch process triggered.");
+    }
+}
+🔄 Optional: Schema Mapping
+You can replace the formatter lambda:
+
+java
+Copy
+Edit
+msg -> "[Message] " + msg
+with a Jackson-mapped POJO or Map + template engine (like Thymeleaf or FreeMarker) if you want a file with a proper structure like:
+
+markdown
+Copy
+Edit
+Customer: John Doe
+Account: 123456
+-----
