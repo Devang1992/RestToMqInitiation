@@ -178,3 +178,233 @@ Edit
 Customer: John Doe
 Account: 123456
 -----
+----------------------------------------------------------------------------------------------------------------------------------------------------
+STEP 1: application.yml
+yaml
+Copy
+Edit
+spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: batch-consumer
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+
+batch:
+  topic: my-topic
+  template: format1    # <-- Pick the template file without .txt
+  max-empty-polls: 5
+  poll-interval-ms: 1000
+  output-dir: output
+  file-name: batch-output.txt
+📦 STEP 2: BatchProperties.java
+java
+Copy
+Edit
+@Component
+@ConfigurationProperties(prefix = "batch")
+@Getter @Setter
+public class BatchProperties {
+    private String topic;
+    private String template;
+    private int maxEmptyPolls;
+    private int pollIntervalMs;
+    private String outputDir;
+    private String fileName;
+}
+📄 STEP 3: TemplateLoader.java — dynamic loader
+java
+Copy
+Edit
+@Component
+public class TemplateLoader {
+
+    private final BatchProperties batchProperties;
+
+    public TemplateLoader(BatchProperties batchProperties) {
+        this.batchProperties = batchProperties;
+    }
+
+    public String loadTemplate() {
+        String templateFile = "/templates/" + batchProperties.getTemplate() + ".txt";
+        try (InputStream in = getClass().getResourceAsStream(templateFile)) {
+            if (in == null) {
+                throw new IllegalArgumentException("Template not found: " + templateFile);
+            }
+            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to load template file: " + templateFile, e);
+        }
+    }
+}
+🧠 STEP 4: TemplateEngine.java — variable replacer
+java
+Copy
+Edit
+public class TemplateEngine {
+
+    public static String apply(String template, Map<String, String> values) {
+        String result = template;
+        for (Map.Entry<String, String> entry : values.entrySet()) {
+            result = result.replace("{{" + entry.getKey() + "}}", entry.getValue() != null ? entry.getValue() : "");
+        }
+        return result;
+    }
+}
+📥 STEP 5: KafkaBatchReader.java — uses YAML config
+java
+Copy
+Edit
+@Component
+public class KafkaBatchReader {
+
+    private final ConsumerFactory<String, String> consumerFactory;
+    private final BatchProperties batchProperties;
+
+    public KafkaBatchReader(ConsumerFactory<String, String> consumerFactory, BatchProperties batchProperties) {
+        this.consumerFactory = consumerFactory;
+        this.batchProperties = batchProperties;
+    }
+
+    public List<String> readBatchMessages() {
+        List<String> messages = new ArrayList<>();
+        Consumer<String, String> consumer = consumerFactory.createConsumer();
+        consumer.subscribe(List.of(batchProperties.getTopic()));
+
+        int emptyPolls = 0;
+        while (emptyPolls < batchProperties.getMaxEmptyPolls()) {
+            ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(batchProperties.getPollIntervalMs()));
+            if (records.isEmpty()) {
+                emptyPolls++;
+            } else {
+                emptyPolls = 0;
+                for (ConsumerRecord<String, String> record : records) {
+                    messages.add(record.value());
+                }
+            }
+        }
+
+        consumer.close();
+        return messages;
+    }
+}
+📝 STEP 6: FileWriterService.java
+java
+Copy
+Edit
+@Component
+public class FileWriterService {
+
+    private final BatchProperties batchProperties;
+
+    public FileWriterService(BatchProperties batchProperties) {
+        this.batchProperties = batchProperties;
+    }
+
+    public void writeToFile(List<String> messages, String template) {
+        try {
+            Path dir = Paths.get(batchProperties.getOutputDir());
+            Files.createDirectories(dir);
+            Path file = dir.resolve(batchProperties.getFileName());
+
+            List<String> formatted = messages.stream()
+                .map(msg -> {
+                    try {
+                        Map<String, String> data = new ObjectMapper().readValue(msg, new TypeReference<>() {});
+                        return TemplateEngine.apply(template, data);
+                    } catch (Exception e) {
+                        return "❌ Failed to format message: " + msg;
+                    }
+                })
+                .toList();
+
+            Files.write(file, formatted, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            System.out.println("✅ File written to: " + file.toAbsolutePath());
+
+        } catch (IOException e) {
+            throw new RuntimeException("Error writing file", e);
+        }
+    }
+}
+⚙️ STEP 7: BatchService.java
+java
+Copy
+Edit
+@Service
+public class BatchService {
+
+    private final KafkaBatchReader kafkaBatchReader;
+    private final FileWriterService fileWriterService;
+    private final TemplateLoader templateLoader;
+
+    public BatchService(KafkaBatchReader reader, FileWriterService writer, TemplateLoader loader) {
+        this.kafkaBatchReader = reader;
+        this.fileWriterService = writer;
+        this.templateLoader = loader;
+    }
+
+    public void runBatch() {
+        List<String> messages = kafkaBatchReader.readBatchMessages();
+        String template = templateLoader.loadTemplate();
+        fileWriterService.writeToFile(messages, template);
+    }
+}
+🌐 STEP 8: BatchController.java
+java
+Copy
+Edit
+@RestController
+@RequestMapping("/batch")
+public class BatchController {
+
+    private final BatchService batchService;
+
+    public BatchController(BatchService batchService) {
+        this.batchService = batchService;
+    }
+
+    @PostMapping("/run")
+    public ResponseEntity<String> triggerBatch() {
+        batchService.runBatch();
+        return ResponseEntity.ok("✅ Batch process completed.");
+    }
+}
+🧪 Example
+Given this JSON message from Kafka:
+
+json
+Copy
+Edit
+{
+  "mid": "123",
+  "name": "Praanvi",
+  "status": "completed"
+}
+And a format3.txt template like:
+
+txt
+Copy
+Edit
+MID: {{mid}}
+Name: {{name}}
+Status: {{status}}
+---
+And YAML setting:
+
+yaml
+Copy
+Edit
+batch:
+  template: format3
+It will write:
+
+yaml
+Copy
+Edit
+MID: 123
+Name: Praanvi
+Status: completed
+---
