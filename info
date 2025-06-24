@@ -408,3 +408,60 @@ MID: 123
 Name: Praanvi
 Status: completed
 ---
+--------------------------------------------------------------------------------------
+If TIBCO mailbox is an SFTP/FTP drop, you can use Spring Integration or Apache Commons Net / JSch to send the file after writing:
+
+java
+Copy
+Edit
+@Bean
+public SessionFactory<ChannelSftp.LsEntry> sftpSessionFactory() {
+    DefaultSftpSessionFactory factory = new DefaultSftpSessionFactory(true);
+    factory.setHost("sftp.host");
+    factory.setPort(22);
+    factory.setUser("username");
+    factory.setPassword("password");
+    return new CachingSessionFactory<>(factory);
+}
+
+public void uploadToSFTP(Path file) {
+    File remoteFile = file.toFile();
+    Session<ChannelSftp.LsEntry> session = sftpSessionFactory().getSession();
+    try (InputStream in = new FileInputStream(remoteFile)) {
+        session.write(in, "/remote/mailbox/path/" + file.getFileName());
+    } catch (Exception e) {
+        throw new RuntimeException("Failed to upload to SFTP", e);
+    }
+}
+🟩 Option B: TIBCO Mailbox = Network Folder (Windows share or NFS)
+You can mount the folder to your local file system (e.g., /mnt/tibco-mailbox/) and then in Spring Boot:
+
+java
+Copy
+Edit
+Files.copy(file, Paths.get("/mnt/tibco-mailbox/", file.getFileName().toString()));
+Done.
+
+🟥 Option C: TIBCO Mailbox = JMS Queue (e.g., EMS)
+If it's a queue-based system, you might need to send a message/file as bytes to a TIBCO EMS destination. Spring Boot supports JMS with:
+
+java
+Copy
+Edit
+@Autowired
+private JmsTemplate jmsTemplate;
+
+public void sendToTibcoQueue(Path filePath) throws IOException {
+    byte[] content = Files.readAllBytes(filePath);
+    jmsTemplate.convertAndSend("TIBCO_QUEUE_NAME", content);
+}
+You’ll need TIBCO EMS client libraries for this (tibjms.jar, etc.).
+
+💡 Recommended Approach for Most File Drops
+Most TIBCO mailboxes in real-world usage are SFTP or network folders.
+
+So the best approach is:
+
+Use Spring Boot to generate the file.
+
+In the same service, upload the file via SFTP or copy to mounted folder.
