@@ -1,0 +1,112 @@
+Perfect — let's refactor the app to use KStream instead of building a Topology bean manually.
+
+✅ What changes now?
+We'll:
+
+Use a @Bean KStream<...> method
+
+Register stream logic directly via StreamsBuilder
+
+Let Spring Boot auto-manage the Kafka Streams lifecycle
+
+📦 Updated Project Structure
+We'll only change:
+
+KafkaStreamsConfig.java
+
+Slight improvement in the processor logic (if needed)
+
+📄 Updated KafkaStreamsConfig.java
+java
+Copy
+Edit
+package com.example.kafkastreams.config;
+
+import com.example.kafkastreams.processor.ContextualHeaderFilterProcessor;
+import com.example.kafkastreams.util.TopicNameExtractorImpl;
+import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.kstream.KStream;
+import org.apache.kafka.streams.kstream.Consumed;
+import org.apache.kafka.streams.processor.api.Record;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class KafkaStreamsConfig {
+
+    @Value("${app.kafka.input-topic}")
+    private String inputTopic;
+
+    @Value("${app.kafka.output-topic}")
+    private String outputTopic;
+
+    private final TopicNameExtractorImpl topicNameExtractor = new TopicNameExtractorImpl();
+
+    @Bean
+    public KStream<String, String> streamPipeline(StreamsBuilder builder) {
+        KStream<String, String> stream = builder.stream(inputTopic, Consumed.with(Serdes.String(), Serdes.String()));
+
+        stream.process(() -> new ContextualHeaderFilterProcessor(topicNameExtractor));
+
+        return stream;
+    }
+}
+📄 Unchanged: ContextualHeaderFilterProcessor.java
+java
+Copy
+Edit
+package com.example.kafkastreams.processor;
+
+import com.example.kafkastreams.util.TopicNameExtractorImpl;
+import org.apache.kafka.common.header.Header;
+import org.apache.kafka.streams.processor.api.ContextualProcessor;
+import org.apache.kafka.streams.processor.api.Record;
+
+public class ContextualHeaderFilterProcessor extends ContextualProcessor<String, String, String, String> {
+
+    private final TopicNameExtractorImpl topicNameExtractor;
+
+    public ContextualHeaderFilterProcessor(TopicNameExtractorImpl topicNameExtractor) {
+        this.topicNameExtractor = topicNameExtractor;
+    }
+
+    @Override
+    public void process(Record<String, String> record) {
+        Header header = record.headers().lastHeader("status");
+
+        if (header != null && new String(header.value()).equalsIgnoreCase("complete")) {
+            String destinationTopic = topicNameExtractor.extract(record.key(), record.value());
+            context().forward(record.withTopic(destinationTopic));
+        }
+    }
+}
+📄 Unchanged: TopicNameExtractorImpl.java
+java
+Copy
+Edit
+package com.example.kafkastreams.util;
+
+public class TopicNameExtractorImpl {
+    public String extract(String key, String value) {
+        return "output-topic";
+    }
+}
+📄 Updated application.yml
+yaml
+Copy
+Edit
+spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+    streams:
+      application-id: header-filter-streams-app
+      default-key-serde: org.apache.kafka.common.serialization.Serdes$StringSerde
+      default-value-serde: org.apache.kafka.common.serialization.Serdes$StringSerde
+
+app:
+  kafka:
+    input-topic: input-topic
+    output-topic: output-topic
