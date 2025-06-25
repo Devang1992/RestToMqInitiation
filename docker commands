@@ -1,0 +1,108 @@
+Common Setup
+bash
+Copy
+Edit
+# Set alias for convenience (optional)
+alias kafka-docker="docker exec -it kafka kafka-topics.sh --bootstrap-server localhost:9092"
+Or use this directly in commands:
+
+bash
+Copy
+Edit
+docker exec -it kafka <command>
+✅ 1. Create a Topic
+bash
+Copy
+Edit
+docker exec -it kafka \
+  kafka-topics.sh --create \
+  --topic my-topic \
+  --bootstrap-server localhost:9092 \
+  --partitions 3 \
+  --replication-factor 1
+📋 2. List Topics
+bash
+Copy
+Edit
+docker exec -it kafka \
+  kafka-topics.sh --list \
+  --bootstrap-server localhost:9092
+🔍 3. Describe Topic (see partitions, leader, etc.)
+bash
+Copy
+Edit
+docker exec -it kafka \
+  kafka-topics.sh --describe \
+  --topic my-topic \
+  --bootstrap-server localhost:9092
+❌ 4. Delete a Topic
+bash
+Copy
+Edit
+docker exec -it kafka \
+  kafka-topics.sh --delete \
+  --topic my-topic \
+  --bootstrap-server localhost:9092
+⚠️ Deletion must be enabled in Kafka config:
+
+yaml
+Copy
+Edit
+delete.topic.enable=true
+If using docker-compose, add this to your KAFKA_CFG_ env variables or server config.
+
+🔄 5. Clear All Messages (Retain Topic, Drop Data)
+There’s no direct "truncate" command in Kafka. But here are 2 workarounds:
+
+🅰️ Option A: Set retention to 0 (immediate cleanup)
+bash
+Copy
+Edit
+docker exec -it kafka \
+  kafka-configs.sh --bootstrap-server localhost:9092 \
+  --entity-type topics --entity-name my-topic \
+  --alter --add-config retention.ms=1000
+Wait a few seconds, then restore it:
+
+bash
+Copy
+Edit
+docker exec -it kafka \
+  kafka-configs.sh --bootstrap-server localhost:9092 \
+  --entity-type topics --entity-name my-topic \
+  --alter --delete-config retention.ms
+🅱️ Option B: Delete and Recreate Topic (if allowed)
+bash
+Copy
+Edit
+# Delete topic
+docker exec -it kafka \
+  kafka-topics.sh --delete \
+  --topic my-topic \
+  --bootstrap-server localhost:9092
+
+# Recreate it fresh
+docker exec -it kafka \
+  kafka-topics.sh --create \
+  --topic my-topic \
+  --bootstrap-server localhost:9092 \
+  --partitions 1 --replication-factor 1
+🧹 6. Clear a Specific Partition (manual method)
+Kafka doesn’t let you "delete messages from a partition" directly — but you can:
+
+Use retention.ms or segment.ms configs per partition
+
+Write a script to consume and delete manually (e.g., via compacted topic or consumer offset reset)
+
+Manual Purge via Admin API (advanced): requires using Kafka Admin client in Java.
+
+🎯 Bonus: Reset Consumer Group Offset (to "replay" messages)
+bash
+Copy
+Edit
+docker exec -it kafka \
+  kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --group my-consumer-group \
+  --topic my-topic \
+  --reset-offsets --to-earliest --execute
