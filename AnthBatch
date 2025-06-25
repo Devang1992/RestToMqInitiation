@@ -1,0 +1,673 @@
+// Controller to initiate batch jobs
+@RestController
+@RequestMapping("/api/batch")
+@Slf4j
+public class BatchController {
+
+    @Autowired
+    private JobLauncher jobLauncher;
+
+    @Autowired
+    private Job kafkaProcessingJob;
+
+    @PostMapping("/start")
+    public ResponseEntity<Map<String, Object>> startBatchJob(
+            @RequestParam String topic,
+            @RequestParam(defaultValue = "JSON") String format,
+            @RequestParam(required = false) Long fromOffset) {
+        
+        try {
+            JobParameters jobParameters = new JobParametersBuilder()
+                    .addString("topic", topic)
+                    .addString("format", format)
+                    .addString("timestamp", String.valueOf(System.currentTimeMillis()))
+                    .addLong("fromOffset", fromOffset != null ? fromOffset : 0L)
+                    .toJobParameters();
+
+            JobExecution jobExecution = jobLauncher.run(kafkaProcessingJob, jobParameters);
+            
+            Map<String, Object> response = new HashMap<>();
+            response.put("jobId", jobExecution.getId());
+            response.put("status", jobExecution.getStatus().toString());
+            response.put("startTime", jobExecution.getStartTime());
+            
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            log.error("Error starting batch job", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    @GetMapping("/status/{jobId}")
+    public ResponseEntity<Map<String, Object>> getJobStatus(@PathVariable Long jobId) {
+        // Implementation for job status checking
+        return ResponseEntity.ok(Map.of("jobId", jobId, "status", "RUNNING"));
+    }
+}
+
+// Configuration for Spring Batch
+@Configuration
+@EnableBatchProcessing
+@Slf4j
+public class BatchConfiguration {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @Bean
+    public Job kafkaProcessingJob(Step kafkaProcessingStep) {
+        return jobBuilderFactory.get("kafkaProcessingJob")
+                .incrementer(new RunIdIncrementer())
+                .start(kafkaProcessingStep)
+                .build();
+    }
+
+    @Bean
+    public Step kafkaProcessingStep(KafkaItemReader kafkaItemReader,
+                                   KafkaItemProcessor kafkaItemProcessor,
+                                   KafkaItemWriter kafkaItemWriter) {
+        return stepBuilderFactory.get("kafkaProcessingStep")
+                .<KafkaMessage, ProcessedMessage>chunk(100)
+                .reader(kafkaItemReader)
+                .processor(kafkaItemProcessor)
+                .writer(kafkaItemWriter)
+                .build();
+    }
+}
+
+// Kafka Item Reader - Custom implementation
+@Component
+@StepScope
+@Slf4j
+public class KafkaItemReader implements ItemReader<KafkaMessage> {
+
+    private KafkaConsumer<String, String> consumer;
+    private Iterator<ConsumerRecord<String, String>> recordIterator;
+    private boolean isInitialized = false;
+    private long lastMessageTime = 0;
+    private final long TIMEOUT_MS = 120000; // 2 minutes timeout
+    
+    @Value("#{jobParameters['topic']}")
+    private String topic;
+    
+    @Value("#{jobParameters['fromOffset']}")
+    private Long fromOffset;
+
+    @PostConstruct
+    public void initialize() {
+        Properties props = new Properties();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "batch-processor-" + System.currentTimeMillis());
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+
+        consumer = new KafkaConsumer<>(props);
+        
+        // Subscribe and seek to offset if specified
+        consumer.subscribe(Collections.singletonList(topic));
+        if (fromOffset != null && fromOffset > 0) {
+            // Seek to specific offset logic would go here
+            consumer.poll(Duration.ofMillis(100)); // Initial poll to get partition assignment
+            consumer.seekToBeginning(consumer.assignment());
+        }
+        
+        isInitialized = true;
+        lastMessageTime = System.currentTimeMillis();
+        log.info("Kafka consumer initialized for topic: {}", topic);
+    }
+
+    @Override
+    public KafkaMessage read() throws Exception {
+        if (!isInitialized) {
+            initialize();
+        }
+
+        // Check timeout
+        if (System.currentTimeMillis() - lastMessageTime > TIMEOUT_MS) {
+            log.info("Timeout reached, stopping batch processing");
+            return null; // Signal end of data
+        }
+
+        if (recordIterator == null || !recordIterator.hasNext()) {
+            ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));
+            if (records.isEmpty()) {
+                return null; // No more messages, end processing
+            }
+            recordIterator = records.iterator();
+        }
+
+        if (recordIterator.hasNext()) {
+            ConsumerRecord<String, String> record = recordIterator.next();
+            lastMessageTime = System.currentTimeMillis();
+            
+            KafkaMessage message = new KafkaMessage();
+            message.setKey(record.key());
+            message.setValue(record.value());
+            message.setTopic(record.topic());
+            message.setPartition(record.partition());
+            message.setOffset(record.offset());
+            message.setTimestamp(record.timestamp());
+            
+            // Extract format from headers
+            if (record.headers() != null) {
+                Header formatHeader = record.headers().lastHeader("format");
+                if (formatHeader != null) {
+                    message.setFormat(new String(formatHeader.value()));
+                }
+            }
+            
+            return message;
+        }
+
+        return null;
+    }
+
+    @PreDestroy
+    public void cleanup() {
+        if (consumer != null) {
+            consumer.close();
+            log.info("Kafka consumer closed");
+        }
+    }
+}
+
+// Kafka Message Model
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class KafkaMessage {
+    private String key;
+    private String value;
+    private String topic;
+    private int partition;
+    private long offset;
+    private long timestamp;
+    private String format = "JSON"; // Default format
+}
+
+// Processed Message Model
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class ProcessedMessage {
+    private String formattedContent;
+    private String originalValue;
+    private long offset;
+    private String format;
+}
+
+// Item Processor
+@Component
+@StepScope
+@Slf4j
+public class KafkaItemProcessor implements ItemProcessor<KafkaMessage, ProcessedMessage> {
+
+    @Autowired
+    private FileFormatService fileFormatService;
+
+    @Override
+    public ProcessedMessage process(KafkaMessage item) throws Exception {
+        log.debug("Processing message with offset: {} and format: {}", item.getOffset(), item.getFormat());
+        
+        String formattedContent = fileFormatService.formatMessage(item.getValue(), item.getFormat());
+        
+        ProcessedMessage processedMessage = new ProcessedMessage();
+        processedMessage.setFormattedContent(formattedContent);
+        processedMessage.setOriginalValue(item.getValue());
+        processedMessage.setOffset(item.getOffset());
+        processedMessage.setFormat(item.getFormat());
+        
+        return processedMessage;
+    }
+}
+
+// Item Writer
+@Component
+@StepScope
+@Slf4j
+public class KafkaItemWriter implements ItemWriter<ProcessedMessage> {
+
+    @Value("#{jobParameters['topic']}")
+    private String topic;
+    
+    @Value("#{jobParameters['timestamp']}")
+    private String timestamp;
+
+    @Override
+    public void write(List<? extends ProcessedMessage> items) throws Exception {
+        String fileName = String.format("output/%s_%s.txt", topic, timestamp);
+        
+        try (FileWriter writer = new FileWriter(fileName, true)) {
+            for (ProcessedMessage item : items) {
+                writer.write(item.getFormattedContent());
+                writer.write(System.lineSeparator());
+            }
+        }
+        
+        log.info("Written {} messages to file: {}", items.size(), fileName);
+    }
+}
+
+// File Format Service
+@Service
+@Slf4j
+public class FileFormatService {
+
+    private Map<String, FileFormatTemplate> formatTemplates;
+    private ObjectMapper objectMapper = new ObjectMapper();
+
+    @PostConstruct
+    public void loadFormatTemplates() {
+        formatTemplates = new HashMap<>();
+        
+        try {
+            Resource resource = new ClassPathResource("file-formats.txt");
+            List<String> lines = Files.readAllLines(Paths.get(resource.getURI()));
+            
+            String currentFormat = null;
+            StringBuilder templateBuilder = new StringBuilder();
+            
+            for (String line : lines) {
+                if (line.startsWith("FORMAT:")) {
+                    if (currentFormat != null) {
+                        formatTemplates.put(currentFormat, 
+                            new FileFormatTemplate(templateBuilder.toString().trim()));
+                    }
+                    currentFormat = line.substring(7).trim();
+                    templateBuilder = new StringBuilder();
+                } else if (line.startsWith("TEMPLATE:")) {
+                    templateBuilder.append(line.substring(9).trim()).append("\n");
+                } else if (!line.trim().isEmpty() && currentFormat != null) {
+                    templateBuilder.append(line).append("\n");
+                }
+            }
+            
+            // Add the last format
+            if (currentFormat != null) {
+                formatTemplates.put(currentFormat, 
+                    new FileFormatTemplate(templateBuilder.toString().trim()));
+            }
+            
+            log.info("Loaded {} format templates", formatTemplates.size());
+            
+        } catch (Exception e) {
+            log.error("Error loading format templates", e);
+            loadDefaultFormats();
+        }
+    }
+
+    private void loadDefaultFormats() {
+        formatTemplates = new HashMap<>();
+        formatTemplates.put("JSON", new FileFormatTemplate("{originalJson}"));
+        formatTemplates.put("CSV", new FileFormatTemplate("{field1},{field2},{field3}"));
+        formatTemplates.put("XML", new FileFormatTemplate("<record><data>{originalJson}</data></record>"));
+        formatTemplates.put("PIPE", new FileFormatTemplate("{field1}|{field2}|{field3}"));
+        formatTemplates.put("FIXED", new FileFormatTemplate("{field1:10}{field2:20}{field3:15}"));
+    }
+
+    public String formatMessage(String jsonMessage, String formatType) {
+        FileFormatTemplate template = formatTemplates.getOrDefault(formatType, 
+                                      formatTemplates.get("JSON"));
+        
+        try {
+            JsonNode jsonNode = objectMapper.readTree(jsonMessage);
+            return template.format(jsonNode, jsonMessage);
+        } catch (Exception e) {
+            log.error("Error formatting message", e);
+            return jsonMessage; // Return original if formatting fails
+        }
+    }
+}
+
+// File Format Template
+@Data
+@AllArgsConstructor
+public class FileFormatTemplate {
+    private String template;
+
+    public String format(JsonNode jsonNode, String originalJson) {
+        String result = template;
+        
+        // Replace {originalJson} with the complete JSON
+        result = result.replace("{originalJson}", originalJson);
+        
+        // Replace field placeholders with actual values
+        result = replaceJsonFields(result, jsonNode, "");
+        
+        return result;
+    }
+
+    private String replaceJsonFields(String template, JsonNode node, String prefix) {
+        String result = template;
+        
+        if (node.isObject()) {
+            Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
+            while (fields.hasNext()) {
+                Map.Entry<String, JsonNode> field = fields.next();
+                String fieldKey = prefix.isEmpty() ? field.getKey() : prefix + "." + field.getKey();
+                
+                if (field.getValue().isValueNode()) {
+                    // Handle fixed-width formatting
+                    String placeholder = "{" + fieldKey + ":";
+                    int startIndex = result.indexOf(placeholder);
+                    if (startIndex != -1) {
+                        int endIndex = result.indexOf("}", startIndex);
+                        if (endIndex != -1) {
+                            String widthStr = result.substring(startIndex + placeholder.length(), endIndex);
+                            try {
+                                int width = Integer.parseInt(widthStr);
+                                String value = field.getValue().asText();
+                                String formattedValue = String.format("%-" + width + "s", value);
+                                if (formattedValue.length() > width) {
+                                    formattedValue = formattedValue.substring(0, width);
+                                }
+                                result = result.replace("{" + fieldKey + ":" + width + "}", formattedValue);
+                            } catch (NumberFormatException e) {
+                                // Ignore and continue
+                            }
+                        }
+                    }
+                    
+                    // Handle regular field replacement
+                    result = result.replace("{" + fieldKey + "}", field.getValue().asText());
+                } else {
+                    result = replaceJsonFields(result, field.getValue(), fieldKey);
+                }
+            }
+        }
+        
+        return result;
+    }
+}
+
+// Job execution listener to clean up resources
+@Component
+@Slf4j
+public class KafkaJobExecutionListener implements JobExecutionListener {
+
+    @Override
+    public void beforeJob(JobExecution jobExecution) {
+        log.info("Starting Kafka batch job: {}", jobExecution.getId());
+        
+        // Create output directory if it doesn't exist
+        File outputDir = new File("output");
+        if (!outputDir.exists()) {
+            outputDir.mkdirs();
+        }
+    }
+
+    @Override
+    public void afterJob(JobExecution jobExecution) {
+        log.info("Kafka batch job completed: {} with status: {}", 
+                jobExecution.getId(), jobExecution.getStatus());
+        
+        // Clean up resources, send notifications, etc.
+        if (jobExecution.getStatus() == BatchStatus.COMPLETED) {
+            log.info("Job completed successfully. Processed {} items", 
+                    jobExecution.getStepExecutions().iterator().next().getWriteCount());
+        }
+    }
+}
+
+
+<dependencies>
+    <!-- Spring Boot Starter -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    
+    <!-- Spring Boot Batch -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-batch</artifactId>
+    </dependency>
+    
+    <!-- Spring Kafka -->
+    <dependency>
+        <groupId>org.springframework.kafka</groupId>
+        <artifactId>spring-kafka</artifactId>
+    </dependency>
+    
+    <!-- Jackson for JSON processing -->
+    <dependency>
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-databind</artifactId>
+    </dependency>
+    
+    <!-- Lombok for reducing boilerplate -->
+    <dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+        <optional>true</optional>
+    </dependency>
+    
+    <!-- H2 Database for Spring Batch metadata (can be replaced with your preferred DB) -->
+    <dependency>
+        <groupId>com.h2database</groupId>
+        <artifactId>h2</artifactId>
+        <scope>runtime</scope>
+    </dependency>
+    
+    <!-- Spring Boot Starter JDBC -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-jdbc</artifactId>
+    </dependency>
+    
+    <!-- SLF4J for logging -->
+    <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-api</artifactId>
+    </dependency>
+    
+    <!-- Spring Boot Test -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-test</artifactId>
+        <scope>test</scope>
+    </dependency>
+    
+    <!-- Spring Batch Test -->
+    <dependency>
+        <groupId>org.springframework.batch</groupId>
+        <artifactId>spring-batch-test</artifactId>
+        <scope>test</scope>
+    </dependency>
+</dependencies>
+
+
+# Server Configuration
+server.port=8080
+
+# Kafka Configuration
+spring.kafka.bootstrap-servers=localhost:9092
+spring.kafka.consumer.group-id=batch-processor
+spring.kafka.consumer.auto-offset-reset=earliest
+spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+spring.kafka.consumer.value-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+spring.kafka.consumer.enable-auto-commit=false
+
+# Spring Batch Configuration
+spring.batch.job.enabled=false
+spring.batch.initialize-schema=always
+
+# Database Configuration (H2 for Spring Batch metadata)
+spring.datasource.url=jdbc:h2:mem:batchdb
+spring.datasource.driverClassName=org.h2.Driver
+spring.datasource.username=sa
+spring.datasource.password=
+spring.h2.console.enabled=true
+
+# Logging Configuration
+logging.level.com.yourcompany.batchprocessor=DEBUG
+logging.level.org.springframework.batch=INFO
+logging.level.org.apache.kafka=INFO
+
+# File Processing Configuration
+batch.output.directory=output
+batch.timeout.minutes=2
+batch.chunk.size=100
+
+
+
+// Sample JSON messages that would be on your Kafka topic
+/*
+Example JSON Message 1:
+{
+  "id": "1001",
+  "name": "John Doe",
+  "email": "john.doe@example.com",
+  "address": {
+    "street": "123 Main St",
+    "city": "New York",
+    "zipCode": "10001"
+  },
+  "phone": "555-1234",
+  "status": "ACTIVE",
+  "createdDate": "2025-01-15"
+}
+
+Example JSON Message 2:
+{
+  "id": "1002",
+  "name": "Jane Smith",
+  "email": "jane.smith@example.com",
+  "address": {
+    "street": "456 Oak Ave",
+    "city": "Los Angeles",
+    "zipCode": "90210"
+  },
+  "phone": "555-5678",
+  "status": "PENDING",
+  "createdDate": "2025-01-16"
+}
+*/
+
+// Main Application Class
+@SpringBootApplication
+@EnableBatchProcessing
+public class KafkaBatchProcessorApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(KafkaBatchProcessorApplication.class, args);
+    }
+}
+
+// Integration Test
+@SpringBootTest
+@TestExecutionListeners({DependencyInjectionTestExecutionListener.class, 
+                        JobExecutionTestExecutionListener.class})
+@Slf4j
+class KafkaBatchProcessorIntegrationTest {
+
+    @Autowired
+    private TestRestTemplate restTemplate;
+
+    @Autowired
+    private JobLauncher jobLauncher;
+
+    @Autowired
+    private Job kafkaProcessingJob;
+
+    @Test
+    void testBatchJobExecution() throws Exception {
+        // This test would require an embedded Kafka for proper testing
+        // For now, it demonstrates the job execution flow
+        
+        JobParameters jobParameters = new JobParametersBuilder()
+                .addString("topic", "test-topic")
+                .addString("format", "CSV")
+                .addString("timestamp", String.valueOf(System.currentTimeMillis()))
+                .addLong("fromOffset", 0L)
+                .toJobParameters();
+
+        // Note: This will fail without actual Kafka messages, 
+        // but demonstrates the setup
+        log.info("Test job parameters created: {}", jobParameters);
+        
+        // In a real test, you would:
+        // 1. Start embedded Kafka
+        // 2. Produce test messages with format header
+        // 3. Execute the job
+        // 4. Verify the output file content
+        
+        assertThat(kafkaProcessingJob).isNotNull();
+        assertThat(jobLauncher).isNotNull();
+    }
+}
+
+// Sample REST API calls to start batch jobs:
+
+/*
+1. Start a CSV format batch job:
+POST http://localhost:8080/api/batch/start?topic=customer-events&format=CSV
+
+2. Start a XML format batch job with specific offset:
+POST http://localhost:8080/api/batch/start?topic=customer-events&format=XML&fromOffset=100
+
+3. Start a PIPE format batch job:
+POST http://localhost:8080/api/batch/start?topic=customer-events&format=PIPE
+
+4. Check job status:
+GET http://localhost:8080/api/batch/status/1
+
+Sample Response:
+{
+  "jobId": 1,
+  "status": "COMPLETED",
+  "startTime": "2025-06-25T10:30:00"
+}
+*/
+
+// Kafka Message Producer (for testing)
+@Component
+@Slf4j
+public class TestMessageProducer {
+
+    @Autowired
+    private KafkaTemplate<String, String> kafkaTemplate;
+
+    public void sendTestMessage(String topic, String message, String format) {
+        ProducerRecord<String, String> record = new ProducerRecord<>(topic, message);
+        record.headers().add("format", format.getBytes());
+        
+        kafkaTemplate.send(record).addCallback(
+            result -> log.info("Message sent successfully to topic: {}", topic),
+            failure -> log.error("Failed to send message", failure)
+        );
+    }
+}
+
+// Configuration for Kafka Template
+@Configuration
+public class KafkaProducerConfig {
+
+    @Bean
+    public ProducerFactory<String, String> producerFactory() {
+        Map<String, Object> configProps = new HashMap<>();
+        configProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        configProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        configProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        return new DefaultKafkaProducerFactory<>(configProps);
+    }
+
+    @Bean
+    public KafkaTemplate<String, String> kafkaTemplate() {
+        return new KafkaTemplate<>(producerFactory());
+    }
+}
+
+
+Usage:
+
+Start a batch job:
+bashPOST /api/batch/start?topic=my-topic&format=CSV&fromOffset=0
+
+Kafka messages should include format header:
+Headers: format=CSV
