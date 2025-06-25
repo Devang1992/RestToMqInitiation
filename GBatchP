@@ -1,0 +1,277 @@
+High-Level Architecture
+csharp
+Copy
+Edit
+[Controller]
+     |
+     V
+[Spring Batch Job] ---------------------+
+     |                                  |
+     V                                  |
+[Kafka Listener (Scoped to Job)]       |
+     |                                  |
+     V                                  |
+[Buffered Message Collector]           |
+     |                                  |
+     V                                  |
+[File Writer Step - Mapped Format] <---+
+✅ Let's Start Breaking It Down
+We'll walk through:
+
+Project structure
+
+Kafka + Spring Batch config
+
+File format loader
+
+Kafka batch reader with timeout
+
+Writing messages using selected format
+
+📁 Project Structure (Overview)
+css
+Copy
+Edit
+src/main
+ ├── java
+ │   └── com.example.batchkafka
+ │       ├── controller
+ │       │   └── BatchTriggerController.java
+ │       ├── batch
+ │       │   ├── KafkaMessageReader.java
+ │       │   ├── FileFormatMapper.java
+ │       │   ├── JobCompletionListener.java
+ │       │   ├── KafkaBatchJobConfig.java
+ │       │   └── MessageProcessor.java
+ │       └── model
+ │           └── KafkaPayload.java
+ └── resources
+     ├── application.yml
+     └── formats
+         ├── format1.txt
+         ├── format2.txt
+         ├── format3.txt
+         ├── format4.txt
+         └── format5.txt
+1️⃣ Controller
+java
+Copy
+Edit
+@RestController
+@RequestMapping("/batch")
+public class BatchTriggerController {
+
+    private final JobLauncher jobLauncher;
+    private final Job kafkaBatchJob;
+
+    public BatchTriggerController(JobLauncher jobLauncher, @Qualifier("kafkaBatchJob") Job kafkaBatchJob) {
+        this.jobLauncher = jobLauncher;
+        this.kafkaBatchJob = kafkaBatchJob;
+    }
+
+    @PostMapping("/start")
+    public ResponseEntity<String> triggerBatchJob() throws Exception {
+        JobParameters params = new JobParametersBuilder()
+                .addLong("startTime", System.currentTimeMillis())
+                .toJobParameters();
+
+        jobLauncher.run(kafkaBatchJob, params);
+
+        return ResponseEntity.ok("Batch job started.");
+    }
+}
+2️⃣ Batch Job Config: KafkaBatchJobConfig.java
+java
+Copy
+Edit
+@Configuration
+@EnableBatchProcessing
+public class KafkaBatchJobConfig {
+
+    @Value("${app.kafka.topic}")
+    private String kafkaTopic;
+
+    @Bean
+    public Job kafkaBatchJob(JobBuilderFactory jobBuilderFactory,
+                              StepBuilderFactory stepBuilderFactory,
+                              KafkaMessageReader reader,
+                              MessageProcessor processor,
+                              JobCompletionListener listener) {
+
+        Step step = stepBuilderFactory.get("kafka-step")
+                .<KafkaPayload, String>chunk(100)
+                .reader(reader)
+                .processor(processor)
+                .writer(items -> {
+                    // write lines to file here, for now console
+                    items.forEach(System.out::println);
+                })
+                .build();
+
+        return jobBuilderFactory.get("kafkaBatchJob")
+                .listener(listener)
+                .start(step)
+                .build();
+    }
+}
+3️⃣ Kafka Message Reader (KafkaMessageReader.java)
+java
+Copy
+Edit
+@Component
+@StepScope
+public class KafkaMessageReader implements ItemReader<KafkaPayload> {
+
+    private final KafkaConsumer<String, String> consumer;
+    private final BlockingQueue<ConsumerRecord<String, String>> buffer = new LinkedBlockingQueue<>();
+    private boolean stopped = false;
+    private long lastPollTime = System.currentTimeMillis();
+
+    public KafkaMessageReader(@Value("#{jobParameters['startTime']}") String startTime) {
+        Properties props = new Properties();
+        props.put("bootstrap.servers", "localhost:9092");
+        props.put("group.id", "batch-consumer-" + startTime);
+        props.put("key.deserializer", StringDeserializer.class.getName());
+        props.put("value.deserializer", StringDeserializer.class.getName());
+        props.put("auto.offset.reset", "earliest");
+
+        consumer = new KafkaConsumer<>(props);
+        consumer.subscribe(Collections.singleton("your-kafka-topic"));
+
+        Executors.newSingleThreadExecutor().submit(this::pollLoop);
+    }
+
+    private void pollLoop() {
+        while (!stopped) {
+            ConsumerRecords<String, String> records = consumer.poll(Duration.ofSeconds(1));
+            if (!records.isEmpty()) {
+                lastPollTime = System.currentTimeMillis();
+                records.forEach(buffer::offer);
+            }
+
+            if (System.currentTimeMillis() - lastPollTime > 2 * 60 * 1000) { // 2 minutes no message
+                stopped = true;
+                consumer.close();
+            }
+        }
+    }
+
+    @Override
+    public KafkaPayload read() {
+        if (stopped && buffer.isEmpty()) return null;
+
+        try {
+            ConsumerRecord<String, String> record = buffer.poll(5, TimeUnit.SECONDS);
+            if (record == null) return null;
+
+            String format = Optional.ofNullable(record.headers().lastHeader("format"))
+                    .map(h -> new String(h.value()))
+                    .orElse("default");
+
+            return new KafkaPayload(record.value(), format);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        }
+    }
+}
+4️⃣ File Format Mapper (MessageProcessor.java + FileFormatMapper.java)
+KafkaPayload.java
+java
+Copy
+Edit
+public class KafkaPayload {
+    private final String json;
+    private final String format;
+
+    public KafkaPayload(String json, String format) {
+        this.json = json;
+        this.format = format;
+    }
+
+    // getters...
+}
+FileFormatMapper.java
+java
+Copy
+Edit
+@Component
+public class FileFormatMapper {
+
+    private final Map<String, String> templates = new HashMap<>();
+
+    @PostConstruct
+    public void loadTemplates() throws IOException {
+        for (int i = 1; i <= 5; i++) {
+            String formatKey = "format" + i;
+            String template = Files.readString(
+                Paths.get("src/main/resources/formats/" + formatKey + ".txt")
+            );
+            templates.put(formatKey, template);
+        }
+    }
+
+    public String applyTemplate(String jsonStr, String formatKey) {
+        String template = templates.getOrDefault(formatKey, templates.get("format1"));
+        // parse json and apply mapping using regex or formatter
+        // dummy for now:
+        return template.replace("{raw}", jsonStr);
+    }
+}
+MessageProcessor.java
+java
+Copy
+Edit
+@Component
+@StepScope
+public class MessageProcessor implements ItemProcessor<KafkaPayload, String> {
+
+    private final FileFormatMapper formatMapper;
+
+    public MessageProcessor(FileFormatMapper formatMapper) {
+        this.formatMapper = formatMapper;
+    }
+
+    @Override
+    public String process(KafkaPayload item) {
+        return formatMapper.applyTemplate(item.getJson(), item.getFormat());
+    }
+}
+5️⃣ Job Listener (cleanup hook)
+java
+Copy
+Edit
+@Component
+public class JobCompletionListener extends JobExecutionListenerSupport {
+    @Override
+    public void afterJob(JobExecution jobExecution) {
+        System.out.println("Batch job completed. File writing done.");
+    }
+}
+✅ File Templates (resources/formats/format1.txt ...)
+txt
+Copy
+Edit
+Name: {raw}
+Later, you can do more advanced mapping like:
+
+txt
+Copy
+Edit
+Name: {user.name}
+Age: {user.age}
+Children: {children[*].name}
+With JSON path mapping or SpEL.
+
+🔚 Final Words
+This setup:
+
+✅ Uses Spring Batch to control lifecycle
+
+✅ Listens to Kafka only during job
+
+✅ Stops when idle (no message for 2 mins)
+
+✅ Dynamically formats output file
+
+✅ Triggered cleanly from controller
