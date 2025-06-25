@@ -275,3 +275,289 @@ This setup:
 ✅ Dynamically formats output file
 
 ✅ Triggered cleanly from controller
+
+Goal
+Write processed messages to a real .txt file in a folder (e.g. /tmp/kafka-output-<timestamp>.txt)
+
+Render each line using JSONPath placeholders from format templates like:
+
+pgsql
+Copy
+Edit
+Name: {$.user.name}
+Age: {$.user.age}
+🔧 Step-by-Step Implementation
+🧩 1. ✅ File Writer: Write Output to File (/tmp/)
+Modify the Step Writer in your job config:
+
+java
+Copy
+Edit
+@Bean
+public Job kafkaBatchJob(JobBuilderFactory jobBuilderFactory,
+                          StepBuilderFactory stepBuilderFactory,
+                          KafkaMessageReader reader,
+                          MessageProcessor processor,
+                          JobCompletionListener listener) {
+
+    Step step = stepBuilderFactory.get("kafka-step")
+            .<KafkaPayload, String>chunk(100)
+            .reader(reader)
+            .processor(processor)
+            .writer(new FlatFileItemWriter<String>() {{
+                setResource(new FileSystemResource("/tmp/kafka-output-" + System.currentTimeMillis() + ".txt"));
+                setLineAggregator(item -> item); // each item is already a line
+                afterPropertiesSet();
+            }})
+            .build();
+
+    return jobBuilderFactory.get("kafkaBatchJob")
+            .listener(listener)
+            .start(step)
+            .build();
+}
+You can customize /tmp/ path via application.yml later if needed.
+
+🧩 2. ✅ JSONPath-Based Template Rendering
+Add Jayway's JSONPath library:
+
+📦 In pom.xml:
+xml
+Copy
+Edit
+<dependency>
+    <groupId>com.jayway.jsonpath</groupId>
+    <artifactId>json-path</artifactId>
+    <version>2.8.0</version>
+</dependency>
+🛠 Update FileFormatMapper.java for JSONPath
+java
+Copy
+Edit
+import com.jayway.jsonpath.JsonPath;
+import net.minidev.json.JSONObject;
+
+@Component
+public class FileFormatMapper {
+
+    private final Map<String, List<String>> templateLines = new HashMap<>();
+
+    @PostConstruct
+    public void loadTemplates() throws IOException {
+        for (int i = 1; i <= 5; i++) {
+            String formatKey = "format" + i;
+            Path path = Paths.get("src/main/resources/formats/" + formatKey + ".txt");
+            List<String> lines = Files.readAllLines(path);
+            templateLines.put(formatKey, lines);
+        }
+    }
+
+    public String applyTemplate(String jsonStr, String formatKey) {
+        List<String> lines = templateLines.getOrDefault(formatKey, templateLines.get("format1"));
+        Object jsonDoc = JsonPath.parse(jsonStr);
+
+        return lines.stream()
+                .map(line -> replacePlaceholders(line, jsonDoc))
+                .collect(Collectors.joining("\n"));
+    }
+
+    private String replacePlaceholders(String line, Object jsonDoc) {
+        Matcher matcher = Pattern.compile("\\{\\$.*?}").matcher(line);
+        StringBuffer sb = new StringBuffer();
+
+        while (matcher.find()) {
+            String pathExpr = matcher.group();
+            String jsonPath = pathExpr.substring(1, pathExpr.length() - 1); // remove {}
+            Object result;
+            try {
+                result = JsonPath.read(jsonDoc, jsonPath);
+            } catch (Exception e) {
+                result = "null";
+            }
+            matcher.appendReplacement(sb, Matcher.quoteReplacement(result != null ? result.toString() : ""));
+        }
+        matcher.appendTail(sb);
+        return sb.toString();
+    }
+}
+✅ Template Example (format1.txt)
+Located in: src/main/resources/formats/format1.txt
+
+txt
+Copy
+Edit
+Name: {$.user.name}
+Age: {$.user.age}
+Email: {$.user.email}
+---
+This supports JSONPath like $.user.name, $.children[0].name, etc.
+
+📦 Sample Input JSON
+json
+Copy
+Edit
+{
+  "user": {
+    "name": "Devang",
+    "age": 28,
+    "email": "devang@example.com"
+  }
+}
+✅ Output to File /tmp/kafka-output-<timestamp>.txt
+txt
+Copy
+Edit
+Name: Devang
+Age: 28
+Email: devang@example.com
+---
+✅ Summary
+Feature	Done
+File writer to /tmp/	✅
+JSONPath-based format mapping	✅
+Template selection via Kafka header	✅
+Extendable formats	✅
+
+🚀 Optional Next
+Would you like to:
+
+Make /tmp/ path configurable?
+
+Support multiple format blocks in one file?
+
+Split files per Kafka header (format)?
+
+Upload output file to cloud (S3, Azure)?
+
+Let me know!
+
+
+
+
+
+
+
+
+You said:
+Make /tmp/ path configurable?, use different file format( which is just like some have name first address second some have name second like that but want to render with json path just flexible to choose baseed on header which format)
+
+
+ChatGPT said:
+Awesome — you're asking for two things now:
+
+✅ Goal
+Make file output path configurable
+
+Support multiple flexible formats (field order & content controlled via header like format=format2)
+
+Template contains lines with JSONPath placeholders
+
+Messages are rendered according to that template dynamically
+
+✅ Implementation Plan
+🧩 1. Make /tmp/ configurable
+🔧 In application.yml
+yaml
+Copy
+Edit
+app:
+  output:
+    dir: /tmp/kafka-exports
+📄 Inject it in KafkaBatchJobConfig.java
+java
+Copy
+Edit
+@Value("${app.output.dir}")
+private String outputDir;
+
+@Bean
+public Job kafkaBatchJob(...) {
+    String fileName = "kafka-output-" + System.currentTimeMillis() + ".txt";
+    String filePath = Paths.get(outputDir, fileName).toString();
+
+    Step step = stepBuilderFactory.get("kafka-step")
+            .<KafkaPayload, String>chunk(100)
+            .reader(reader)
+            .processor(processor)
+            .writer(new FlatFileItemWriter<String>() {{
+                setResource(new FileSystemResource(filePath));
+                setLineAggregator(item -> item); // line is already rendered
+                afterPropertiesSet();
+            }})
+            .build();
+
+    return jobBuilderFactory.get("kafkaBatchJob")
+            .listener(listener)
+            .start(step)
+            .build();
+}
+🧩 2. Flexible File Format Mapping Using JSONPath (already mostly done)
+Ensure your formats/ folder has 5 format templates:
+
+📄 src/main/resources/formats/format1.txt
+txt
+Copy
+Edit
+Name: {$.user.name}
+Age: {$.user.age}
+Address: {$.user.address}
+---
+📄 format2.txt
+txt
+Copy
+Edit
+Address: {$.user.address}
+Name: {$.user.name}
+---
+📄 format3.txt
+txt
+Copy
+Edit
+Full Info: {$.user.name}, {$.user.age}, {$.user.email}
+---
+You can have any structure — the only requirement is placeholders are valid JSONPath expressions wrapped in {}
+
+🔁 Use Header to Pick Format
+Already in place via:
+
+java
+Copy
+Edit
+String format = Optional.ofNullable(record.headers().lastHeader("format"))
+                        .map(h -> new String(h.value()))
+                        .orElse("format1"); // default
+The file format mapper uses this to choose the correct template.
+
+🧠 Internal Flow:
+Kafka message comes in → Header: format=format3
+
+FileFormatMapper loads format3.txt
+
+Each line in template is scanned for {$.json.path} patterns
+
+Values from JSON are injected into line
+
+Final string is passed to writer
+
+✅ Example:
+Kafka Message
+json
+Copy
+Edit
+{
+  "user": {
+    "name": "Devang",
+    "age": 28,
+    "address": "Toronto",
+    "email": "d@example.com"
+  }
+}
+Header: format: format2
+Output File:
+txt
+Copy
+Edit
+Address: Toronto
+Name: Devang
+---
+
