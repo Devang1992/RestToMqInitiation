@@ -1,0 +1,705 @@
+// Main Application Class
+@SpringBootApplication
+@EnableKafkaStreams
+@Slf4j
+public class KafkaStreamsApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(KafkaStreamsApplication.class, args);
+    }
+}
+
+// Kafka Streams Configuration
+@Configuration
+@EnableConfigurationProperties
+@Slf4j
+public class KafkaStreamsConfig {
+
+    @Value("${app.kafka.input-topic}")
+    private String inputTopic;
+
+    @Value("${app.kafka.output-topic}")
+    private String outputTopic;
+
+    @Value("${app.kafka.error-topic}")
+    private String errorTopic;
+
+    @Value("${spring.kafka.bootstrap-servers}")
+    private String bootstrapServers;
+
+    @Bean(name = KafkaStreamsDefaultConfiguration.DEFAULT_STREAMS_CONFIG_BEAN_NAME)
+    public KafkaStreamsConfiguration kStreamsConfig() {
+        Map<String, Object> props = new HashMap<>();
+        props.put(StreamsConfig.APPLICATION_ID_CONFIG, "message-processor-app");
+        props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        props.put(StreamsConfig.DEFAULT_KEY_SERDE_CONFIG, Serdes.String().getClass().getName());
+        props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CONFIG, Serdes.String().getClass().getName());
+        props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, StreamsConfig.EXACTLY_ONCE_V2);
+        props.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 1000);
+        props.put(StreamsConfig.DEFAULT_DESERIALIZATION_EXCEPTION_HANDLER_CLASS_CONFIG, 
+                 CustomDeserializationExceptionHandler.class.getName());
+        props.put(StreamsConfig.DEFAULT_PRODUCTION_EXCEPTION_HANDLER_CLASS_CONFIG,
+                 CustomProductionExceptionHandler.class.getName());
+        
+        return new KafkaStreamsConfiguration(props);
+    }
+
+    @Bean
+    public StreamsBuilder streamsBuilder() {
+        return new StreamsBuilder();
+    }
+
+    @Bean
+    public KStream<String, String> messageProcessingStream(
+            StreamsBuilder streamsBuilder,
+            MessageProcessor messageProcessor) {
+        
+        return streamsBuilder
+                .stream(inputTopic)
+                .process(() -> messageProcessor, "message-processor-store");
+    }
+}
+
+// Custom Message Processor with Context
+@Component
+@Slf4j
+public class MessageProcessor implements Processor<String, String, String, String> {
+
+    private ProcessorContext<String, String> context;
+    
+    @Autowired
+    private DatabaseEnrichmentService databaseService;
+    
+    @Autowired
+    private ErrorHandler errorHandler;
+    
+    @Value("${app.kafka.output-topic}")
+    private String outputTopic;
+    
+    @Value("${app.kafka.error-topic}")
+    private String errorTopic;
+    
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Override
+    public void init(ProcessorContext<String, String> context) {
+        this.context = context;
+        log.info("MessageProcessor initialized with context");
+    }
+
+    @Override
+    public void process(Record<String, String> record) {
+        try {
+            log.debug("Processing record with key: {}, headers: {}", 
+                     record.key(), record.headers());
+            
+            // Extract and validate headers
+            HeaderValidationResult headerValidation = validateHeaders(record.headers());
+            if (!headerValidation.isValid()) {
+                handleValidationError(record, headerValidation.getErrorMessage());
+                return;
+            }
+
+            String mid = headerValidation.getMid();
+            
+            // Parse the message payload
+            MessagePayload payload = parsePayload(record.value());
+            if (payload == null) {
+                handleParsingError(record, "Failed to parse message payload");
+                return;
+            }
+
+            // Database enrichment
+            EnrichedData enrichedData = performDatabaseEnrichment(mid, payload);
+            
+            // Create enriched message
+            EnrichedMessage enrichedMessage = new EnrichedMessage();
+            enrichedMessage.setOriginalPayload(payload);
+            enrichedMessage.setEnrichedData(enrichedData);
+            enrichedMessage.setMid(mid);
+            enrichedMessage.setProcessingTimestamp(System.currentTimeMillis());
+            
+            // Create output headers
+            Headers outputHeaders = createOutputHeaders(record.headers(), enrichedData);
+            
+            // Forward to output topic using context
+            String enrichedJson = objectMapper.writeValueAsString(enrichedMessage);
+            
+            context.forward(record.withValue(enrichedJson).withHeaders(outputHeaders), 
+                           outputTopic);
+            
+            log.info("Successfully processed and forwarded message with MID: {}", mid);
+            
+        } catch (Exception e) {
+            log.error("Error processing record: {}", e.getMessage(), e);
+            handleProcessingError(record, e);
+        }
+    }
+
+    private HeaderValidationResult validateHeaders(Headers headers) {
+        HeaderValidationResult result = new HeaderValidationResult();
+        
+        // Check for status header
+        Header statusHeader = headers.lastHeader("status");
+        if (statusHeader == null) {
+            result.setValid(false);
+            result.setErrorMessage("Missing 'status' header");
+            return result;
+        }
+        
+        String status = new String(statusHeader.value(), StandardCharsets.UTF_8);
+        if (!"complete".equalsIgnoreCase(status)) {
+            result.setValid(false);
+            result.setErrorMessage("Status is not 'complete': " + status);
+            return result;
+        }
+        
+        // Check for mid header
+        Header midHeader = headers.lastHeader("mid");
+        if (midHeader == null) {
+            result.setValid(false);
+            result.setErrorMessage("Missing 'mid' header");
+            return result;
+        }
+        
+        String mid = new String(midHeader.value(), StandardCharsets.UTF_8);
+        if (mid.trim().isEmpty()) {
+            result.setValid(false);
+            result.setErrorMessage("Empty 'mid' header value");
+            return result;
+        }
+        
+        result.setValid(true);
+        result.setMid(mid);
+        return result;
+    }
+
+    private MessagePayload parsePayload(String jsonValue) {
+        try {
+            return objectMapper.readValue(jsonValue, MessagePayload.class);
+        } catch (Exception e) {
+            log.error("Failed to parse payload: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    private EnrichedData performDatabaseEnrichment(String mid, MessagePayload payload) {
+        try {
+            return databaseService.enrichData(mid, payload);
+        } catch (Exception e) {
+            log.error("Database enrichment failed for MID: {}", mid, e);
+            // Return partial enrichment or default values
+            return createDefaultEnrichedData(mid);
+        }
+    }
+
+    private EnrichedData createDefaultEnrichedData(String mid) {
+        EnrichedData data = new EnrichedData();
+        data.setMid(mid);
+        data.setEnrichmentStatus("PARTIAL");
+        data.setErrorMessage("Database enrichment failed");
+        return data;
+    }
+
+    private Headers createOutputHeaders(Headers originalHeaders, EnrichedData enrichedData) {
+        Headers outputHeaders = new RecordHeaders();
+        
+        // Copy relevant original headers
+        for (Header header : originalHeaders) {
+            String key = header.key();
+            if (!key.equals("status")) { // Don't copy status as it changes
+                outputHeaders.add(header);
+            }
+        }
+        
+        // Add new headers
+        outputHeaders.add("status", "enriched".getBytes(StandardCharsets.UTF_8));
+        outputHeaders.add("enrichment-status", 
+                         enrichedData.getEnrichmentStatus().getBytes(StandardCharsets.UTF_8));
+        outputHeaders.add("processing-timestamp", 
+                         String.valueOf(System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8));
+        
+        if (enrichedData.getCustomerType() != null) {
+            outputHeaders.add("customer-type", 
+                             enrichedData.getCustomerType().getBytes(StandardCharsets.UTF_8));
+        }
+        
+        return outputHeaders;
+    }
+
+    private void handleValidationError(Record<String, String> record, String errorMessage) {
+        errorHandler.handleValidationError(record, errorMessage, context, errorTopic);
+    }
+
+    private void handleParsingError(Record<String, String> record, String errorMessage) {
+        errorHandler.handleParsingError(record, errorMessage, context, errorTopic);
+    }
+
+    private void handleProcessingError(Record<String, String> record, Exception e) {
+        errorHandler.handleProcessingError(record, e, context, errorTopic);
+    }
+
+    @Override
+    public void close() {
+        log.info("MessageProcessor closing");
+    }
+}
+
+// Header Validation Result
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class HeaderValidationResult {
+    private boolean valid;
+    private String errorMessage;
+    private String mid;
+}
+
+// Message Models
+@Data
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class MessagePayload {
+    private String id;
+    private String type;
+    private String customerId;
+    private Map<String, Object> data;
+    private String timestamp;
+}
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class EnrichedData {
+    private String mid;
+    private String customerType;
+    private String accountStatus;
+    private BigDecimal creditLimit;
+    private String riskCategory;
+    private Map<String, Object> additionalAttributes;
+    private String enrichmentStatus = "SUCCESS";
+    private String errorMessage;
+}
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class EnrichedMessage {
+    private MessagePayload originalPayload;
+    private EnrichedData enrichedData;
+    private String mid;
+    private long processingTimestamp;
+}
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class ErrorMessage {
+    private String originalKey;
+    private String originalValue;
+    private Map<String, String> originalHeaders;
+    private String errorType;
+    private String errorMessage;
+    private String stackTrace;
+    private long errorTimestamp;
+}
+
+// Database Enrichment Service
+@Service
+@Slf4j
+public class DatabaseEnrichmentService {
+
+    // Placeholder for database dependencies
+    // @Autowired
+    // private JdbcTemplate jdbcTemplate;
+    
+    // @Autowired 
+    // private CustomerRepository customerRepository;
+
+    public EnrichedData enrichData(String mid, MessagePayload payload) {
+        log.info("Performing database enrichment for MID: {}", mid);
+        
+        try {
+            EnrichedData enrichedData = new EnrichedData();
+            enrichedData.setMid(mid);
+            
+            // Placeholder for actual database queries
+            enrichedData = enrichCustomerData(mid, payload.getCustomerId(), enrichedData);
+            enrichedData = enrichAccountData(mid, enrichedData);
+            enrichedData = enrichRiskData(mid, enrichedData);
+            
+            enrichedData.setEnrichmentStatus("SUCCESS");
+            return enrichedData;
+            
+        } catch (Exception e) {
+            log.error("Database enrichment failed for MID: {}", mid, e);
+            
+            EnrichedData errorData = new EnrichedData();
+            errorData.setMid(mid);
+            errorData.setEnrichmentStatus("FAILED");
+            errorData.setErrorMessage(e.getMessage());
+            return errorData;
+        }
+    }
+
+    private EnrichedData enrichCustomerData(String mid, String customerId, EnrichedData data) {
+        // Placeholder for customer data enrichment
+        /*
+        String sql = "SELECT customer_type, account_status FROM customers WHERE customer_id = ?";
+        try {
+            Map<String, Object> result = jdbcTemplate.queryForMap(sql, customerId);
+            data.setCustomerType((String) result.get("customer_type"));
+            data.setAccountStatus((String) result.get("account_status"));
+        } catch (EmptyResultDataAccessException e) {
+            log.warn("No customer found for ID: {}", customerId);
+            data.setCustomerType("UNKNOWN");
+            data.setAccountStatus("UNKNOWN");
+        }
+        */
+        
+        // Mock data for demonstration
+        data.setCustomerType("PREMIUM");
+        data.setAccountStatus("ACTIVE");
+        
+        return data;
+    }
+
+    private EnrichedData enrichAccountData(String mid, EnrichedData data) {
+        // Placeholder for account data enrichment
+        /*
+        String sql = "SELECT credit_limit FROM accounts WHERE mid = ?";
+        try {
+            BigDecimal creditLimit = jdbcTemplate.queryForObject(sql, BigDecimal.class, mid);
+            data.setCreditLimit(creditLimit);
+        } catch (EmptyResultDataAccessException e) {
+            log.warn("No account found for MID: {}", mid);
+            data.setCreditLimit(BigDecimal.ZERO);
+        }
+        */
+        
+        // Mock data for demonstration
+        data.setCreditLimit(new BigDecimal("50000.00"));
+        
+        return data;
+    }
+
+    private EnrichedData enrichRiskData(String mid, EnrichedData data) {
+        // Placeholder for risk data enrichment
+        /*
+        String sql = "SELECT risk_category, additional_attributes FROM risk_profiles WHERE mid = ?";
+        try {
+            Map<String, Object> result = jdbcTemplate.queryForMap(sql, mid);
+            data.setRiskCategory((String) result.get("risk_category"));
+            
+            String additionalAttrsJson = (String) result.get("additional_attributes");
+            if (additionalAttrsJson != null) {
+                ObjectMapper mapper = new ObjectMapper();
+                data.setAdditionalAttributes(mapper.readValue(additionalAttrsJson, Map.class));
+            }
+        } catch (Exception e) {
+            log.warn("No risk data found for MID: {}", mid);
+            data.setRiskCategory("LOW");
+        }
+        */
+        
+        // Mock data for demonstration
+        data.setRiskCategory("MEDIUM");
+        data.setAdditionalAttributes(Map.of(
+            "lastReviewDate", "2025-01-15",
+            "reviewScore", "85"
+        ));
+        
+        return data;
+    }
+}
+
+// Error Handler
+@Component
+@Slf4j
+public class ErrorHandler {
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    public void handleValidationError(Record<String, String> record, String errorMessage, 
+                                    ProcessorContext<String, String> context, String errorTopic) {
+        log.error("Validation error for record key {}: {}", record.key(), errorMessage);
+        forwardToErrorTopic(record, "VALIDATION_ERROR", errorMessage, null, context, errorTopic);
+    }
+
+    public void handleParsingError(Record<String, String> record, String errorMessage,
+                                 ProcessorContext<String, String> context, String errorTopic) {
+        log.error("Parsing error for record key {}: {}", record.key(), errorMessage);
+        forwardToErrorTopic(record, "PARSING_ERROR", errorMessage, null, context, errorTopic);
+    }
+
+    public void handleProcessingError(Record<String, String> record, Exception exception,
+                                    ProcessorContext<String, String> context, String errorTopic) {
+        log.error("Processing error for record key {}: {}", record.key(), exception.getMessage(), exception);
+        forwardToErrorTopic(record, "PROCESSING_ERROR", exception.getMessage(), 
+                           getStackTrace(exception), context, errorTopic);
+    }
+
+    private void forwardToErrorTopic(Record<String, String> record, String errorType, 
+                                   String errorMessage, String stackTrace,
+                                   ProcessorContext<String, String> context, String errorTopic) {
+        try {
+            ErrorMessage error = new ErrorMessage();
+            error.setOriginalKey(record.key());
+            error.setOriginalValue(record.value());
+            error.setOriginalHeaders(convertHeaders(record.headers()));
+            error.setErrorType(errorType);
+            error.setErrorMessage(errorMessage);
+            error.setStackTrace(stackTrace);
+            error.setErrorTimestamp(System.currentTimeMillis());
+
+            String errorJson = objectMapper.writeValueAsString(error);
+            
+            Headers errorHeaders = new RecordHeaders();
+            errorHeaders.add("error-type", errorType.getBytes(StandardCharsets.UTF_8));
+            errorHeaders.add("error-timestamp", 
+                           String.valueOf(System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8));
+            
+            context.forward(record.withValue(errorJson).withHeaders(errorHeaders), errorTopic);
+            
+        } catch (Exception e) {
+            log.error("Failed to forward error message to error topic", e);
+        }
+    }
+
+    private Map<String, String> convertHeaders(Headers headers) {
+        Map<String, String> headerMap = new HashMap<>();
+        for (Header header : headers) {
+            headerMap.put(header.key(), new String(header.value(), StandardCharsets.UTF_8));
+        }
+        return headerMap;
+    }
+
+    private String getStackTrace(Exception e) {
+        StringWriter sw = new StringWriter();
+        PrintWriter pw = new PrintWriter(sw);
+        e.printStackTrace(pw);
+        return sw.toString();
+    }
+}
+
+// Custom Exception Handlers
+public class CustomDeserializationExceptionHandler implements DeserializationExceptionHandler {
+    
+    @Override
+    public DeserializationHandlerResponse handle(ProcessorContext context, 
+                                               ConsumerRecord<byte[], byte[]> record, 
+                                               Exception exception) {
+        
+        String errorTopic = (String) context.appConfigs().get("app.kafka.error-topic");
+        
+        try {
+            Headers errorHeaders = new RecordHeaders();
+            errorHeaders.add("error-type", "DESERIALIZATION_ERROR".getBytes());
+            errorHeaders.add("error-message", exception.getMessage().getBytes());
+            errorHeaders.add("original-topic", record.topic().getBytes());
+            errorHeaders.add("original-partition", 
+                           String.valueOf(record.partition()).getBytes());
+            errorHeaders.add("original-offset", 
+                           String.valueOf(record.offset()).getBytes());
+            
+            ProducerRecord<byte[], byte[]> errorRecord = new ProducerRecord<>(
+                errorTopic, 
+                null, 
+                record.key(), 
+                record.value(), 
+                errorHeaders
+            );
+            
+            context.forward(errorRecord);
+            
+        } catch (Exception e) {
+            // Log the error if forwarding fails
+            System.err.println("Failed to forward deserialization error: " + e.getMessage());
+        }
+        
+        return DeserializationHandlerResponse.CONTINUE;
+    }
+
+    @Override
+    public void configure(Map<String, ?> configs) {
+        // Configuration if needed
+    }
+}
+
+public class CustomProductionExceptionHandler implements ProductionExceptionHandler {
+    
+    @Override
+    public ProductionExceptionHandlerResponse handle(ProducerRecord<byte[], byte[]> record, 
+                                                   Exception exception) {
+        
+        System.err.println("Production exception for record: " + record + 
+                          ", exception: " + exception.getMessage());
+        
+        // Log to monitoring system
+        // Could also forward to a dead letter topic here
+        
+        return ProductionExceptionHandlerResponse.CONTINUE;
+    }
+
+    @Override
+    public void configure(Map<String, ?> configs) {
+        // Configuration if needed
+    }
+}
+
+# Server Configuration
+server.port=8080
+
+# Kafka Configuration
+spring.kafka.bootstrap-servers=localhost:9092
+
+# Kafka Streams Configuration
+spring.kafka.streams.application-id=message-processor-app
+spring.kafka.streams.bootstrap-servers=${spring.kafka.bootstrap-servers}
+spring.kafka.streams.properties.default.key.serde=org.apache.kafka.common.serialization.Serdes$StringSerde
+spring.kafka.streams.properties.default.value.serde=org.apache.kafka.common.serialization.Serdes$StringSerde
+spring.kafka.streams.properties.processing.guarantee=exactly_once_v2
+spring.kafka.streams.properties.commit.interval.ms=1000
+spring.kafka.streams.properties.num.stream.threads=2
+spring.kafka.streams.properties.cache.max.bytes.buffering=10485760
+spring.kafka.streams.properties.replication.factor=1
+
+# Application Topics
+app.kafka.input-topic=input-messages
+app.kafka.output-topic=enriched-messages
+app.kafka.error-topic=error-messages
+
+# Database Configuration (Placeholder)
+spring.datasource.url=jdbc:postgresql://localhost:5432/enrichment_db
+spring.datasource.username=your_username
+spring.datasource.password=your_password
+spring.datasource.driver-class-name=org.postgresql.Driver
+
+# JPA Configuration
+spring.jpa.hibernate.ddl-auto=validate
+spring.jpa.show-sql=false
+spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.PostgreSQLDialect
+
+# Connection Pool Configuration
+spring.datasource.hikari.maximum-pool-size=10
+spring.datasource.hikari.minimum-idle=5
+spring.datasource.hikari.connection-timeout=30000
+spring.datasource.hikari.idle-timeout=600000
+spring.datasource.hikari.max-lifetime=1800000
+
+# Logging Configuration
+logging.level.com.yourcompany.streams=DEBUG
+logging.level.org.apache.kafka.streams=INFO
+logging.level.org.springframework.kafka=INFO
+
+# Management and Monitoring
+management.endpoints.web.exposure.include=health,info,metrics,kafka-streams
+management.endpoint.kafka-streams.enabled=true
+management.metrics.export.prometheus.enabled=true
+
+# Application Specific Configuration
+app.enrichment.timeout-ms=5000
+app.enrichment.retry-attempts=3
+app.error-handling.forward-to-dlq=true
+
+<dependencies>
+    <!-- Spring Boot Starter Web -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    
+    <!-- Spring Boot Kafka Streams -->
+    <dependency>
+        <groupId>org.springframework.kafka</groupId>
+        <artifactId>spring-kafka</artifactId>
+    </dependency>
+    
+    <!-- Apache Kafka Streams -->
+    <dependency>
+        <groupId>org.apache.kafka</groupId>
+        <artifactId>kafka-streams</artifactId>
+    </dependency>
+    
+    <!-- Spring Boot Starter Data JPA (for database operations) -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-jpa</artifactId>
+    </dependency>
+    
+    <!-- Spring Boot Starter JDBC -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-jdbc</artifactId>
+    </dependency>
+    
+    <!-- PostgreSQL Driver (replace with your database) -->
+    <dependency>
+        <groupId>org.postgresql</groupId>
+        <artifactId>postgresql</artifactId>
+        <scope>runtime</scope>
+    </dependency>
+    
+    <!-- Jackson for JSON processing -->
+    <dependency>
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-databind</artifactId>
+    </dependency>
+    
+    <!-- Lombok -->
+    <dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+        <optional>true</optional>
+    </dependency>
+    
+    <!-- Spring Boot Actuator for monitoring -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+    
+    <!-- Micrometer Prometheus for metrics -->
+    <dependency>
+        <groupId>io.micrometer</groupId>
+        <artifactId>micrometer-registry-prometheus</artifactId>
+    </dependency>
+    
+    <!-- SLF4J API -->
+    <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-api</artifactId>
+    </dependency>
+    
+    <!-- Spring Boot Test -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-test</artifactId>
+        <scope>test</scope>
+    </dependency>
+    
+    <!-- Kafka Streams Test Utils -->
+    <dependency>
+        <groupId>org.apache.kafka</groupId>
+        <artifactId>kafka-streams-test-utils</artifactId>
+        <scope>test</scope>
+    </dependency>
+    
+    <!-- Spring Kafka Test -->
+    <dependency>
+        <groupId>org.springframework.kafka</groupId>
+        <artifactId>spring-kafka-test</artifactId>
+        <scope>test</scope>
+    </dependency>
+    
+    <!-- Testcontainers for integration testing -->
+    <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>kafka</artifactId>
+        <scope>test</scope>
+    </dependency>
+    
+    <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>postgresql</artifactId>
+        <scope>test</scope>
+    </dependency>
+</dependencies>
