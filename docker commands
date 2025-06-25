@@ -106,3 +106,74 @@ docker exec -it kafka \
   --group my-consumer-group \
   --topic my-topic \
   --reset-offsets --to-earliest --execute
+
+
+Send messages WITH header using Kafka Console Producer
+bash
+Copy
+Edit
+docker exec -it kafka \
+  kafka-console-producer.sh \
+  --broker-list localhost:9092 \
+  --topic input-topic \
+  --property "parse.key=true" \
+  --property "key.separator=:" \
+  --property "headers=status=completed"
+Once it opens an interactive prompt, enter messages like:
+
+text
+Copy
+Edit
+myKey:This is a message with completed status
+You can also set multiple headers like:
+
+bash
+Copy
+Edit
+--property "headers=status=completed,source=manual"
+❌ 2. Send messages WITHOUT headers
+Just omit the --property headers=...:
+
+bash
+Copy
+Edit
+docker exec -it kafka \
+  kafka-console-producer.sh \
+  --broker-list localhost:9092 \
+  --topic input-topic \
+  --property "parse.key=true" \
+  --property "key.separator=:"
+Enter:
+
+pgsql
+Copy
+Edit
+someKey:Hello without header
+Or, even simpler (no key-value):
+
+bash
+Copy
+Edit
+docker exec -it kafka \
+  kafka-console-producer.sh \
+  --broker-list localhost:9092 \
+  --topic input-topic
+Then:
+
+pgsql
+Copy
+Edit
+Just some plain text message
+🧪 3. Send JSON messages (optional)
+If your stream processes JSON:
+
+bash
+Copy
+Edit
+{"event":"login", "user":"alice"}
+With headers:
+
+bash
+Copy
+Edit
+--property "headers=status=completed,env=prod"
