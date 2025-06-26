@@ -1,0 +1,166 @@
+package com.example.kafka.streams;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.streams.kstream.KStream;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import java.util.function.Consumer;
+import java.util.function.Function;
+
+@Slf4j
+@SpringBootApplication
+public class KafkaStreamsApplication {
+    
+    public static void main(String[] args) {
+        SpringApplication.run(KafkaStreamsApplication.class, args);
+    }
+}
+
+@Configuration
+@Slf4j
+class StreamsConfig {
+    
+    // Simple Consumer - just listens and processes messages
+    @Bean
+    public Consumer<KStream<String, JsonNode>> notificationListener() {
+        return inputStream -> {
+            inputStream
+                .peek((key, value) -> log.info("Received message - Key: {}, Value: {}", key, value))
+                .foreach((key, value) -> {
+                    // Process your message here
+                    processMessage(key, value);
+                });
+        };
+    }
+    
+    // Function - processes and forwards to another topic
+    @Bean
+    public Function<KStream<String, JsonNode>, KStream<String, JsonNode>> notificationProcessor() {
+        return inputStream -> {
+            return inputStream
+                .peek((key, value) -> log.info("Processing message - Key: {}", key))
+                .mapValues(this::transformMessage)
+                .peek((key, value) -> log.info("Transformed message - Key: {}, Value: {}", key, value));
+        };
+    }
+    
+    // Alternative: Consumer that reads from one topic and writes to another
+    @Bean
+    public Consumer<KStream<String, JsonNode>> notificationForwarder() {
+        return inputStream -> {
+            inputStream
+                .peek((key, value) -> log.info("Forwarding message - Key: {}", key))
+                .mapValues(this::addMetadata)
+                .to("output-topic"); // Specify your output topic name
+        };
+    }
+    
+    private void processMessage(String key, JsonNode value) {
+        try {
+            // Your processing logic here
+            log.info("Processing notification: {}", value);
+            
+            // Example: Extract fields from the message
+            if (value.has("type")) {
+                String messageType = value.get("type").asText();
+                log.info("Message type: {}", messageType);
+            }
+            
+            // Add your business logic here
+            
+        } catch (Exception e) {
+            log.error("Error processing message with key: {}", key, e);
+        }
+    }
+    
+    private JsonNode transformMessage(JsonNode originalMessage) {
+        try {
+            // Transform your message here
+            // This is just an example - modify as needed
+            log.info("Transforming message: {}", originalMessage);
+            
+            // You can modify the JsonNode or create a new one
+            // For this example, we'll just return it as-is
+            return originalMessage;
+            
+        } catch (Exception e) {
+            log.error("Error transforming message", e);
+            return originalMessage;
+        }
+    }
+    
+    private JsonNode addMetadata(JsonNode originalMessage) {
+        try {
+            // Add metadata like timestamp, processing info, etc.
+            // This is just an example
+            log.info("Adding metadata to message: {}", originalMessage);
+            return originalMessage;
+            
+        } catch (Exception e) {
+            log.error("Error adding metadata", e);
+            return originalMessage;
+        }
+    }
+}
+
+
+----------------------------------------
+
+spring:
+  application:
+    name: kafka-streams-processor
+  cloud:
+    stream:
+      kafka:
+        streams:
+          binder:
+            configuration:
+              application.id: notification-processor
+              bootstrap.servers: localhost:9092
+              default.key.serde: org.apache.kafka.common.serialization.Serdes$StringSerde
+              default.value.serde: org.springframework.kafka.support.serializer.JsonSerde
+              # Enable auto-creation of topics (useful for development)
+              auto.create.topics.enable: true
+        binder:
+          brokers: localhost:9092
+      bindings:
+        # For the Consumer (notificationListener)
+        notificationListener-in-0:
+          destination: input-topic
+          group: notification-processor-group
+          content-type: application/json
+        
+        # For the Function (notificationProcessor)
+        notificationProcessor-in-0:
+          destination: input-topic
+          group: notification-processor-group
+          content-type: application/json
+        notificationProcessor-out-0:
+          destination: processed-topic
+          content-type: application/json
+        
+        # For the Forwarder Consumer
+        notificationForwarder-in-0:
+          destination: input-topic
+          group: notification-forwarder-group
+          content-type: application/json
+
+# Logging configuration
+logging:
+  level:
+    com.example.kafka.streams: DEBUG
+    org.springframework.cloud.stream: DEBUG
+    org.apache.kafka: INFO
+  pattern:
+    console: "%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
+-----------------------------------------------
+
+# Example using kafka console producer
+kafka-console-producer.sh --bootstrap-server localhost:9092 --topic input-topic
+
+# Then type a JSON message:
+{"type": "notification", "message": "Hello World", "timestamp": "2024-01-01T10:00:00Z"}
