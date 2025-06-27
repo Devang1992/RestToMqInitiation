@@ -1,3 +1,5 @@
+https://refactorfirst.com/spring-cloud-kafka-streams-aggregate-join-windowing
+
 Perfect — let's refactor the app to use KStream instead of building a Topology bean manually.
 
 ✅ What changes now?
