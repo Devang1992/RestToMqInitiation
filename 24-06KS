@@ -1,3 +1,5 @@
+status=completed,source=user-service,correlation-id=12345|user123:{"userId": "user123", "message": "Welcome notification", "timestamp": "2025-06-27T10:30:00Z", "type": "welcome"}
+
 docker exec -it kafka kafka-console-producer \
   --topic notifications \
   --bootstrap-server localhost:9092 \
