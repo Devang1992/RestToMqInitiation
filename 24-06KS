@@ -1,3 +1,11 @@
+docker exec -it kafka kafka-console-producer \
+  --topic notifications \
+  --bootstrap-server localhost:9092 \
+  --property "parse.key=true" \
+  --property "key.separator=:" \
+  --property "parse.headers=true" \
+  --property "headers.delimiter=|" \
+  --property "headers.separator=,"
 https://refactorfirst.com/spring-cloud-kafka-streams-aggregate-join-windowing
 
 Perfect — let's refactor the app to use KStream instead of building a Topology bean manually.
