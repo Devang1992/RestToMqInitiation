@@ -1,0 +1,159 @@
+@Component
+public class DatabaseDedupProcessor<K, V> extends ContextualProcessor<K, V> {
+    
+    private static final String MID_STORE = "mid-store";
+    private static final long PUNCTUATION_INTERVAL = Duration.ofMinutes(1).toMillis(); // 1 minute
+    private static final long DB_DELAY_THRESHOLD = Duration.ofSeconds(30).toMillis(); // 30 seconds for DB
+    
+    private KeyValueStore<String, ProcessingRecord> midStore;
+    private final NotificationDao notificationDao;
+    private final DedupProcessorProperties properties;
+    
+    public DatabaseDedupProcessor(NotificationDao notificationDao, 
+                                 DedupProcessorProperties properties) {
+        this.notificationDao = notificationDao;
+        this.properties = properties;
+    }
+    
+    @Override
+    public void init(final ProcessorContext<K, V> context) {
+        super.init(context);
+        midStore = context.getStateStore(MID_STORE);
+        
+        // Schedule punctuation every minute
+        context.schedule(
+            Duration.ofMinutes(1),
+            PunctuationType.WALL_CLOCK_TIME,
+            this::checkDatabaseAndProcess
+        );
+    }
+    
+    @Override
+    public void process(Record<K, V> rec) {
+        if (rec.value() == null) {
+            String mid = HeaderUtils.lastStringHeader(rec.headers(), KafkaHeaders.MID);
+            if (mid == null) {
+                log.error(PantsErrorCode.MID_NOT_FOUND_ERROR.toString());
+                return;
+            }
+            
+            // Check if we already have this mid in our store
+            if (midStore.get(mid) != null) {
+                log.info("Duplicate message detected for mid {}, skipping processing.", mid);
+                return;
+            }
+            
+            // Store the record with timestamp for later processing
+            ProcessingRecord processingRecord = new ProcessingRecord(
+                rec, 
+                System.currentTimeMillis(),
+                0 // retry count
+            );
+            midStore.put(mid, processingRecord);
+            
+            // Don't forward immediately - let punctuator handle it
+            return;
+        }
+        
+        // Forward non-null records immediately
+        context().forward(rec);
+    }
+    
+    private void checkDatabaseAndProcess(long currentStreamTimeMs) {
+        try (KeyValueIterator<String, ProcessingRecord> iterator = midStore.all()) {
+            while (iterator.hasNext()) {
+                final KeyValue<String, ProcessingRecord> entry = iterator.next();
+                final String mid = entry.key;
+                final ProcessingRecord processingRecord = entry.value;
+                
+                long timeSinceAdded = currentStreamTimeMs - processingRecord.getTimestamp();
+                
+                // Only check after DB delay threshold (30 seconds)
+                if (timeSinceAdded >= DB_DELAY_THRESHOLD) {
+                    
+                    // Check if notification exists in database
+                    boolean existsInDb = notificationDao.existsById(mid);
+                    
+                    if (existsInDb) {
+                        // Found in DB - forward the record and remove from store
+                        log.info("Found mid {} in database, forwarding record", mid);
+                        context().forward(processingRecord.getRecord());
+                        midStore.delete(mid);
+                    } else {
+                        // Not found in DB - check if we should retry
+                        int retryCount = processingRecord.getRetryCount();
+                        long timeSinceLastCheck = currentStreamTimeMs - processingRecord.getLastCheckTime();
+                        
+                        if (timeSinceLastCheck >= Duration.ofMinutes(1).toMillis()) {
+                            // It's been a minute since last check, increment retry count
+                            retryCount++;
+                            
+                            if (retryCount >= properties.getMaxRetries()) {
+                                // Max retries reached, remove from store
+                                log.warn("Max retries reached for mid {}, removing from store", mid);
+                                midStore.delete(mid);
+                            } else {
+                                // Update retry count and last check time
+                                ProcessingRecord updatedRecord = new ProcessingRecord(
+                                    processingRecord.getRecord(),
+                                    processingRecord.getTimestamp(),
+                                    retryCount,
+                                    currentStreamTimeMs
+                                );
+                                midStore.put(mid, updatedRecord);
+                                log.info("Retrying mid {} (attempt {})", mid, retryCount);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.error("Error during database check punctuation", e);
+        }
+    }
+    
+    @Override
+    public void close() {
+        // Cleanup if needed
+    }
+    
+    // Helper class to store processing information
+    private static class ProcessingRecord {
+        private final Record<?, ?> record;
+        private final long timestamp;
+        private final int retryCount;
+        private final long lastCheckTime;
+        
+        public ProcessingRecord(Record<?, ?> record, long timestamp, int retryCount) {
+            this(record, timestamp, retryCount, timestamp);
+        }
+        
+        public ProcessingRecord(Record<?, ?> record, long timestamp, int retryCount, long lastCheckTime) {
+            this.record = record;
+            this.timestamp = timestamp;
+            this.retryCount = retryCount;
+            this.lastCheckTime = lastCheckTime;
+        }
+        
+        // Getters
+        public Record<?, ?> getRecord() { return record; }
+        public long getTimestamp() { return timestamp; }
+        public int getRetryCount() { return retryCount; }
+        public long getLastCheckTime() { return lastCheckTime; }
+    }
+}
+
+// Configuration properties
+@ConfigurationProperties(prefix = "dedup.processor")
+@Data
+public class DedupProcessorProperties {
+    private int maxRetries = 5; // Maximum number of retry attempts
+    private Duration dbCheckDelay = Duration.ofSeconds(30); // Delay before first DB check
+    private Duration retryInterval = Duration.ofMinutes(1); // Interval between retries
+}
+
+// DAO interface
+public interface NotificationDao {
+    boolean existsById(String id);
+    // other methods...
+}
