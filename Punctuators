@@ -1,0 +1,233 @@
+// NotificationDao interface
+public interface NotificationDao {
+    boolean existsByMid(String mid);
+    // or 
+    // Notification findByMid(String mid); // returns null if not found
+}
+
+// Updated DedupProcessor with database checking
+@Slf4j
+public class DedupProcessor<K, V> extends ContextualProcessor<K, V> {
+    
+    public static final String MID_STORE = "mid-store";
+    
+    private KeyValueStore<String, Long> midStore;
+    private final DedupProcessorProperties properties;
+    private final NotificationDao notificationDao;
+    
+    public DedupProcessor(@NonNull DedupProcessorProperties properties, 
+                         @NonNull NotificationDao notificationDao) {
+        this.properties = properties;
+        this.notificationDao = notificationDao;
+    }
+    
+    @Override
+    public void init(final ProcessorContext<K, V> context) {
+        super.init(context);
+        midStore = context.getStateStore(MID_STORE);
+        
+        // Schedule punctuation every 30 seconds for database checking
+        context.schedule(
+            Duration.ofSeconds(30), // Check every 30 seconds
+            PunctuationType.WALL_CLOCK_TIME,
+            this::checkDatabaseAndCleanup
+        );
+    }
+    
+    @Override
+    public void process(Record<K, V> rec) {
+        if (rec.value() == null) {
+            String mid = HeaderUtils.lastStringHeader(rec.headers(), KafkaHeaders.MID);
+            if (mid == null) {
+                log.error(PantsErrorCode.MID_NOT_FOUND_ERROR.toString());
+                return;
+            }
+            
+            // Check if we've already seen this MID
+            if (midStore.get(mid) != null) {
+                log.info("Duplicate message detected for mid {}, skipping processing.", mid);
+                return;
+            }
+            
+            // Check database immediately
+            if (notificationDao.existsByMid(mid)) {
+                log.info("MID {} already exists in database, skipping processing.", mid);
+                return;
+            }
+            
+            // Store the MID with current timestamp for tracking
+            midStore.put(mid, System.currentTimeMillis());
+        }
+        
+        // Forward the record for processing
+        context().forward(rec);
+    }
+    
+    /**
+     * Punctuator that checks database for MIDs and manages cleanup
+     */
+    private void checkDatabaseAndCleanup(long currentStreamTimeMs) {
+        log.debug("Running database check punctuation at {}", currentStreamTimeMs);
+        
+        try (KeyValueIterator<String, Long> iterator = midStore.all()) {
+            while (iterator.hasNext()) {
+                final KeyValue<String, Long> entry = iterator.next();
+                final String mid = entry.key;
+                final long firstSeenTimestamp = entry.value;
+                final long currentTime = System.currentTimeMillis();
+                
+                // Check if MID now exists in database
+                if (notificationDao.existsByMid(mid)) {
+                    log.info("MID {} found in database, removing from store", mid);
+                    midStore.delete(mid);
+                } else {
+                    // Check if we should give up after maximum retry time (e.g., 5 minutes)
+                    long maxRetryTime = Duration.ofMinutes(5).toMillis();
+                    if (currentTime - firstSeenTimestamp > maxRetryTime) {
+                        log.warn("MID {} not found in database after {} minutes, giving up and removing from store", 
+                                mid, Duration.ofMillis(currentTime - firstSeenTimestamp).toMinutes());
+                        midStore.delete(mid);
+                    } else {
+                        log.debug("MID {} still not in database, will check again in next cycle", mid);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.error("Error during database check punctuation", e);
+        }
+    }
+    
+    @Override
+    public void close() {
+        // Cleanup if needed
+    }
+}
+
+// Alternative implementation with more sophisticated retry logic
+@Slf4j
+public class EnhancedDedupProcessor<K, V> extends ContextualProcessor<K, V> {
+    
+    public static final String MID_STORE = "mid-store";
+    
+    private KeyValueStore<String, MidTrackingInfo> midStore;
+    private final DedupProcessorProperties properties;
+    private final NotificationDao notificationDao;
+    
+    public EnhancedDedupProcessor(@NonNull DedupProcessorProperties properties, 
+                                 @NonNull NotificationDao notificationDao) {
+        this.properties = properties;
+        this.notificationDao = notificationDao;
+    }
+    
+    @Override
+    public void init(final ProcessorContext<K, V> context) {
+        super.init(context);
+        midStore = context.getStateStore(MID_STORE);
+        
+        // Schedule punctuation every 30 seconds
+        context.schedule(
+            Duration.ofSeconds(30),
+            PunctuationType.WALL_CLOCK_TIME,
+            this::checkDatabaseAndManageRetries
+        );
+    }
+    
+    @Override
+    public void process(Record<K, V> rec) {
+        if (rec.value() == null) {
+            String mid = HeaderUtils.lastStringHeader(rec.headers(), KafkaHeaders.MID);
+            if (mid == null) {
+                log.error(PantsErrorCode.MID_NOT_FOUND_ERROR.toString());
+                return;
+            }
+            
+            // Check if we're already tracking this MID
+            MidTrackingInfo existingInfo = midStore.get(mid);
+            if (existingInfo != null) {
+                log.info("Duplicate message detected for mid {}, skipping processing.", mid);
+                return;
+            }
+            
+            // Check database immediately
+            if (notificationDao.existsByMid(mid)) {
+                log.info("MID {} already exists in database, skipping processing.", mid);
+                return;
+            }
+            
+            // Store the MID with tracking info
+            MidTrackingInfo trackingInfo = new MidTrackingInfo(
+                System.currentTimeMillis(),
+                0, // retry count
+                System.currentTimeMillis() // last check time
+            );
+            midStore.put(mid, trackingInfo);
+        }
+        
+        // Forward the record for processing
+        context().forward(rec);
+    }
+    
+    /**
+     * Enhanced punctuator with retry logic
+     */
+    private void checkDatabaseAndManageRetries(long currentStreamTimeMs) {
+        log.debug("Running enhanced database check punctuation");
+        
+        try (KeyValueIterator<String, MidTrackingInfo> iterator = midStore.all()) {
+            while (iterator.hasNext()) {
+                final KeyValue<String, MidTrackingInfo> entry = iterator.next();
+                final String mid = entry.key;
+                final MidTrackingInfo info = entry.value;
+                final long currentTime = System.currentTimeMillis();
+                
+                // Check if enough time has passed since last check (1 minute)
+                if (currentTime - info.lastCheckTime < Duration.ofMinutes(1).toMillis()) {
+                    continue; // Not time to check yet
+                }
+                
+                // Check database
+                if (notificationDao.existsByMid(mid)) {
+                    log.info("MID {} found in database after {} retries, removing from store", 
+                            mid, info.retryCount);
+                    midStore.delete(mid);
+                } else {
+                    // Update retry info
+                    MidTrackingInfo updatedInfo = new MidTrackingInfo(
+                        info.firstSeenTime,
+                        info.retryCount + 1,
+                        currentTime
+                    );
+                    
+                    // Check if we should give up (e.g., after 5 retries or 10 minutes)
+                    boolean maxRetriesReached = updatedInfo.retryCount >= 5;
+                    boolean maxTimeReached = currentTime - info.firstSeenTime > Duration.ofMinutes(10).toMillis();
+                    
+                    if (maxRetriesReached || maxTimeReached) {
+                        log.warn("MID {} not found in database after {} retries over {} minutes, giving up", 
+                                mid, updatedInfo.retryCount, 
+                                Duration.ofMillis(currentTime - info.firstSeenTime).toMinutes());
+                        midStore.delete(mid);
+                    } else {
+                        log.debug("MID {} still not in database, retry count: {}", mid, updatedInfo.retryCount);
+                        midStore.put(mid, updatedInfo);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.error("Error during enhanced database check punctuation", e);
+        }
+    }
+    
+    // Inner class to track MID information
+    public static class MidTrackingInfo {
+        public final long firstSeenTime;
+        public final int retryCount;
+        public final long lastCheckTime;
+        
+        public MidTrackingInfo(long firstSeenTime, int retryCount, long lastCheckTime) {
+            this.firstSeenTime = firstSeenTime;
+            this.retryCount = retryCount;
+            this.lastCheckTime = lastCheckTime;
+        }
+    }
+}
