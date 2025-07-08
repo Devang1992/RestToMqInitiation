@@ -1,0 +1,60 @@
+public class MidParkingProcessor implements Processor<String, String, String, String> {
+    private ProcessorContext<String, String> context;
+    private KeyValueStore<String, String> parkedMessagesStore;
+
+    @Override
+    public void init(ProcessorContext<String, String> context) {
+        this.context = context;
+        this.parkedMessagesStore = context.getStateStore("mid-parking-store");
+
+        context.schedule(Duration.ofMinutes(1), PunctuationType.WALL_CLOCK_TIME, timestamp -> {
+            try (KeyValueIterator<String, String> iterator = parkedMessagesStore.all()) {
+                while (iterator.hasNext()) {
+                    KeyValue<String, String> entry = iterator.next();
+                    String mid = entry.key;
+                    String messageValue = entry.value;
+
+                    if (checkIfMidExistsInDb(mid)) {
+                        // Reprocess
+                        context.forward(mid, messageValue);
+                        parkedMessagesStore.delete(mid); // Done
+                    }
+                }
+            }
+        });
+    }
+
+    @Override
+    public void process(Record<String, String> record) {
+        String mid = extractMidFromHeader(record.headers());
+
+        if (checkIfMidExistsInDb(mid)) {
+            context.forward(record.withKey(mid)); // Process immediately
+        } else {
+            parkedMessagesStore.put(mid, record.value()); // Park it
+        }
+    }
+
+    private boolean checkIfMidExistsInDb(String mid) {
+        // JDBC or repository check
+        return db.checkMidExists(mid);
+    }
+
+    private String extractMidFromHeader(Headers headers) {
+        Header header = headers.lastHeader("mid");
+        return header != null ? new String(header.value(), StandardCharsets.UTF_8) : null;
+    }
+}
+
+
+StoreBuilder<KeyValueStore<String, String>> storeBuilder =
+    Stores.keyValueStoreBuilder(
+        Stores.persistentKeyValueStore("mid-parking-store"),
+        Serdes.String(),
+        Serdes.String()
+    );
+
+builder.addStateStore(storeBuilder);
+
+stream.process(() -> new MidParkingProcessor(), Named.as("MidProcessor"), "mid-parking-store");
+
