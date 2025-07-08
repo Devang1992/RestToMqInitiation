@@ -1,0 +1,61 @@
+public class MidParkingProcessor implements Processor<String, JsonNode, String, JsonNode> {
+
+    private ProcessorContext<String, JsonNode> context;
+    private KeyValueStore<String, String> parkedStore;
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Override
+    public void init(ProcessorContext<String, JsonNode> context) {
+        this.context = context;
+        this.parkedStore = context.getStateStore("mid-parking-store");
+
+        context.schedule(Duration.ofMinutes(1), PunctuationType.WALL_CLOCK_TIME, timestamp -> {
+            try (KeyValueIterator<String, String> iterator = parkedStore.all()) {
+                while (iterator.hasNext()) {
+                    KeyValue<String, String> entry = iterator.next();
+                    String mid = entry.key;
+                    String jsonString = entry.value;
+
+                    if (checkIfMidExistsInDb(mid)) {
+                        JsonNode valueNode = objectMapper.readTree(jsonString);
+                        context.forward(new Record<>(mid, valueNode, timestamp));
+                        parkedStore.delete(mid); // remove after processing
+                    }
+                }
+            } catch (Exception e) {
+                // log error
+                e.printStackTrace();
+            }
+        });
+    }
+
+    @Override
+    public void process(Record<String, JsonNode> record) {
+        String mid = extractMidFromHeader(record.headers());
+
+        if (mid == null) return; // skip if mid missing
+
+        if (checkIfMidExistsInDb(mid)) {
+            context.forward(new Record<>(mid, record.value(), record.timestamp()));
+        } else {
+            try {
+                String jsonStr = objectMapper.writeValueAsString(record.value());
+                parkedStore.put(mid, jsonStr);
+            } catch (JsonProcessingException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    private String extractMidFromHeader(Headers headers) {
+        Header header = headers.lastHeader("mid");
+        return (header != null)
+                ? new String(header.value(), StandardCharsets.UTF_8)
+                : null;
+    }
+
+    private boolean checkIfMidExistsInDb(String mid) {
+        // Replace with actual DB check
+        return myAdviceRepository.existsByMid(mid);
+    }
+}
