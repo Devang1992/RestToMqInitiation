@@ -1,3 +1,11 @@
+streamsBuilder.stream("input-topic")
+    .filter((key, value, recordContext) -> {
+        Headers headers = recordContext.headers();
+        String mid = HeaderUtils.lastStringHeader(headers, KafkaHeaders.MID);
+        return mid != null && !mid.isEmpty();
+    })
+    .to("output-topic");
+
 Scenario: What You’re Doing Now (Probably)
 In your Kafka Streams processor, you likely do:
 
