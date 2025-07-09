@@ -1,0 +1,73 @@
+If the child node is nested multiple levels deep (i.e., several objects down the tree), you can still directly extract it using Jackson’s JsonNode API — you just need to navigate step by step.
+
+✅ Example: Deeply Nested Structure
+Let's say your JSON looks like this:
+
+json
+Copy code
+{
+  "meta": {
+    "event": {
+      "details": {
+        "child": {
+          "a": 1,
+          "b": 2,
+          "c": 3
+        }
+      }
+    }
+  }
+}
+✅ You can extract child like this:
+java
+Copy code
+JsonNode payload = record.value(); // the root JsonNode
+
+JsonNode childNode = payload
+    .path("meta")
+    .path("event")
+    .path("details")
+    .path("child");
+
+if (!childNode.isMissingNode() && childNode.isObject()) {
+    String childJson = childNode.toString();  // Serialize to JSON string
+    // Use or store childJson
+}
+✅ Why use .path() and not .get()?
+get("field") returns null if the field is missing → can cause NPE.
+
+path("field") returns a MissingNode (safe, non-null) → preferred when navigating deep trees.
+
+🔁 If You Know the Full Path: Use JSON Pointer
+Jackson supports JSON Pointer syntax too:
+
+java
+Copy code
+JsonNode childNode = payload.at("/meta/event/details/child");
+Then the rest is the same:
+
+java
+Copy code
+if (!childNode.isMissingNode()) {
+    String json = childNode.toString();
+}
+🔧 Bonus: Convert to POJO
+java
+Copy code
+Child child = objectMapper.treeToValue(childNode, Child.class);
+✅ Summary
+Depth	Extraction method
+1 level deep	payload.get("child")
+Multi-level	payload.path("meta").path("event").path("details").path("child")
+Or	payload.at("/meta/event/details/child") (JSON Pointer)
+
+No need for full manual parsing — just navigate directly to the deep node and serialize it.
+
+Let me know the actual path if you want me to write the exact extraction code.
+
+
+
+
+
+
+
