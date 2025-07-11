@@ -1,0 +1,75 @@
+package com.td.payments.pwsp.kafka.processor;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.td.payments.pwsp.kafka.common.KafkaHeaders;
+import com.td.payments.pwsp.kafka.processor.FilterProcessor;
+import lombok.SneakyThrows;
+import org.apache.kafka.common.header.internals.RecordHeaders;
+import org.apache.kafka.streams.processor.api.ProcessorContext;
+import org.apache.kafka.streams.processor.api.Record;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
+
+import java.nio.charset.StandardCharsets;
+
+import static org.mockito.Mockito.*;
+
+class FilterProcessorTest {
+
+    private FilterProcessor processor;
+    private ProcessorContext<String, JsonNode> context;
+
+    private static final ObjectMapper objectMapper = new ObjectMapper();
+
+    @BeforeEach
+    void setUp() {
+        processor = new FilterProcessor();
+        context = mock(ProcessorContext.class);
+        processor.init(context);
+    }
+
+    @Test
+    @SneakyThrows
+    void shouldForwardRecordWhenStatusIsValid() {
+        String validStatus = "in_processing";
+        RecordHeaders headers = new RecordHeaders();
+        headers.add(KafkaHeaders.STATUS, validStatus.getBytes(StandardCharsets.UTF_8));
+
+        JsonNode value = objectMapper.readTree("{\"someField\":\"someValue\"}");
+
+        Record<String, JsonNode> record = new Record<>("key1", value, System.currentTimeMillis(), headers);
+
+        processor.process(record);
+
+        verify(context).forward(record);  // should forward
+    }
+
+    @Test
+    @SneakyThrows
+    void shouldNotForwardWhenStatusIsNull() {
+        RecordHeaders headers = new RecordHeaders();  // No STATUS header
+
+        JsonNode value = objectMapper.readTree("{\"someField\":\"someValue\"}");
+        Record<String, JsonNode> record = new Record<>("key2", value, System.currentTimeMillis(), headers);
+
+        processor.process(record);
+
+        verify(context, never()).forward(any());  // should skip
+    }
+
+    @Test
+    @SneakyThrows
+    void shouldNotForwardWhenStatusIsComplete() {
+        RecordHeaders headers = new RecordHeaders();
+        headers.add(KafkaHeaders.STATUS, "complete".getBytes(StandardCharsets.UTF_8));
+
+        JsonNode value = objectMapper.readTree("{\"someField\":\"someValue\"}");
+        Record<String, JsonNode> record = new Record<>("key3", value, System.currentTimeMillis(), headers);
+
+        processor.process(record);
+
+        verify(context, never()).forward(any());  // should skip
+    }
+}
