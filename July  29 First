@@ -1,0 +1,243 @@
+1. Define Templates in resources/templates/
+Place files like:
+
+python-repl
+Copy
+Edit
+message_template_type1.txt
+message_template_type2.txt
+...
+message_template_type8.txt
+Each with placeholders like:
+
+txt
+Copy
+Edit
+Name: ${name}
+Email: ${email}
+Amount: ${amount}
+Timestamp: ${timestamp}
+2. TemplateWriter – Apply JSON to Template
+java
+Copy
+Edit
+package com.example.batch.service;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import java.io.*;
+import java.nio.file.*;
+import java.util.HashMap;
+import java.util.Map;
+
+public class TemplateWriter {
+
+    private static final String TEMPLATE_DIR = "src/main/resources/templates/";
+    private static final File OUTPUT_FILE = new File("/tmp/batch_output.txt");
+    private static final ObjectMapper objectMapper = new ObjectMapper();
+    private static final Map<String, String> templateCache = new HashMap<>();
+
+    public static synchronized void appendToFile(String jsonValue, String templateType) {
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(OUTPUT_FILE, true))) {
+            JsonNode node = objectMapper.readTree(jsonValue);
+
+            String template = loadTemplate(templateType);
+            String formatted = applyTemplate(template, node);
+
+            writer.write(formatted);
+            writer.newLine();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private static String loadTemplate(String type) throws IOException {
+        if (templateCache.containsKey(type)) return templateCache.get(type);
+        String template = Files.readString(Paths.get(TEMPLATE_DIR + "message_template_" + type + ".txt"));
+        templateCache.put(type, template);
+        return template;
+    }
+
+    private static String applyTemplate(String template, JsonNode node) {
+        String result = template;
+        for (var field : node.fields()) {
+            result = result.replace("${" + field.getKey() + "}", field.getValue().asText(""));
+        }
+        return result;
+    }
+}
+3. Kafka Streams Processor with Offset Tracking
+java
+Copy
+Edit
+package com.example.batch.processor;
+
+import com.example.batch.service.TemplateWriter;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.streams.processor.api.*;
+
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
+
+public class OffsetTrackingProcessor implements Processor<String, String, Void, Void> {
+
+    private final Map<TopicPartition, Long> currentOffsets;
+    private final Map<TopicPartition, Long> endOffsets;
+    private final AtomicLong lastMessageTime;
+    private ProcessorContext<Void, Void> context;
+
+    public OffsetTrackingProcessor(Map<TopicPartition, Long> currentOffsets,
+                                   Map<TopicPartition, Long> endOffsets,
+                                   AtomicLong lastMessageTime) {
+        this.currentOffsets = currentOffsets;
+        this.endOffsets = endOffsets;
+        this.lastMessageTime = lastMessageTime;
+    }
+
+    @Override
+    public void init(ProcessorContext<Void, Void> context) {
+        this.context = context;
+    }
+
+    @Override
+    public void process(Record<String, String> record) {
+        TopicPartition tp = new TopicPartition(record.topic(), record.partition());
+        currentOffsets.put(tp, record.offset());
+        lastMessageTime.set(System.currentTimeMillis());
+
+        String templateType = "type1"; // default; can be extracted from headers or JSON field
+        try {
+            String templateFromJson = new ObjectMapper().readTree(record.value()).path("templateType").asText();
+            if (!templateFromJson.isBlank()) {
+                templateType = templateFromJson;
+            }
+        } catch (Exception e) {
+            // fallback to default
+        }
+
+        TemplateWriter.appendToFile(record.value(), templateType);
+    }
+}
+4. Idle Timeout + End Offset Monitor
+java
+Copy
+Edit
+package com.example.batch.util;
+
+import com.example.batch.service.TibcoFileSender;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.streams.KafkaStreams;
+
+import java.io.File;
+import java.util.Map;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+
+public class ProcessorContextScheduler {
+
+    public static void scheduleIdleCheck(Map<TopicPartition, Long> currentOffsets,
+                                         Map<TopicPartition, Long> endOffsets,
+                                         KafkaStreams kafkaStreams,
+                                         AtomicLong lastMessageTime,
+                                         TibcoFileSender fileSender) {
+
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+
+        scheduler.scheduleAtFixedRate(() -> {
+            boolean allReached = endOffsets.entrySet().stream().allMatch(entry -> {
+                long current = currentOffsets.getOrDefault(entry.getKey(), -1L);
+                return current >= entry.getValue();
+            });
+
+            long idleMillis = System.currentTimeMillis() - lastMessageTime.get();
+            boolean idleTimeout = idleMillis > 40000;
+
+            if (allReached || idleTimeout) {
+                kafkaStreams.close(Duration.ofSeconds(5));
+                fileSender.sendFile(new File("/tmp/batch_output.txt"));
+                scheduler.shutdown();
+            }
+
+        }, 10, 5, TimeUnit.SECONDS);
+    }
+}
+5. Admin Utility to Get End Offsets
+java
+Copy
+Edit
+package com.example.batch.util;
+
+import org.apache.kafka.clients.consumer.*;
+import org.apache.kafka.common.*;
+
+import java.util.*;
+
+public class KafkaOffsetUtil {
+
+    public static Map<TopicPartition, Long> fetchEndOffsets(String topic, Properties props) {
+        Map<TopicPartition, Long> endOffsets = new HashMap<>();
+
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
+            List<PartitionInfo> partitions = consumer.partitionsFor(topic);
+            List<TopicPartition> topicPartitions = new ArrayList<>();
+            for (PartitionInfo pi : partitions) {
+                topicPartitions.add(new TopicPartition(topic, pi.partition()));
+            }
+
+            consumer.assign(topicPartitions);
+            consumer.seekToEnd(topicPartitions);
+            for (TopicPartition tp : topicPartitions) {
+                endOffsets.put(tp, consumer.position(tp) - 1);
+            }
+        }
+
+        return endOffsets;
+    }
+}
+6. TIBCO File Sender via SFTP
+java
+Copy
+Edit
+package com.example.batch.service;
+
+import com.jcraft.jsch.*;
+
+import java.io.File;
+
+public class TibcoFileSender {
+
+    public void sendFile(File file) {
+        String host = "your-sftp-host";
+        String user = "your-user";
+        String pass = "your-password";
+
+        try {
+            JSch jsch = new JSch();
+            Session session = jsch.getSession(user, host, 22);
+            session.setPassword(pass);
+            session.setConfig("StrictHostKeyChecking", "no");
+            session.connect();
+
+            ChannelSftp sftp = (ChannelSftp) session.openChannel("sftp");
+            sftp.connect();
+            sftp.put(file.getAbsolutePath(), "/remote/path/" + file.getName());
+            sftp.disconnect();
+            session.disconnect();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+}
+✅ Summary
+You now have:
+
+Multiple template support (templateType field in JSON)
+
+Offset-tracked stream that shuts down cleanly
+
+Final text file built line-by-line
+
+Optional idle timeout logic
+
+File pushed to TIBCO mailbox after stream ends
