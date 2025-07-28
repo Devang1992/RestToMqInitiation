@@ -1,0 +1,127 @@
+@ExtendWith(MockitoExtension.class)
+class NotificationProcessorTest {
+
+    @Mock KafkaHeaderProcessor headerProcessor;
+    @Mock NotificationsMapper notificationsMapper;
+    @Mock ObjectMapper objectMapper;
+    @Mock MessageDeserializer<JsonNode> deserializer;
+
+    NotificationProcessor processor;
+
+    @BeforeEach
+    void setup() {
+        processor = new NotificationProcessor(headerProcessor, notificationsMapper, objectMapper, deserializer);
+    }
+
+    @Test
+    void test_process_shouldContinue_and_successfullyForward() throws Exception {
+        // Arrange
+        String mid = "MID123";
+        String adviceCode = "MCC";
+        Record<String, JsonNode> record = mock(Record.class);
+        Headers headers = new RecordHeaders();
+
+        headers.add("MID", mid.getBytes());
+        headers.add("ADVICE_CODE", adviceCode.getBytes());
+
+        JsonNode valueNode = mock(JsonNode.class);
+        when(record.value()).thenReturn(valueNode);
+        when(record.headers()).thenReturn(headers);
+
+        HvpRequestTag hvp = new HvpRequestTag();
+        when(objectMapper.treeToValue(any(), eq(HvpRequestTag.class))).thenReturn(hvp);
+
+        CustomerInfo customerInfo = mock(CustomerInfo.class);
+        when(customerInfo.getAdviceCode()).thenReturn(adviceCode);
+        when(notificationsMapper.mapAdviceCode(hvp)).thenReturn(customerInfo);
+
+        JsonNode deserializedResult = mock(JsonNode.class);
+        when(deserializer.deserialize(any())).thenReturn(deserializedResult);
+
+        // Act
+        processor.process(record);
+
+        // Assert
+        verify(headerProcessor).addHvpHeaders(eq(headers), eq(adviceCode), eq(hvp));
+        verify(record).withKey(eq(mid));
+        verify(record).withValue(eq(deserializedResult));
+    }
+
+    @Test
+    void test_process_skipped_dueToAdviceCode() throws Exception {
+        Record<String, JsonNode> record = mock(Record.class);
+        Headers headers = new RecordHeaders();
+        headers.add("MID", "MID123".getBytes());
+
+        when(record.headers()).thenReturn(headers);
+        when(record.value()).thenReturn(mock(JsonNode.class));
+
+        HvpRequestTag hvp = new HvpRequestTag();
+        when(objectMapper.treeToValue(any(), eq(HvpRequestTag.class))).thenReturn(hvp);
+
+        CustomerInfo customerInfo = mock(CustomerInfo.class);
+        when(customerInfo.getAdviceCode()).thenReturn("INVALID");
+        when(notificationsMapper.mapAdviceCode(hvp)).thenReturn(customerInfo);
+
+        processor.process(record); // no exception
+
+        // Should not forward or deserialize
+        verify(deserializer, never()).deserialize(any());
+    }
+
+    @Test
+    void test_extractHvpRequestTag_throwsException() {
+        JsonNode node = mock(JsonNode.class);
+        when(objectMapper.treeToValue(any(), eq(HvpRequestTag.class)))
+            .thenThrow(new RuntimeException("fail"));
+
+        PantsException exception = assertThrows(
+            PantsException.class,
+            () -> processor.extractHvpRequestTag(node)
+        );
+
+        assertEquals(PantsErrorCode.DESERIALIZATION_ERROR, exception.getErrorCode());
+    }
+
+    @Test
+    void test_checkDuplicateError_throwsDuplicateException() {
+        Headers headers = new RecordHeaders();
+        headers.add("ERROR_CODE", PantsErrorCode.DUPLICATE_MID_ERROR.getErrorCode().getCode().getBytes());
+
+        PantsException exception = assertThrows(
+            PantsException.class,
+            () -> processor.checkDuplicateError(headers)
+        );
+
+        assertEquals(PantsErrorCode.DUPLICATE_MID_ERROR, exception.getErrorCode());
+    }
+
+    @Test
+    void test_handleException_wrapsNonPantsException() {
+        Record<String, JsonNode> record = mock(Record.class);
+        Exception someGenericEx = new RuntimeException("stream broke");
+
+        processor.handleException(record, someGenericEx);
+        // Check logs or inspect for side effects if needed
+    }
+
+    @Test
+    void test_handleException_directPantsException() {
+        Record<String, JsonNode> record = mock(Record.class);
+        PantsException expected = new PantsException(PantsErrorCode.STREAM_ERROR, "boom");
+
+        processor.handleException(record, expected);
+    }
+
+    @Test
+    void test_shouldContinueProcessing_trueCases() {
+        assertTrue(processor.shouldContinueProcessing("MCC"));
+        assertTrue(processor.shouldContinueProcessing("MCD"));
+        assertTrue(processor.shouldContinueProcessing("CSSWFTR"));
+    }
+
+    @Test
+    void test_shouldContinueProcessing_falseCase() {
+        assertFalse(processor.shouldContinueProcessing("XYZ"));
+    }
+}
