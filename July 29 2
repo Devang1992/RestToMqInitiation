@@ -1,0 +1,129 @@
+ Sample JSON Input (from Kafka)
+json
+Copy
+Edit
+{
+  "id": "U123",
+  "name": "Devang",
+  "email": "dev@example.com",
+  "transaction": {
+    "amount": 250.75,
+    "currency": "USD"
+  },
+  "meta": {
+    "source": {
+      "system": "FPL",
+      "version": "v2"
+    }
+  }
+}
+📝 Sample Template (from resources/templates/message_template_type1.txt)
+txt
+Copy
+Edit
+User ID: {{id}}
+Name: {{name}}
+Email: {{email}}
+
+Transaction:
+  Amount: {{transaction.amount}}
+  Currency: {{transaction.currency}}
+
+Source System: {{meta.source.system}}
+Source Version: {{meta.source.version}}
+⚙️ Java Code to Render This Using Handlebars
+🔧 Dependencies (in pom.xml)
+xml
+Copy
+Edit
+<dependency>
+  <groupId>com.github.jknack</groupId>
+  <artifactId>handlebars</artifactId>
+  <version>4.3.1</version>
+</dependency>
+
+<dependency>
+  <groupId>com.fasterxml.jackson.core</groupId>
+  <artifactId>jackson-databind</artifactId>
+</dependency>
+🚀 Java Class: TemplateRenderer
+java
+Copy
+Edit
+package com.example.batch.util;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.jknack.handlebars.Handlebars;
+import com.github.jknack.handlebars.Template;
+
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.Map;
+
+public class TemplateRenderer {
+
+    private static final ObjectMapper objectMapper = new ObjectMapper();
+    private static final Handlebars handlebars = new Handlebars();
+
+    public static String renderFromJson(String jsonPayload, String templatePath) throws Exception {
+        // 1. Read the template file
+        String templateContent = Files.readString(Paths.get(templatePath));
+
+        // 2. Convert JSON to Map (nested structure preserved)
+        Map<String, Object> model = objectMapper.readValue(jsonPayload, new TypeReference<>() {});
+
+        // 3. Compile and apply
+        Template template = handlebars.compileInline(templateContent);
+        return template.apply(model);
+    }
+}
+🧪 Test Usage
+java
+Copy
+Edit
+public class TestTemplate {
+    public static void main(String[] args) throws Exception {
+        String jsonPayload = """
+        {
+          "id": "U123",
+          "name": "Devang",
+          "email": "dev@example.com",
+          "transaction": {
+            "amount": 250.75,
+            "currency": "USD"
+          },
+          "meta": {
+            "source": {
+              "system": "FPL",
+              "version": "v2"
+            }
+          }
+        }
+        """;
+
+        String templatePath = "src/main/resources/templates/message_template_type1.txt";
+        String result = TemplateRenderer.renderFromJson(jsonPayload, templatePath);
+        System.out.println(result);
+    }
+}
+✅ Output (Text File Content)
+yaml
+Copy
+Edit
+User ID: U123
+Name: Devang
+Email: dev@example.com
+
+Transaction:
+  Amount: 250.75
+  Currency: USD
+
+Source System: FPL
+Source Version: v2
+🔁 Notes:
+You can dynamically pass the template path based on templateType field in the JSON.
+
+Nested objects like transaction.amount and meta.source.system work out of the box.
+
+You don’t need to write .replace() for each field — the Handlebars engine + Jackson handles the mapping.
