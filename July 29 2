@@ -87,8 +87,8 @@ public class TestTemplate {
         String jsonPayload = """
         {
           "id": "U123",
-          "name": "Devang",
-          "email": "dev@example.com",
+          "name": "d",
+          "email": "d@example.com",
           "transaction": {
             "amount": 250.75,
             "currency": "USD"
@@ -127,3 +127,54 @@ You can dynamically pass the template path based on templateType field in the JS
 Nested objects like transaction.amount and meta.source.system work out of the box.
 
 You don’t need to write .replace() for each field — the Handlebars engine + Jackson handles the mapping.
+
+Wrap the entire line in an {{#if ...}} block:
+
+🧾 Example Template (message_template_type1.txt)
+h
+Copy
+Edit
+User ID: {{id}}
+Name: {{name}}
+Email: {{email}}
+
+{{#if transaction.amount}}
+Amount: {{transaction.amount}}
+{{/if}}
+
+{{#if transaction.currency}}
+Currency: {{transaction.currency}}
+{{/if}}
+
+{{#if meta.source.system}}
+Source System: {{meta.source.system}}
+{{/if}}
+✅ What This Does:
+If transaction.amount exists and is non-null, it renders the line
+
+If it's missing or blank, it omits the whole line
+
+🧠 Note on Nested Nulls
+If transaction or meta.source is missing entirely, transaction.amount or meta.source.system won’t throw errors — Handlebars just treats them as falsy and skips.
+
+✅ Bonus: Optional or / fallback logic
+You can use a custom helper if you want more control (e.g. fallback fields), but for your use case, the simple #if block is the best and cleanest way.
+
+✨ Final Output Example
+If this JSON comes in:
+json
+Copy
+Edit
+{
+  "id": "U001",
+  "name": "Alice",
+  "email": "alice@example.com",
+  "transaction": {}
+}
+Output will be:
+yaml
+Copy
+Edit
+User ID: U001
+Name: Alice
+Email: alice@example.com
