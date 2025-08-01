@@ -58,3 +58,105 @@ public class BatchFileGenerator {
         return String.format("%-" + length + "s", input);
     }
 }
+
+
+--------------------------------------------------------------------------------
+
+package com.example.batch;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.List;
+
+@Component
+@RequiredArgsConstructor
+public class BatchFileGenerator {
+
+    private static final int MAX_LINES_PER_PAGE = 65;
+    private static final int CONTENT_START_LINE_FIRST_PAGE = 27;
+    private static final int ADDRESS_LINE_FIRST_PAGE = 17;
+    private static final int CONTENT_START_LINE_NEXT_PAGES = 13;
+    private static final int ADDRESS_LINE_NEXT_PAGES = 8;
+    private static final int PAGE_NUMBER_LINE = 65;
+    private static final int LINE_LENGTH = 134;
+
+    public void generateFile(List<String> renderedMessages, Path outputPath) {
+        int docCounter = 1;
+        List<String> finalOutput = new ArrayList<>();
+
+        for (String message : renderedMessages) {
+            String[] lines = message.split("\r?\n");
+            List<String> contentLines = new ArrayList<>();
+            List<String> addressBlock = new ArrayList<>();
+            boolean addressEndReached = false;
+
+            for (String line : lines) {
+                if (!addressEndReached && line.contains("customer.zip")) {
+                    addressEndReached = true;
+                    addressBlock.add(line);
+                } else if (!addressEndReached) {
+                    addressBlock.add(line);
+                } else {
+                    contentLines.add(line);
+                }
+            }
+
+            int totalLines = contentLines.size();
+            int page = 1;
+            for (int i = 0; i < totalLines; i += (MAX_LINES_PER_PAGE - CONTENT_START_LINE_FIRST_PAGE)) {
+                List<String> pageLines = new ArrayList<>();
+
+                pageLines.add(pad("1", LINE_LENGTH));
+                if (page == 1) {
+                    pageLines.add(pad("##", LINE_LENGTH));
+                    fillLines(pageLines, 2, ADDRESS_LINE_FIRST_PAGE);
+                    pageLines.set(ADDRESS_LINE_FIRST_PAGE - 1, padLines(addressBlock));
+                    fillLines(pageLines, ADDRESS_LINE_FIRST_PAGE + 1, CONTENT_START_LINE_FIRST_PAGE);
+                } else {
+                    fillLines(pageLines, 2, ADDRESS_LINE_NEXT_PAGES);
+                    pageLines.set(ADDRESS_LINE_NEXT_PAGES - 1, padLines(addressBlock));
+                    fillLines(pageLines, ADDRESS_LINE_NEXT_PAGES + 1, CONTENT_START_LINE_NEXT_PAGES);
+                }
+
+                int start = i;
+                int end = Math.min(i + (MAX_LINES_PER_PAGE - CONTENT_START_LINE_FIRST_PAGE), totalLines);
+                for (int j = start; j < end; j++) {
+                    pageLines.add(pad(contentLines.get(j), LINE_LENGTH));
+                }
+
+                fillLines(pageLines, pageLines.size() + 1, PAGE_NUMBER_LINE);
+                pageLines.set(PAGE_NUMBER_LINE - 1, pad("Page " + String.format("%02d", page), LINE_LENGTH));
+
+                finalOutput.addAll(pageLines);
+                page++;
+            }
+            docCounter++;
+        }
+
+        try {
+            Files.write(outputPath, String.join("\r\n", finalOutput).getBytes(), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        } catch (Exception e) {
+            throw new RuntimeException("Error writing batch file", e);
+        }
+    }
+
+    private String pad(String line, int length) {
+        return String.format("%-" + length + "s", line);
+    }
+
+    private void fillLines(List<String> list, int fromInclusive, int toExclusive) {
+        for (int i = fromInclusive; i < toExclusive; i++) {
+            list.add(pad("", LINE_LENGTH));
+        }
+    }
+
+    private String padLines(List<String> lines) {
+        return pad(String.join(" ", lines), LINE_LENGTH);
+    }
+}
+
