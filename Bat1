@@ -1,0 +1,60 @@
+public class BatchFileGenerator {
+
+    private static final int LINE_LENGTH = 134;
+    private static final int MAX_LINES_PER_PAGE = 65;
+
+    public void generateFile(List<String> renderedTemplates, Path outputPath) throws IOException {
+        List<String> finalLines = new ArrayList<>();
+        int pageCounter = 1;
+
+        for (String rendered : renderedTemplates) {
+            List<String> lines = formatPage(rendered, pageCounter);
+            finalLines.addAll(lines);
+            pageCounter++;
+        }
+
+        try (BufferedWriter writer = Files.newBufferedWriter(outputPath, StandardCharsets.UTF_8)) {
+            writer.write("*DJDE* JDE=WIRES, END;\r\n"); // First line
+            for (String line : finalLines) {
+                writer.write(line);
+                writer.write("\r\n"); // carriage return + newline
+            }
+        }
+    }
+
+    private List<String> formatPage(String content, int pageNumber) {
+        List<String> pageLines = new ArrayList<>();
+        pageLines.add(padToLength("1", LINE_LENGTH)); // Line 1
+        pageLines.add(padToLength(" ##", LINE_LENGTH)); // Line 2
+
+        List<String> contentLines = splitContentIntoLines(content);
+
+        // Fill lines with padding or content
+        int contentStartLine = (pageNumber == 1) ? 27 : 13;
+        while (pageLines.size() < contentStartLine - 1)
+            pageLines.add(padToLength("", LINE_LENGTH));
+
+        for (String cl : contentLines) {
+            if (pageLines.size() >= 62) break;
+            pageLines.add(padToLength(cl, LINE_LENGTH));
+        }
+
+        while (pageLines.size() < 64) // Fill till line 64 (before Page XX)
+            pageLines.add(padToLength("", LINE_LENGTH));
+
+        pageLines.add(padToLength(" Page " + String.format("%02d", pageNumber), LINE_LENGTH)); // Line 65
+
+        return pageLines;
+    }
+
+    private List<String> splitContentIntoLines(String content) {
+        return Arrays.stream(content.split("\n"))
+                     .map(line -> line.replaceAll("\r", "").trim())
+                     .collect(Collectors.toList());
+    }
+
+    private String padToLength(String input, int length) {
+        if (input.length() >= length) return input.substring(0, length);
+        return String.format("%-" + length + "s", input);
+    }
+}
