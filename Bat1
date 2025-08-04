@@ -1,162 +1,74 @@
-public class BatchFileGenerator {
-
-    private static final int LINE_LENGTH = 134;
-    private static final int MAX_LINES_PER_PAGE = 65;
-
-    public void generateFile(List<String> renderedTemplates, Path outputPath) throws IOException {
-        List<String> finalLines = new ArrayList<>();
-        int pageCounter = 1;
-
-        for (String rendered : renderedTemplates) {
-            List<String> lines = formatPage(rendered, pageCounter);
-            finalLines.addAll(lines);
-            pageCounter++;
-        }
-
-        try (BufferedWriter writer = Files.newBufferedWriter(outputPath, StandardCharsets.UTF_8)) {
-            writer.write("*DJDE* JDE=WIRES, END;\r\n"); // First line
-            for (String line : finalLines) {
-                writer.write(line);
-                writer.write("\r\n"); // carriage return + newline
-            }
-        }
-    }
-
-    private List<String> formatPage(String content, int pageNumber) {
-        List<String> pageLines = new ArrayList<>();
-        pageLines.add(padToLength("1", LINE_LENGTH)); // Line 1
-        pageLines.add(padToLength(" ##", LINE_LENGTH)); // Line 2
-
-        List<String> contentLines = splitContentIntoLines(content);
-
-        // Fill lines with padding or content
-        int contentStartLine = (pageNumber == 1) ? 27 : 13;
-        while (pageLines.size() < contentStartLine - 1)
-            pageLines.add(padToLength("", LINE_LENGTH));
-
-        for (String cl : contentLines) {
-            if (pageLines.size() >= 62) break;
-            pageLines.add(padToLength(cl, LINE_LENGTH));
-        }
-
-        while (pageLines.size() < 64) // Fill till line 64 (before Page XX)
-            pageLines.add(padToLength("", LINE_LENGTH));
-
-        pageLines.add(padToLength(" Page " + String.format("%02d", pageNumber), LINE_LENGTH)); // Line 65
-
-        return pageLines;
-    }
-
-    private List<String> splitContentIntoLines(String content) {
-        return Arrays.stream(content.split("\n"))
-                     .map(line -> line.replaceAll("\r", "").trim())
-                     .collect(Collectors.toList());
-    }
-
-    private String padToLength(String input, int length) {
-        if (input.length() >= length) return input.substring(0, length);
-        return String.format("%-" + length + "s", input);
-    }
-}
-
-
---------------------------------------------------------------------------------
-
-package com.example.batch;
-
-import lombok.RequiredArgsConstructor;
-import org.springframework.stereotype.Component;
-
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 
-@Component
-@RequiredArgsConstructor
 public class BatchFileGenerator {
-
-    private static final int MAX_LINES_PER_PAGE = 65;
-    private static final int CONTENT_START_LINE_FIRST_PAGE = 27;
-    private static final int ADDRESS_LINE_FIRST_PAGE = 17;
-    private static final int CONTENT_START_LINE_NEXT_PAGES = 13;
-    private static final int ADDRESS_LINE_NEXT_PAGES = 8;
-    private static final int PAGE_NUMBER_LINE = 65;
+    private static final int PAGE_LINES = 65;
     private static final int LINE_LENGTH = 134;
+    private static final int PAGE_NUMBER_LINE = 65;
 
     public void generateFile(List<String> renderedMessages, Path outputPath) {
-        int docCounter = 1;
         List<String> finalOutput = new ArrayList<>();
 
-        for (String message : renderedMessages) {
-            String[] lines = message.split("\r?\n");
-            List<String> contentLines = new ArrayList<>();
-            List<String> addressBlock = new ArrayList<>();
-            boolean addressEndReached = false;
+        for (String renderedMessage : renderedMessages) {
+            List<String> lines = splitLines(renderedMessage);
 
-            for (String line : lines) {
-                if (!addressEndReached && line.contains("customer.zip")) {
-                    addressEndReached = true;
-                    addressBlock.add(line);
-                } else if (!addressEndReached) {
-                    addressBlock.add(line);
-                } else {
-                    contentLines.add(line);
-                }
-            }
+            // Split into pages of 65 lines max
+            int totalPages = (int) Math.ceil((double) lines.size() / PAGE_LINES);
 
-            int totalLines = contentLines.size();
-            int page = 1;
-            for (int i = 0; i < totalLines; i += (MAX_LINES_PER_PAGE - CONTENT_START_LINE_FIRST_PAGE)) {
+            for (int page = 1; page <= totalPages; page++) {
                 List<String> pageLines = new ArrayList<>();
 
-                pageLines.add(pad("1", LINE_LENGTH));
+                pageLines.add(pad("1", LINE_LENGTH)); // Line 1 = '1'
+
                 if (page == 1) {
-                    pageLines.add(pad("##", LINE_LENGTH));
-                    fillLines(pageLines, 2, ADDRESS_LINE_FIRST_PAGE);
-                    pageLines.set(ADDRESS_LINE_FIRST_PAGE - 1, padLines(addressBlock));
-                    fillLines(pageLines, ADDRESS_LINE_FIRST_PAGE + 1, CONTENT_START_LINE_FIRST_PAGE);
+                    pageLines.add(pad("##", LINE_LENGTH)); // Line 2 = '##' only on first page
                 } else {
-                    fillLines(pageLines, 2, ADDRESS_LINE_NEXT_PAGES);
-                    pageLines.set(ADDRESS_LINE_NEXT_PAGES - 1, padLines(addressBlock));
-                    fillLines(pageLines, ADDRESS_LINE_NEXT_PAGES + 1, CONTENT_START_LINE_NEXT_PAGES);
+                    pageLines.add(pad("", LINE_LENGTH)); // empty for other pages
                 }
 
-                int start = i;
-                int end = Math.min(i + (MAX_LINES_PER_PAGE - CONTENT_START_LINE_FIRST_PAGE), totalLines);
-                for (int j = start; j < end; j++) {
-                    pageLines.add(pad(contentLines.get(j), LINE_LENGTH));
+                int start = (page - 1) * (PAGE_LINES - 2); // -2 for header lines
+                int end = Math.min(start + (PAGE_LINES - 2), lines.size());
+                List<String> contentSlice = lines.subList(start, end);
+                for (String contentLine : contentSlice) {
+                    pageLines.add(pad(contentLine, LINE_LENGTH));
                 }
 
-                fillLines(pageLines, pageLines.size() + 1, PAGE_NUMBER_LINE);
-                pageLines.set(PAGE_NUMBER_LINE - 1, pad("Page " + String.format("%02d", page), LINE_LENGTH));
+                // Pad remaining lines if needed
+                while (pageLines.size() < PAGE_NUMBER_LINE - 1) {
+                    pageLines.add(pad("", LINE_LENGTH));
+                }
 
+                // Add Page XX at the end
+                pageLines.add(pad("Page " + String.format("%02d", page), LINE_LENGTH));
+
+                // Add to final output
                 finalOutput.addAll(pageLines);
-                page++;
             }
-            docCounter++;
         }
 
         try {
-            Files.write(outputPath, String.join("\r\n", finalOutput).getBytes(), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-        } catch (Exception e) {
+            Files.write(outputPath, String.join("\r\n", finalOutput).getBytes(),
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            System.out.println("File written to: " + outputPath.toAbsolutePath());
+        } catch (IOException e) {
             throw new RuntimeException("Error writing batch file", e);
         }
+    }
+
+    private List<String> splitLines(String content) {
+        String[] rawLines = content.split("\r?\n");
+        List<String> paddedLines = new ArrayList<>();
+        for (String line : rawLines) {
+            paddedLines.add(pad(line, LINE_LENGTH));
+        }
+        return paddedLines;
     }
 
     private String pad(String line, int length) {
         return String.format("%-" + length + "s", line);
     }
-
-    private void fillLines(List<String> list, int fromInclusive, int toExclusive) {
-        for (int i = fromInclusive; i < toExclusive; i++) {
-            list.add(pad("", LINE_LENGTH));
-        }
-    }
-
-    private String padLines(List<String> lines) {
-        return pad(String.join(" ", lines), LINE_LENGTH);
-    }
 }
-
