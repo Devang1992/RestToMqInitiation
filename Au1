@@ -1,0 +1,234 @@
+To use KafkaItemReader in a Spring Batch job to read from a Kafka topic, follow the steps below. This is perfect for one-time batch jobs that consume records from Kafka and process them (e.g., write to a file, DB, etc.).
+
+✅ Dependencies
+Make sure your pom.xml includes:
+
+xml
+Copy code
+<dependency>
+    <groupId>org.springframework.batch</groupId>
+    <artifactId>spring-batch-core</artifactId>
+</dependency>
+
+<dependency>
+    <groupId>org.springframework.kafka</groupId>
+    <artifactId>spring-kafka</artifactId>
+</dependency>
+
+<dependency>
+    <groupId>org.springframework.batch</groupId>
+    <artifactId>spring-batch-kafka</artifactId>
+    <version>4.3.8</version> <!-- or latest compatible -->
+</dependency>
+⚙️ Configuration Overview
+KafkaItemReader reads records from a Kafka topic.
+
+Batch Step uses this reader.
+
+The job starts the step and reads all records from the topic.
+
+You can set offsets and stop criteria.
+
+🛠️ Step-by-Step Implementation
+1. 🧾 Kafka Consumer Config
+java
+Copy code
+@Bean
+public Map<String, Object> consumerConfigs() {
+    Map<String, Object> props = new HashMap<>();
+    props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+    props.put(ConsumerConfig.GROUP_ID_CONFIG, "batch-consumer-group");
+    props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+    props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+    props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+    props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false); // Required for manual commit
+    return props;
+}
+
+@Bean
+public ConsumerFactory<String, String> consumerFactory() {
+    return new DefaultKafkaConsumerFactory<>(consumerConfigs());
+}
+2. 📘 KafkaItemReader Bean
+java
+Copy code
+@Bean
+public KafkaItemReader<String, String> kafkaItemReader() {
+    KafkaItemReader<String, String> reader = new KafkaItemReaderBuilder<String, String>()
+            .partitions(0) // specify partitions, optional
+            .consumerFactory(consumerFactory())
+            .name("kafka-item-reader")
+            .saveState(false) // Set true if you want stateful resume
+            .topic("your-kafka-topic")
+            .build();
+    return reader;
+}
+3. 💡 Processor (Optional)
+java
+Copy code
+@Bean
+public ItemProcessor<String, String> itemProcessor() {
+    return item -> {
+        // transform or log
+        return item.toUpperCase();
+    };
+}
+4. 📤 Writer
+java
+Copy code
+@Bean
+public ItemWriter<String> itemWriter() {
+    return items -> {
+        for (String item : items) {
+            System.out.println("Writing: " + item);
+        }
+    };
+}
+5. 📦 Step and Job Configuration
+java
+Copy code
+@Bean
+public Step kafkaReaderStep(StepBuilderFactory stepBuilderFactory) {
+    return stepBuilderFactory.get("kafka-reader-step")
+            .<String, String>chunk(10)
+            .reader(kafkaItemReader())
+            .processor(itemProcessor())
+            .writer(itemWriter())
+            .build();
+}
+
+@Bean
+public Job kafkaBatchJob(JobBuilderFactory jobBuilderFactory, Step kafkaReaderStep) {
+    return jobBuilderFactory.get("kafka-batch-job")
+            .start(kafkaReaderStep)
+            .build();
+}
+✅ To Run the Job
+You can trigger it via:
+
+Command line argument (via JobLauncher)
+
+REST endpoint
+
+Scheduler
+
+Example via controller:
+
+java
+Copy code
+@Autowired
+JobLauncher jobLauncher;
+
+@Autowired
+Job kafkaBatchJob;
+
+@GetMapping("/run-kafka-job")
+public ResponseEntity<String> runJob() throws Exception {
+    JobParameters jobParameters = new JobParametersBuilder()
+            .addLong("startAt", System.currentTimeMillis())
+            .toJobParameters();
+    jobLauncher.run(kafkaBatchJob, jobParameters);
+    return ResponseEntity.ok("Batch Job Started");
+}
+🧠 Notes
+KafkaItemReader is not reactive — it reads messages until the topic has no more records to consume.
+
+It doesn't commit offsets by default unless you manage it.
+
+To stop after a fixed number of messages or after a time delay, you must add custom logic.
+
+You can seek from specific offsets by customizing the underlying KafkaConsumer.
+
+Would you like an example where:
+
+You read messages from offset X to Y?
+
+Or you collect and write to a file?
+Let me know your use case and I can tailor it.
+
+
+
+
+
+
+
+You said:
+It doesn't commit offsets by default unless you manage it.
+does that mean if you want to read from new messages only next time, will it not work?
+
+
+ChatGPT said:
+Great question.
+
+By default, the KafkaItemReader does not commit offsets automatically, because it's designed for Spring Batch, which typically expects full control over execution state (like restartability, idempotency, etc.).
+
+🔁 So What Happens Without Offset Commit?
+If saveState(false) is set (which is the default in many examples), no offset is saved or committed.
+
+When the job runs again, it will start reading from the beginning (based on the auto.offset.reset policy – usually "earliest").
+
+That means you'll re-read old messages unless you manually commit offsets or enable state tracking.
+
+✅ If You Want to Read Only New Messages Next Time
+You have two options:
+
+✅ Option 1: Enable State Saving and Use Job Repository
+java
+Copy code
+KafkaItemReader<String, String> reader = new KafkaItemReaderBuilder<String, String>()
+    .consumerFactory(consumerFactory())
+    .name("kafka-reader") // IMPORTANT: Name required for state persistence
+    .saveState(true)       // Enables offset tracking
+    .topic("your-topic")
+    .build();
+With this setup:
+
+Spring Batch will persist offsets in the job execution context.
+
+On the next run, the reader will resume from the last committed offset.
+
+Useful for long-running jobs and restart support.
+
+🔔 Important: You must have a proper JobRepository configured for saveState(true) to work!
+
+✅ Option 2: Manually Commit Offsets (Advanced / DIY)
+If you want more control (e.g., for reading from offset X to Y, or committing only if processing is successful), you'd use a custom KafkaConsumer instead of KafkaItemReader and do:
+
+java
+Copy code
+consumer.commitSync(); // after processing
+But this is more complex and bypasses the Spring Batch abstraction.
+
+🔁 Summary
+Feature	saveState = false	saveState = true
+Commits offset?	❌ No	✅ Yes (via Spring Batch context)
+Resumes where left off?	❌ No (re-reads from earliest/latest)	✅ Yes
+Best for	One-off batch or test jobs	Production jobs with retry/resume
+Needs JobRepository configured	❌ Not required	✅ Required
+
+✅ Recommendation for You
+If you're doing a daily or periodic Kafka batch job and want to process only new messages, use:
+
+java
+Copy code
+.saveState(true)
+.name("kafka-reader-job") // Unique name required
+And ensure you have JobRepository properly set up (which Spring Boot does for you automatically in most cases).
+
+Let me know if you want to add:
+
+Custom start offset?
+
+Filter by headers?
+
+Or resume logic across partitions?
+
+I can help tailor that setup.
+
+
+
+
+
+
+
+
