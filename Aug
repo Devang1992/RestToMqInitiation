@@ -1,0 +1,287 @@
+Perfect. Here's how we can structure a clean and Spring Boot-friendly "Job-like" Kafka Streams Executor, mimicking a Spring Batch style — without using Spring Batch.
+
+🧱 Structure Overview
+text
+Copy code
+📦 com.yourapp.kafka.batchjob
+├── KafkaBatchJobRunner.java         <-- Main job runner logic (start + wait + stop)
+├── KafkaStreamLifecycleManager.java <-- KafkaStreams holder and lifecycle controller
+├── JobStatusTracker.java            <-- (Optional) Status holder (RUNNING, COMPLETED, FAILED)
+✅ 1. KafkaStreamLifecycleManager.java
+A wrapper to hold and manage Kafka Streams lifecycle.
+
+java
+Copy code
+@Component
+public class KafkaStreamLifecycleManager {
+
+    private KafkaStreams kafkaStreams;
+
+    public void setKafkaStreams(KafkaStreams streams) {
+        this.kafkaStreams = streams;
+    }
+
+    public void start() {
+        if (kafkaStreams != null) {
+            kafkaStreams.start();
+        }
+    }
+
+    public void stop() {
+        if (kafkaStreams != null) {
+            kafkaStreams.close(Duration.ofSeconds(5));
+        }
+    }
+
+    public KafkaStreams.State getState() {
+        return kafkaStreams != null ? kafkaStreams.state() : null;
+    }
+}
+✅ 2. KafkaBatchJobRunner.java
+This is your controller-triggered runner, which:
+
+Builds the topology
+
+Assigns it to the manager
+
+Starts the stream
+
+Waits for all messages
+
+Shuts down
+
+java
+Copy code
+@Component
+public class KafkaBatchJobRunner {
+
+    private final KafkaStreamLifecycleManager lifecycleManager;
+    private final StreamsBuilderFactoryBean factoryBean;
+    private final KafkaProperties kafkaProperties;
+
+    public KafkaBatchJobRunner(KafkaStreamLifecycleManager lifecycleManager,
+                               StreamsBuilderFactoryBean factoryBean,
+                               KafkaProperties kafkaProperties) {
+        this.lifecycleManager = lifecycleManager;
+        this.factoryBean = factoryBean;
+        this.kafkaProperties = kafkaProperties;
+    }
+
+    public void runKafkaJob() {
+        try {
+            StreamsBuilder builder = new StreamsBuilder();
+
+            // Your Kafka Streams topology logic here
+            KStream<String, String> stream = builder.stream("your-topic");
+            stream.foreach((key, value) -> {
+                // Your processing logic
+                System.out.println("Processing: " + key + " -> " + value);
+            });
+
+            Properties props = new Properties();
+            props.putAll(kafkaProperties.buildStreamsProperties());
+            props.put(StreamsConfig.APPLICATION_ID_CONFIG, "your-batch-job-" + UUID.randomUUID());
+            props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+            props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+
+            KafkaStreams streams = new KafkaStreams(builder.build(), props);
+
+            lifecycleManager.setKafkaStreams(streams);
+            lifecycleManager.start();
+
+            // Optional: Wait until processing finishes (e.g., based on custom offset logic)
+            // You may use CountDownLatch, endOffset logic, or sleep-and-check pattern here
+            Thread.sleep(15_000); // Example placeholder
+
+            lifecycleManager.stop();
+
+        } catch (Exception e) {
+            lifecycleManager.stop();
+            throw new RuntimeException("Kafka batch job failed", e);
+        }
+    }
+}
+✅ 3. Your REST Controller
+java
+Copy code
+@RestController
+@RequestMapping("/kafka-job")
+public class KafkaJobController {
+
+    private final KafkaBatchJobRunner jobRunner;
+
+    public KafkaJobController(KafkaBatchJobRunner jobRunner) {
+        this.jobRunner = jobRunner;
+    }
+
+    @GetMapping("/run")
+    public ResponseEntity<String> runKafkaBatch() {
+        try {
+            jobRunner.runKafkaJob();
+            return ResponseEntity.ok("Kafka batch job completed.");
+        } catch (Exception ex) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                                 .body("Job failed: " + ex.getMessage());
+        }
+    }
+}
+🧠 Extra Ideas
+Feature	Description
+🕒 Add timeout logic	Instead of Thread.sleep(...), build a CountDownLatch or track offsets to stop stream once processing is done
+📈 Track job status	Add a JobStatusTracker bean (Map<UUID, Status>) so frontend can poll status
+🔁 Add repeatable jobs	Pass parameters (e.g., topic name, filter key) in controller request
+
+✅ Result:
+Now your controller-based KafkaStreams run behaves like a one-off batch job and doesn’t need to be always running.
+
+Want help with the offset-tracking + latch-based shutdown for more precise stream stopping?
+
+
+
+
+
+
+
+You said:
+Sure
+
+
+ChatGPT said:
+Awesome — let’s now implement precise stream shutdown using offset tracking + CountDownLatch, so your job stops automatically when:
+
+✅ All messages up to a known end offset have been processed
+
+💡 Goal:
+Fetch current end offset for the topic/partition at stream startup
+
+Track last processed offset during processing
+
+When processed offset equals end offset → trigger latch.countDown()
+
+Main thread waits on the latch and gracefully shuts down the stream
+
+✅ Step-by-Step
+1. Add End Offset Resolver
+We'll use a plain Kafka consumer to fetch end offsets before starting the stream:
+
+java
+Copy code
+@Component
+public class EndOffsetResolver {
+
+    private final KafkaProperties kafkaProperties;
+
+    public EndOffsetResolver(KafkaProperties kafkaProperties) {
+        this.kafkaProperties = kafkaProperties;
+    }
+
+    public Map<TopicPartition, Long> getEndOffsets(String topicName) {
+        Properties props = new Properties();
+        props.putAll(kafkaProperties.buildConsumerProperties("offset-fetcher"));
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props, new StringDeserializer(), new StringDeserializer())) {
+            List<PartitionInfo> partitions = consumer.partitionsFor(topicName);
+            List<TopicPartition> topicPartitions = partitions.stream()
+                .map(p -> new TopicPartition(topicName, p.partition()))
+                .collect(Collectors.toList());
+
+            consumer.assign(topicPartitions);
+            consumer.seekToEnd(topicPartitions);
+
+            Map<TopicPartition, Long> endOffsets = new HashMap<>();
+            for (TopicPartition tp : topicPartitions) {
+                endOffsets.put(tp, consumer.position(tp));
+            }
+            return endOffsets;
+        }
+    }
+}
+2. In KafkaBatchJobRunner, set up Latch + Offset Tracker
+Here’s a trimmed version of the updated runKafkaJob():
+
+java
+Copy code
+public void runKafkaJob() {
+    String topic = "your-topic";
+    Map<TopicPartition, Long> endOffsets = endOffsetResolver.getEndOffsets(topic);
+    CountDownLatch latch = new CountDownLatch(1);
+
+    StreamsBuilder builder = new StreamsBuilder();
+    KStream<String, String> stream = builder.stream(topic);
+
+    Map<Integer, Long> latestOffsets = new ConcurrentHashMap<>();
+
+    stream.foreach((key, value) -> {
+        // Get partition and offset (assumes key != null)
+        int partition = -1; long offset = -1;
+
+        if (value instanceof String && key != null) {
+            ProcessorContext context = InternalContextAccessor.getContext();
+            if (context != null) {
+                partition = context.partition();
+                offset = context.offset();
+            }
+        }
+
+        latestOffsets.put(partition, offset);
+        System.out.println("Processed: " + key + ", offset: " + offset);
+
+        // Check if all partitions reached end offset
+        boolean allReached = endOffsets.entrySet().stream()
+            .allMatch(entry ->
+                latestOffsets.getOrDefault(entry.getKey().partition(), -1L) >= entry.getValue() - 1
+            );
+
+        if (allReached) {
+            latch.countDown();
+        }
+    });
+
+    KafkaStreams streams = new KafkaStreams(builder.build(), buildStreamProps());
+    lifecycleManager.setKafkaStreams(streams);
+    lifecycleManager.start();
+
+    try {
+        latch.await(); // Wait until all end offsets reached
+        System.out.println("All messages processed. Closing stream...");
+        lifecycleManager.stop();
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+    }
+}
+🔧 InternalContextAccessor is a utility to expose ProcessorContext. You may need a Transformer or peek with context() to get metadata like partition/offset if needed.
+
+3. Optionally: Use transform instead of foreach to get full metadata
+java
+Copy code
+stream.transform(() -> new Transformer<String, String, KeyValue<String, String>>() {
+    private ProcessorContext context;
+
+    @Override
+    public void init(ProcessorContext context) {
+        this.context = context;
+    }
+
+    @Override
+    public KeyValue<String, String> transform(String key, String value) {
+        int partition = context.partition();
+        long offset = context.offset();
+
+        latestOffsets.put(partition, offset);
+        // Check latch condition...
+
+        return null;
+    }
+
+    @Override
+    public void close() { }
+});
+🧠 Summary
+Component	Purpose
+EndOffsetResolver	Get latest offsets for all partitions before starting job
+CountDownLatch	Block main thread until processing completes
+offset tracking map	Track latest processed offsets by partition
+KafkaStreamLifecycleManager	Start/stop control from main thread
+
+Would you like me to bundle all this into a ready-to-use package or GitHub project structure?
