@@ -86,3 +86,139 @@ public class BatchController {
         }
     }
 }
+
+----------------------------------------
+
+application.yml
+yaml
+Copy
+Edit
+app:
+  kafka:
+    topic: my-topic
+    group-id: batch-consumer-group
+
+spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      properties:
+        spring.json.trusted.packages: "*"
+
+  batch:
+    job:
+      enabled: false
+✅ 2. MyEvent POJO (Value)
+java
+Copy
+Edit
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class MyEvent {
+    private String id;
+    private String name;
+    private String timestamp;
+}
+✅ 3. Kafka Properties Config Class
+java
+Copy
+Edit
+@Component
+@ConfigurationProperties(prefix = "app.kafka")
+@Data
+public class KafkaBatchProperties {
+    private String topic;
+    private String groupId;
+}
+✅ 4. KafkaItemReader Config (Deserialize JSON → POJO)
+java
+Copy
+Edit
+@Configuration
+public class KafkaBatchReaderConfig {
+
+    @Autowired
+    private KafkaBatchProperties props;
+
+    @Autowired
+    private KafkaProperties kafkaProperties;
+
+    @Bean
+    public KafkaItemReader<String, MyEvent> kafkaItemReader() {
+        Map<String, Object> consumerProps = kafkaProperties.buildConsumerProperties(props.getGroupId());
+        consumerProps.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        consumerProps.put(JsonDeserializer.TRUSTED_PACKAGES, "*");
+
+        return new KafkaItemReaderBuilder<String, MyEvent>()
+                .name("kafka-item-reader")
+                .topic(props.getTopic())
+                .partitions(0) // You can extend to multiple partitions
+                .consumerProperties(consumerProps)
+                .keyDeserializer(new StringDeserializer())
+                .valueDeserializer(new JsonDeserializer<>(MyEvent.class, false))
+                .build();
+    }
+}
+✅ 5. Spring Batch Job Config
+java
+Copy
+Edit
+@Configuration
+public class KafkaBatchJobConfig {
+
+    @Bean
+    public Step kafkaStep(StepBuilderFactory stepBuilderFactory,
+                          KafkaItemReader<String, MyEvent> reader) {
+        return stepBuilderFactory.get("kafkaStep")
+                .<MyEvent, MyEvent>chunk(5)
+                .reader(reader)
+                .writer(items -> {
+                    for (MyEvent event : items) {
+                        System.out.println("Processed event: " + event);
+                    }
+                })
+                .build();
+    }
+
+    @Bean
+    public Job kafkaBatchJob(JobBuilderFactory jobBuilderFactory, Step kafkaStep) {
+        return jobBuilderFactory.get("kafkaBatchJob")
+                .start(kafkaStep)
+                .build();
+    }
+}
+✅ 6. Trigger Job from Controller
+java
+Copy
+Edit
+@RestController
+@RequestMapping("/batch")
+public class KafkaBatchJobController {
+
+    private final JobLauncher jobLauncher;
+    private final Job kafkaBatchJob;
+
+    public KafkaBatchJobController(JobLauncher jobLauncher, @Qualifier("kafkaBatchJob") Job kafkaBatchJob) {
+        this.jobLauncher = jobLauncher;
+        this.kafkaBatchJob = kafkaBatchJob;
+    }
+
+    @GetMapping("/run")
+    public ResponseEntity<String> runJob() {
+        try {
+            JobParameters jobParameters = new JobParametersBuilder()
+                    .addLong("time", System.currentTimeMillis())
+                    .toJobParameters();
+
+            jobLauncher.run(kafkaBatchJob, jobParameters);
+            return ResponseEntity.ok("Batch job triggered.");
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body("Batch job failed: " + e.getMessage());
+        }
+    }
+}
+✅ Summary
