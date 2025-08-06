@@ -1,0 +1,181 @@
+// === application.yml ===
+
+app:
+  kafka:
+    topic: wires-topic
+    group-id: batch-consumer-group
+  output:
+    environment: dev
+    file-name-format:
+      dev: "WIRES_.%s.TST"
+      prod: "WIRES_PROD.%s.OUT"
+    date-pattern: "yyMMdd"
+
+spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      enable-auto-commit: false
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      properties:
+        spring.json.trusted.packages: "*"
+
+
+// === KafkaBatchProperties.java ===
+
+@ConfigurationProperties(prefix = "app")
+@Component
+@Data
+public class KafkaBatchProperties {
+    private Kafka kafka;
+    private Output output;
+
+    @Data
+    public static class Kafka {
+        private String topic;
+        private String groupId;
+    }
+
+    @Data
+    public static class Output {
+        private String environment;
+        private Map<String, String> fileNameFormat;
+        private String datePattern;
+    }
+}
+
+
+// === KafkaConsumerConfig.java ===
+
+@Configuration
+public class KafkaConsumerConfig {
+
+    @Bean
+    public KafkaConsumer<String, JsonNode> kafkaConsumer(KafkaProperties kafkaProperties,
+                                                         KafkaBatchProperties batchProps) {
+        Map<String, Object> props = kafkaProperties.buildConsumerProperties(batchProps.getKafka().getGroupId(), null);
+        props.put(JsonDeserializer.TRUSTED_PACKAGES, "*");
+
+        return new KafkaConsumer<>(props,
+                new StringDeserializer(),
+                new JsonDeserializer<>(JsonNode.class));
+    }
+}
+
+
+// === TemplateMapper.java ===
+
+@Component
+public class TemplateMapper {
+    private final Handlebars handlebars = new Handlebars();
+    private final Map<String, Template> templateCache = new ConcurrentHashMap<>();
+
+    public String render(String templateId, JsonNode data) throws IOException {
+        Template template = templateCache.computeIfAbsent(templateId, id -> {
+            try {
+                Path path = Paths.get("src/main/resources/templates/" + id + ".hbs");
+                return handlebars.compileInline(Files.readString(path));
+            } catch (IOException e) {
+                throw new RuntimeException("Template not found: " + id, e);
+            }
+        });
+        return template.apply(data);
+    }
+}
+
+
+// === BatchKafkaConsumerService.java ===
+
+@Service
+public class BatchKafkaConsumerService {
+
+    private final KafkaConsumer<String, JsonNode> consumer;
+    private final KafkaBatchProperties props;
+    private final TemplateMapper templateMapper;
+
+    @Value("${app.output.date-pattern}")
+    private String datePattern;
+
+    public BatchKafkaConsumerService(KafkaConsumer<String, JsonNode> consumer,
+                                     KafkaBatchProperties props,
+                                     TemplateMapper templateMapper) {
+        this.consumer = consumer;
+        this.props = props;
+        this.templateMapper = templateMapper;
+    }
+
+    public void process() throws IOException {
+        consumer.subscribe(List.of(props.getKafka().getTopic()));
+
+        boolean running = true;
+        long idleTimeout = 5000;
+        long lastPollTime = System.currentTimeMillis();
+
+        List<String> renderedMessages = new ArrayList<>();
+
+        while (running) {
+            ConsumerRecords<String, JsonNode> records = consumer.poll(Duration.ofSeconds(1));
+            if (records.isEmpty()) {
+                if (System.currentTimeMillis() - lastPollTime > idleTimeout) {
+                    running = false;
+                }
+                continue;
+            }
+
+            lastPollTime = System.currentTimeMillis();
+
+            for (ConsumerRecord<String, JsonNode> record : records) {
+                String templateId = Optional.ofNullable(record.headers().lastHeader("template-id"))
+                        .map(h -> new String(h.value(), StandardCharsets.UTF_8))
+                        .orElse("default");
+                String rendered = templateMapper.render(templateId, record.value());
+                renderedMessages.add(rendered);
+            }
+
+            consumer.commitSync();
+        }
+
+        writeToFile(renderedMessages);
+    }
+
+    private void writeToFile(List<String> messages) throws IOException {
+        String formattedDate = "00" + LocalDate.now().format(DateTimeFormatter.ofPattern(datePattern));
+        String fileNamePattern = props.getOutput().getFileNameFormat().get(props.getOutput().getEnvironment());
+        String fileName = String.format(fileNamePattern, formattedDate);
+
+        Path outputFile = Paths.get("/tmp/" + fileName);
+        try (BufferedWriter writer = Files.newBufferedWriter(outputFile)) {
+            for (String line : messages) {
+                writer.write(line);
+                writer.newLine();
+            }
+            writer.write("Total records processed: " + messages.size());
+        }
+    }
+}
+
+
+// === BatchController.java ===
+
+@RestController
+@RequestMapping("/batch/manual")
+public class BatchController {
+
+    private final BatchKafkaConsumerService consumerService;
+
+    public BatchController(BatchKafkaConsumerService consumerService) {
+        this.consumerService = consumerService;
+    }
+
+    @GetMapping("/run")
+    public ResponseEntity<String> runBatch() {
+        try {
+            consumerService.process();
+            return ResponseEntity.ok("Batch processing complete.");
+        } catch (Exception e) {
+            return ResponseEntity.status(500).body("Error: " + e.getMessage());
+        }
+    }
+}
