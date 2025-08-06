@@ -222,3 +222,104 @@ public class KafkaBatchJobController {
     }
 }
 ✅ Summary
+
+-------------------------------------------------------------------------
+
+
+
+KafkaAdminConfig.java
+java
+Copy
+Edit
+@Configuration
+public class KafkaAdminConfig {
+    @Bean
+    public AdminClient adminClient(KafkaProperties kafkaProperties) {
+        return AdminClient.create(kafkaProperties.buildAdminProperties());
+    }
+
+    public List<Integer> getPartitions(String topic, AdminClient adminClient) {
+        try {
+            var desc = adminClient.describeTopics(List.of(topic))
+                .values().get(topic).get();
+            return desc.partitions().stream()
+                       .map(p -> p.partition()).toList();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+}
+5. KafkaJsonReaderConfig.java
+java
+Copy
+Edit
+@Configuration
+public class KafkaJsonReaderConfig {
+
+    @Autowired KafkaBatchProperties props;
+    @Autowired KafkaProperties kafkaProperties;
+    @Autowired AdminClient adminClient;
+    @Autowired KafkaAdminConfig kafkaAdminConfig;
+
+    @Bean
+    public KafkaItemReader<String, JsonNode> reader() {
+        var partitions = kafkaAdminConfig.getPartitions(props.getTopic(), adminClient);
+        var map = kafkaProperties.buildConsumerProperties(props.getGroupId(), null);
+        map.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        map.put(JsonDeserializer.TRUSTED_PACKAGES, "*");
+
+        Properties consumerProps = new Properties();
+        map.forEach(consumerProps::put);
+
+        return new KafkaItemReaderBuilder<String, JsonNode>()
+                .name("kafka-json-reader")
+                .topic(props.getTopic())
+                .partitions(partitions.stream().mapToInt(i -> i).toArray())
+                .consumerProperties(consumerProps)
+                .keyDeserializer(new StringDeserializer())
+                .valueDeserializer(new JsonDeserializer<>(JsonNode.class, false))
+                .build();
+    }
+}
+6. KafkaBatchJobConfig.java
+java
+Copy
+Edit
+@Configuration
+public class KafkaBatchJobConfig {
+
+    @Bean
+    public Job kafkaJob(JobRepository jr, Step kafkaStep) {
+        return new JobBuilder("kafka-job", jr).start(kafkaStep).build();
+    }
+
+    @Bean
+    public Step kafkaStep(JobRepository jr, PlatformTransactionManager tx, 
+                          KafkaItemReader<String, JsonNode> reader) {
+        return new StepBuilder("kafka-step", jr)
+            .<JsonNode, JsonNode>chunk(ChunkOptions.options().itemCount(10))
+            .reader(reader)
+            .writer(items -> items.forEach(j -> log.info("Key: {}, Value: {}", 
+                                 j.getHeaders().get("key"), j.toString())))
+            .transactionManager(tx)
+            .build();
+    }
+}
+7. BatchController.java
+java
+Copy
+Edit
+@RestController
+@RequestMapping("/batch")
+public class BatchController {
+    @Autowired JobLauncher jobLauncher;
+    @Autowired @Qualifier("kafkaJob") Job job;
+
+    @GetMapping("/run")
+    public ResponseEntity<String> run() throws Exception {
+        var params = new JobParametersBuilder()
+                .addLong("time", System.currentTimeMillis()).toJobParameters();
+        jobLauncher.run(job, params);
+        return ResponseEntity.ok("Job launched");
+    }
+}
