@@ -1,0 +1,88 @@
+Kafka ItemReader Config
+java
+Copy
+Edit
+@Configuration
+public class KafkaBatchConfig {
+
+    @Value("${spring.kafka.bootstrap-servers}")
+    private String bootstrapServers;
+
+    @Bean
+    public KafkaItemReader<String, String> kafkaItemReader() {
+        KafkaItemReader<String, String> reader = new KafkaItemReaderBuilder<String, String>()
+                .partitions(0)  // or .partitions(0, 1, ...) for multiple
+                .consumerProperties(Map.of(
+                        ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers,
+                        ConsumerConfig.GROUP_ID_CONFIG, "batch-consumer-group",
+                        ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest",
+                        ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
+                        ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class
+                ))
+                .name("kafka-item-reader")
+                .topic("your-topic-name")
+                .build();
+
+        return reader;
+    }
+}
+✅ 4. Spring Batch Job & Step
+java
+Copy
+Edit
+@Configuration
+public class BatchJobConfig {
+
+    @Bean
+    public Step kafkaStep(StepBuilderFactory stepBuilderFactory,
+                          KafkaItemReader<String, String> kafkaItemReader) {
+        return stepBuilderFactory.get("kafkaStep")
+                .<String, String>chunk(10)
+                .reader(kafkaItemReader)
+                .writer(items -> {
+                    for (String item : items) {
+                        System.out.println("Processed message: " + item);
+                    }
+                })
+                .build();
+    }
+
+    @Bean
+    public Job kafkaBatchJob(JobBuilderFactory jobBuilderFactory, Step kafkaStep) {
+        return jobBuilderFactory.get("kafkaBatchJob")
+                .start(kafkaStep)
+                .build();
+    }
+}
+✅ 5. Trigger from Controller
+java
+Copy
+Edit
+@RestController
+@RequestMapping("/batch")
+public class BatchController {
+
+    private final JobLauncher jobLauncher;
+    private final Job kafkaBatchJob;
+
+    public BatchController(JobLauncher jobLauncher, @Qualifier("kafkaBatchJob") Job kafkaBatchJob) {
+        this.jobLauncher = jobLauncher;
+        this.kafkaBatchJob = kafkaBatchJob;
+    }
+
+    @GetMapping("/run")
+    public ResponseEntity<String> runKafkaJob() {
+        try {
+            JobParameters jobParameters = new JobParametersBuilder()
+                    .addLong("time", System.currentTimeMillis())
+                    .toJobParameters();
+
+            jobLauncher.run(kafkaBatchJob, jobParameters);
+
+            return ResponseEntity.ok("Kafka batch job started");
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body("Error: " + e.getMessage());
+        }
+    }
+}
