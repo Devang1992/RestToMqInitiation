@@ -323,3 +323,217 @@ public class BatchController {
         return ResponseEntity.ok("Job launched");
     }
 }
+
+
+----------------------\\\
+
+ Here’s What We’ll Do:
+To include Kafka headers in Spring Batch using KafkaItemReader, we’ll:
+
+1. Use ConsumerRecord<String, JsonNode> as the item type
+➡️ This gives access to:
+
+Key
+
+Value (JsonNode)
+
+Headers
+
+Partition
+
+Offset
+
+2. Update the reader to deserialize into ConsumerRecord
+✅ You’ll need a custom valueDeserializer via properties
+✅ But you don’t need to parse headers manually — Kafka gives you that
+
+✅ Updated Reader Example
+java
+Copy
+Edit
+@Bean
+public KafkaItemReader<String, ConsumerRecord<String, JsonNode>> kafkaItemReader(
+        KafkaBatchProperties kafkaBatchProperties,
+        KafkaProperties kafkaProperties,
+        AdminClient adminClient,
+        KafkaAdminConfig kafkaAdminConfig
+) {
+    List<Integer> partitions = kafkaAdminConfig.getPartitions(kafkaBatchProperties.getTopic(), adminClient);
+
+    Map<String, Object> configMap = kafkaProperties.buildConsumerProperties(kafkaBatchProperties.getGroupId(), null);
+    configMap.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+    configMap.put(JsonDeserializer.TRUSTED_PACKAGES, "*");
+    configMap.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+    configMap.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
+    configMap.put(JsonDeserializer.VALUE_DEFAULT_TYPE, "com.fasterxml.jackson.databind.JsonNode");
+
+    Properties consumerProps = new Properties();
+    configMap.forEach(consumerProps::put);
+
+    return new KafkaItemReaderBuilder<String, ConsumerRecord<String, JsonNode>>()
+            .name("kafka-header-aware-reader")
+            .topic(kafkaBatchProperties.getTopic())
+            .partitions(partitions.stream().mapToInt(i -> i).toArray())
+            .consumerProperties(consumerProps)
+            .build();
+}
+✅ Updated Step Writer to Access Headers
+java
+Copy
+Edit
+@Bean
+public Step kafkaStep(JobRepository jobRepository,
+                      PlatformTransactionManager transactionManager,
+                      KafkaItemReader<String, ConsumerRecord<String, JsonNode>> reader) {
+    return new StepBuilder("kafka-step", jobRepository)
+            .<ConsumerRecord<String, JsonNode>, ConsumerRecord<String, JsonNode>>chunk(10)
+            .reader(reader)
+            .writer(records -> {
+                for (ConsumerRecord<String, JsonNode> record : records) {
+                    String templateId = Optional.ofNullable(record.headers().lastHeader("template-id"))
+                                                .map(header -> new String(header.value(), StandardCharsets.UTF_8))
+                                                .orElse("default");
+
+                    JsonNode payload = record.value();
+
+                    log.info("Template: {}, Payload: {}", templateId, payload.toPrettyString());
+
+                    // Now you can render your templates based on `templateId` and `payload`
+                }
+            })
+            .transactionManager(transactionManager)
+            .build();
+}
+✅ Summary
+Field	Access With
+Kafka Key	record.key()
+Kafka JSON payload	record.value()
+Kafka Headers	record.headers()
+Template ID from header	record.headers().lastHeader("template-id")
+
+Would you like a full working zip/project for this updated version? Or integrate with your existing template rendering logic now?
+
+
+
+
+
+
+
+
+You said:
+so for wirter not sure if you still remember
+
+we had the requirement to make a final file of all kafka messages combined with the template choosen from headers and append everything with the total number of records appended
+
+
+ChatGPT said:
+Yes — I remember now! Let me summarize your full requirement and then give you the updated ItemWriter that does exactly that.
+
+🧠 Recap of Your Requirement
+You want a Kafka batch job that:
+
+Reads Kafka messages as:
+
+String key
+
+JsonNode value (the message payload)
+
+Kafka headers (e.g., template-id)
+
+For each message:
+
+Extract the template-id from headers
+
+Load a corresponding Handlebars or text template from the resources folder
+
+Apply the JSON payload to the template
+
+Append the rendered output to a file
+
+Final output file:
+
+Should contain all rendered message blocks (i.e., batch output)
+
+Add a final line that says something like:
+Total records processed: XX
+
+✅ The Writer You Need: (Handles All This)
+java
+Copy
+Edit
+@Bean
+public Step kafkaStep(JobRepository jobRepository,
+                      PlatformTransactionManager transactionManager,
+                      KafkaItemReader<String, ConsumerRecord<String, JsonNode>> reader,
+                      TemplateMapper templateMapper // <-- your helper class
+) {
+    return new StepBuilder("kafka-step", jobRepository)
+            .<ConsumerRecord<String, JsonNode>, ConsumerRecord<String, JsonNode>>chunk(1000)
+            .reader(reader)
+            .writer(new ItemWriter<>() {
+                private final Path outputFile = Paths.get("/tmp/final-output.txt");
+                private int total = 0;
+
+                @Override
+                public void write(List<? extends ConsumerRecord<String, JsonNode>> items) throws Exception {
+                    Files.deleteIfExists(outputFile); // Clear previous file if rerunning
+                    Files.createDirectories(outputFile.getParent());
+
+                    try (BufferedWriter writer = Files.newBufferedWriter(outputFile, StandardCharsets.UTF_8,
+                            StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
+
+                        for (ConsumerRecord<String, JsonNode> record : items) {
+                            String templateId = Optional.ofNullable(record.headers().lastHeader("template-id"))
+                                    .map(h -> new String(h.value(), StandardCharsets.UTF_8))
+                                    .orElse("default");
+
+                            JsonNode payload = record.value();
+
+                            // Use your existing template mapping logic
+                            String rendered = templateMapper.renderTemplate(templateId, payload);
+
+                            writer.write(rendered);
+                            writer.newLine();
+                            total++;
+                        }
+
+                        writer.write("\nTotal records processed: " + total);
+                        writer.newLine();
+                    }
+                }
+            })
+            .transactionManager(transactionManager)
+            .build();
+}
+✅ Required Utility (TemplateMapper)
+If you haven't already, your TemplateMapper would look like this:
+
+java
+Copy
+Edit
+@Component
+public class TemplateMapper {
+
+    private final Map<String, Template> templateMap = new HashMap<>();
+
+    public TemplateMapper() throws IOException {
+        Handlebars handlebars = new Handlebars();
+
+        try (Stream<Path> paths = Files.walk(Paths.get("src/main/resources/templates"))) {
+            paths.filter(Files::isRegularFile)
+                .forEach(path -> {
+                    try {
+                        String templateId = path.getFileName().toString().replace(".hbs", "");
+                        templateMap.put(templateId, handlebars.compile(path.toString()));
+                    } catch (IOException e) {
+                        throw new RuntimeException("Failed to load template: " + path, e);
+                    }
+                });
+        }
+    }
+
+    public String renderTemplate(String templateId, JsonNode data) throws IOException {
+        Template template = templateMap.getOrDefault(templateId, templateMap.get("default"));
+        return template.apply(data);
+    }
+}
