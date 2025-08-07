@@ -1,0 +1,44 @@
+ Code Example
+Place this after consumer.subscribe(...) and rebalance:
+
+java
+Copy
+Edit
+// Ensure partitions are assigned
+while (consumer.assignment().isEmpty()) {
+    consumer.poll(Duration.ofMillis(100));
+}
+
+Set<TopicPartition> partitions = consumer.assignment();
+
+// Get start offsets
+Map<TopicPartition, Long> startOffsets = consumer.beginningOffsets(partitions);
+
+// Get end offsets
+Map<TopicPartition, Long> endOffsets = consumer.endOffsets(partitions);
+
+// Log them
+for (TopicPartition partition : partitions) {
+    long start = startOffsets.get(partition);
+    long end = endOffsets.get(partition);
+    System.out.printf("Partition %s | Start Offset: %d | End Offset: %d%n", partition.partition(), start, end);
+}
+🔎 Use Case: When to Stop
+If you want to stop after reading all messages up to end offset, you can track last offset in the loop:
+
+java
+Copy
+Edit
+Map<TopicPartition, Long> endOffsets = consumer.endOffsets(consumer.assignment());
+
+while (running) {
+    ConsumerRecords<String, JsonNode> records = consumer.poll(Duration.ofSeconds(1));
+
+    for (ConsumerRecord<String, JsonNode> record : records) {
+        // Process
+        long end = endOffsets.get(new TopicPartition(record.topic(), record.partition()));
+        if (record.offset() + 1 >= end) {
+            running = false; // You've reached the end for that partition
+        }
+    }
+}
