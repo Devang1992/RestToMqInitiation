@@ -1,44 +1,85 @@
- Code Example
-Place this after consumer.subscribe(...) and rebalance:
+// 1-based line numbers
+private static final int PAGE_LINES = 65;
+private static final int CONTENT_LAST_LINE = 62;
+private static final int LINE_ID_LINE = 1;
+private static final int FIRST_PAGE_HASH_LINE = 2;
+private static final int FIRST_PAGE_ADDRESS_START = 17;
+private static final int NEXT_PAGE_ADDRESS_START = 8;
+private static final int PAGE_NUMBER_LINE = 65;
+private static final int LINE_LENGTH = 133;
 
-java
-Copy
-Edit
-// Ensure partitions are assigned
-while (consumer.assignment().isEmpty()) {
-    consumer.poll(Duration.ofMillis(100));
-}
+private static String pad(String s) { return String.format("%-" + LINE_LENGTH + "s", s); }
 
-Set<TopicPartition> partitions = consumer.assignment();
+public void generateFile(List<String> renderedMessages, Path outputPath) {
+    List<String> finalOutput = new ArrayList<>();
+    finalOutput.add(templateMapper.getBannerPage()); // your banner (already padded)
 
-// Get start offsets
-Map<TopicPartition, Long> startOffsets = consumer.beginningOffsets(partitions);
+    int docCounter = 1;
+    for (String message : renderedMessages) {
+        // split message into content + address block (you already have these two lists)
+        List<String> contentLines = extractContentLines(message);
+        List<String> addressBlock = extractAddressBlock(message);
 
-// Get end offsets
-Map<TopicPartition, Long> endOffsets = consumer.endOffsets(partitions);
+        int idx = 0; // index into contentLines
+        boolean firstPage = true;
 
-// Log them
-for (TopicPartition partition : partitions) {
-    long start = startOffsets.get(partition);
-    long end = endOffsets.get(partition);
-    System.out.printf("Partition %s | Start Offset: %d | End Offset: %d%n", partition.partition(), start, end);
-}
-🔎 Use Case: When to Stop
-If you want to stop after reading all messages up to end offset, you can track last offset in the loop:
+        while (idx < contentLines.size()) {
+            List<String> page = blankPage();
 
-java
-Copy
-Edit
-Map<TopicPartition, Long> endOffsets = consumer.endOffsets(consumer.assignment());
+            // common header
+            page.set(LINE_ID_LINE - 1, pad("1"));
 
-while (running) {
-    ConsumerRecords<String, JsonNode> records = consumer.poll(Duration.ofSeconds(1));
+            int addressStart = firstPage ? FIRST_PAGE_ADDRESS_START : NEXT_PAGE_ADDRESS_START;
 
-    for (ConsumerRecord<String, JsonNode> record : records) {
-        // Process
-        long end = endOffsets.get(new TopicPartition(record.topic(), record.partition()));
-        if (record.offset() + 1 >= end) {
-            running = false; // You've reached the end for that partition
+            if (firstPage) {
+                page.set(FIRST_PAGE_HASH_LINE - 1, pad("#"));
+            }
+
+            // place address block
+            int aLine = addressStart;
+            for (String addr : addressBlock) {
+                if (aLine > CONTENT_LAST_LINE) break; // hard stop
+                page.set(aLine - 1, pad(addr));
+                aLine++;
+            }
+
+            // compute where content is allowed to start
+            int contentStart = addressStart + addressBlock.size();
+            if (contentStart < (firstPage ? FIRST_PAGE_HASH_LINE + 1 : LINE_ID_LINE + 1)) {
+                // just in case addressBlock is empty, ensure we don't overwrite header
+                contentStart = (firstPage ? FIRST_PAGE_HASH_LINE + 1 : LINE_ID_LINE + 1);
+            }
+
+            // write content up to line 62
+            int linePtr = Math.max(contentStart, (firstPage ? FIRST_PAGE_HASH_LINE + 1 : LINE_ID_LINE + 1));
+            while (idx < contentLines.size() && linePtr <= CONTENT_LAST_LINE) {
+                page.set(linePtr - 1, pad(contentLines.get(idx++)));
+                linePtr++;
+            }
+
+            // blank 63-64 are already blank in blankPage()
+
+            // page footer
+            page.set(PAGE_NUMBER_LINE - 1, pad(String.format("Page %02d", docCounter)));
+            docCounter++;
+
+            finalOutput.add(String.join("\r\n", page));
+            firstPage = false;
         }
     }
+
+    try {
+        Files.writeString(
+                outputPath,
+                String.join("\r\n", finalOutput) + "\r\n",
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING
+        );
+    } catch (IOException e) {
+        throw new RuntimeException("Error writing batch file", e);
+    }
+}
+
+private List<String> blankPage() {
+    List<String> page = new ArrayList<>(Collections.nCopies(PAGE_LINES, pad("")));
+    return page;
 }
