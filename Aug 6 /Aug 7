@@ -1,3 +1,56 @@
+for (String message : renderedMessages) {
+
+    int pageCounter = 1; // ✅ Reset for each message
+
+    List<String> contentLines = extractContentLines(message);
+    List<String> addressBlock = extractAddressBlock(message);
+
+    boolean firstPage = true;
+    int idx = 0;
+
+    while (idx < contentLines.size()) {
+        List<String> page = blankPage();
+
+        // header
+        page.set(LINE_ID_LINE - 1, pad("1"));
+        if (firstPage) {
+            page.set(FIRST_PAGE_HASH_LINE - 1, pad("#"));
+        }
+
+        // address
+        int addressStart = firstPage ? FIRST_PAGE_ADDRESS_START : NEXT_PAGE_ADDRESS_START;
+        int aLine = addressStart;
+        for (String addr : addressBlock) {
+            if (aLine > CONTENT_LAST_LINE) break;
+            page.set(aLine - 1, pad(addr));
+            aLine++;
+        }
+
+        // content
+        int contentStart = addressStart + addressBlock.size();
+        if (contentStart <= (firstPage ? FIRST_PAGE_HASH_LINE : LINE_ID_LINE)) {
+            contentStart = (firstPage ? FIRST_PAGE_HASH_LINE + 1 : LINE_ID_LINE + 1);
+        }
+
+        int linePtr = contentStart;
+        while (idx < contentLines.size() && linePtr <= CONTENT_LAST_LINE) {
+            page.set(linePtr - 1, pad(contentLines.get(idx++)));
+            linePtr++;
+        }
+
+        // page number footer
+        page.set(PAGE_NUMBER_LINE - 1, pad(String.format("Page %02d", pageCounter)));
+        pageCounter++; // ✅ Only increments inside the same message
+
+        finalOutput.add(String.join("\r\n", page));
+
+        firstPage = false;
+    }
+}
+
+
+--------
+
 private List<String> extractAddressBlock(String message) {
     List<String> addressBlock = new ArrayList<>();
     String[] lines = message.split("\\r?\\n");
