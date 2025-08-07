@@ -1,3 +1,37 @@
+private List<String> extractAddressBlock(String message) {
+    List<String> addressBlock = new ArrayList<>();
+    String[] lines = message.split("\\r?\\n");
+
+    for (String line : lines) {
+        if (line.trim().isEmpty()) {
+            break; // stop at the first blank line
+        }
+        addressBlock.add(line);
+    }
+    return addressBlock;
+}
+
+private List<String> extractContentLines(String message) {
+    List<String> contentLines = new ArrayList<>();
+    String[] lines = message.split("\\r?\\n");
+
+    boolean addressEnded = false;
+    for (String line : lines) {
+        if (!addressEnded) {
+            if (line.trim().isEmpty()) {
+                addressEnded = true; // now start capturing content
+            }
+        } else {
+            contentLines.add(line);
+        }
+    }
+    return contentLines;
+}
+Example
+If message is:
+
+------------
+
 // 1-based line numbers
 private static final int PAGE_LINES = 65;
 private static final int CONTENT_LAST_LINE = 62;
