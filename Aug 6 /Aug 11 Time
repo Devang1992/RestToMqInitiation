@@ -1,0 +1,150 @@
+1) Container bean (no auto-start, manual ack, short poll timeout)
+java
+Copy
+Edit
+@Bean
+KafkaMessageListenerContainer<String, String> batchContainer(
+    ConsumerFactory<String, String> cf,
+    BatchIdleListener listener,
+    @Value("${batch.idle.ms:60000}") long idleMs,
+    @Value("${batch.poll.timeout.ms:2000}") long pollTimeoutMs) {
+
+  var cp = new ContainerProperties("your-topic");
+  cp.setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
+  cp.setPollTimeout(pollTimeoutMs);            // poll every ~2s
+
+  var c = new KafkaMessageListenerContainer<>(cf, cp);
+  c.setAutoStartup(false);                     // start only from controller
+  c.setCommonErrorHandler(new DefaultErrorHandler(new FixedBackOff(0, 0)));
+
+  c.setupMessageListener(listener);
+  listener.attach(c, idleMs);
+  return c;
+}
+2) Listener with an idle “watchdog”
+Updates lastRecordAt on every message
+
+A scheduled task stops the container when now - lastRecordAt ≥ idleMs
+
+Guarded by finished so finalize runs once
+
+java
+Copy
+Edit
+@Component
+public class BatchIdleListener
+    implements org.springframework.kafka.listener.AcknowledgingConsumerAwareMessageListener<String, String> {
+
+  private volatile KafkaMessageListenerContainer<String, String> container;
+  private final java.util.concurrent.atomic.AtomicBoolean running  = new java.util.concurrent.atomic.AtomicBoolean(false);
+  private final java.util.concurrent.atomic.AtomicBoolean finished = new java.util.concurrent.atomic.AtomicBoolean(false);
+  private final java.util.concurrent.atomic.AtomicLong lastRecordAt = new java.util.concurrent.atomic.AtomicLong(0);
+
+  private java.util.concurrent.ScheduledExecutorService watchdog;
+  private long idleMs;
+
+  void attach(KafkaMessageListenerContainer<String, String> c, long idleMs) {
+    this.container = c;
+    this.idleMs = idleMs;
+  }
+
+  /** called by controller before start() */
+  void beginRun() {
+    this.finished.set(false);
+    this.running.set(true);
+    this.lastRecordAt.set(System.currentTimeMillis());
+    startWatchdog();
+  }
+
+  private void startWatchdog() {
+    stopWatchdog(); // cleanup if any
+    watchdog = java.util.concurrent.Executors.newSingleThreadScheduledExecutor();
+    watchdog.scheduleWithFixedDelay(() -> {
+      if (!running.get() || finished.get()) return;
+      long idleFor = System.currentTimeMillis() - lastRecordAt.get();
+      if (idleFor >= idleMs) {
+        finalizeAndStop();
+      }
+    }, idleMs, Math.max(1000, idleMs / 4), java.util.concurrent.TimeUnit.MILLISECONDS);
+  }
+
+  private void stopWatchdog() {
+    if (watchdog != null) {
+      watchdog.shutdownNow();
+      watchdog = null;
+    }
+  }
+
+  private void finalizeAndStop() {
+    if (!finished.compareAndSet(false, true)) return; // run once
+    try {
+      // TODO: write the file, flush buffers, etc.
+      // fileGen.generateFile(rendered, outputPath);
+    } catch (Exception e) {
+      // log error
+    } finally {
+      running.set(false);
+      stopWatchdog();
+      if (container != null) container.stop();
+    }
+  }
+
+  @Override
+  public void onMessage(org.apache.kafka.clients.consumer.ConsumerRecord<String, String> rec,
+                        org.springframework.kafka.support.Acknowledgment ack,
+                        org.apache.kafka.clients.consumer.Consumer<?, ?> consumer) {
+    // process the record (render, accumulate, etc.)
+    // rendered.add(rec.value());
+    if (ack != null) ack.acknowledge();
+
+    // mark activity
+    lastRecordAt.set(System.currentTimeMillis());
+  }
+}
+Behavior
+
+If there’s a burst of messages, lastRecordAt keeps moving forward and the watchdog won’t fire.
+
+If no message arrives for idleMs (e.g., 60s), finalizeAndStop() runs once and stops the container.
+
+This is robust with transactional producers: you’re not counting records/offsets at all; you’re purely time-based.
+
+3) Controller: start on demand
+java
+Copy
+Edit
+@RestController
+@RequestMapping("/batch")
+public class BatchController {
+
+  private final KafkaMessageListenerContainer<String, String> container;
+  private final BatchIdleListener listener;
+
+  public BatchController(KafkaMessageListenerContainer<String, String> container,
+                         BatchIdleListener listener) {
+    this.container = container;
+    this.listener = listener;
+  }
+
+  @PostMapping("/run")
+  public ResponseEntity<String> run() {
+    if (container.isRunning()) return ResponseEntity.status(409).body("Already running");
+    listener.beginRun();    // reset state + start watchdog
+    container.start();      // start consuming now
+    return ResponseEntity.accepted().body("Started");
+  }
+
+  @PostMapping("/stop")
+  public ResponseEntity<String> stop() {
+    if (container.isRunning()) container.stop();
+    return ResponseEntity.ok("Stopped");
+  }
+}
+Notes / tuning
+What “idle” means here: “No delivered records for idleMs.” That’s usually the business signal you want: “we’re caught up for now”.
+
+If you want to include a bit of hysteresis, keep it as is (it already checks every ~idle/4s). Or require 2 consecutive idle windows (add a small counter in the watchdog).
+
+Keep pollTimeout modest (1–2s) so the container polls frequently; otherwise “no records” detection may lag by the poll timeout.
+
+If you still want an alternative that’s fully framework-driven, you can also use ContainerProperties.setIdleEventInterval(idleMs) and listen for ListenerContainerIdleEvent to stop the container. The watchdog above is simpler and gives you exact control.
