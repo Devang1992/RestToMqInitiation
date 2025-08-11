@@ -1,0 +1,94 @@
+Option 2 — Use a Spring Kafka listener container you can start/stop on demand
+This gives you the “start listening on controller call; stop when done” behavior safely.
+
+java
+Copy
+Edit
+// config
+@Bean
+public KafkaMessageListenerContainer<String, JsonNode> batchContainer(
+    ConsumerFactory<String, JsonNode> cf, KafkaBatchProperties props) {
+
+  // assign partitions explicitly; don’t auto-start
+  var topic = props.getKafka().getTopic();
+  // you can discover partitions dynamically too
+  ContainerProperties cp = new ContainerProperties(new TopicPartitionInitialOffset(topic, 0));
+  cp.setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
+  cp.setAutoStartup(false);
+
+  return new KafkaMessageListenerContainer<>(cf, cp);
+}
+Job-scoped listener that tracks end offsets and stops itself:
+
+java
+Copy
+Edit
+@Component
+public class BatchJobListener implements AcknowledgingMessageListener<String, JsonNode> {
+  private final TemplateMapper mapper;
+  private final BatchFileGenerator fileGen;
+  private final KafkaMessageListenerContainer<String, JsonNode> container;
+  private final ConsumerFactory<String, JsonNode> cf;
+  private final KafkaBatchProperties props;
+
+  private volatile Map<TopicPartition, Long> endSnapshot = Map.of();
+  private final Map<TopicPartition, Long> last = new ConcurrentHashMap<>();
+  private final List<String> rendered = Collections.synchronizedList(new ArrayList<>());
+
+  public BatchJobListener(TemplateMapper mapper,
+                          BatchFileGenerator fileGen,
+                          KafkaMessageListenerContainer<String, JsonNode> container,
+                          ConsumerFactory<String, JsonNode> cf,
+                          KafkaBatchProperties props) {
+    this.mapper = mapper; this.fileGen = fileGen; this.container = container;
+    this.cf = cf; this.props = props;
+    container.setupMessageListener(this);
+  }
+
+  public void startRun() {
+    // snapshot end before starting
+    try (var c = cf.createConsumer()) {
+      var parts = c.partitionsFor(props.getKafka().getTopic()).stream()
+          .map(p -> new TopicPartition(p.topic(), p.partition())).toList();
+      c.assign(parts);
+      endSnapshot = c.endOffsets(parts);
+      last.clear();
+      rendered.clear();
+      container.start();
+    }
+  }
+
+  @Override
+  public void onMessage(ConsumerRecord<String, JsonNode> rec, Acknowledgment ack) {
+    rendered.add(mapper.mapTemplate(rec.value().toString(), "NA", "NA"));
+    last.put(new TopicPartition(rec.topic(), rec.partition()), rec.offset());
+    ack.acknowledge();
+
+    boolean done = endSnapshot.entrySet().stream()
+        .allMatch(e -> last.getOrDefault(e.getKey(), -1L) >= e.getValue() - 1);
+
+    if (done) {
+      try { fileGen.generateFile(new ArrayList<>(rendered), props.outputPath()); }
+      catch (IOException e) { /* log */ }
+      finally { container.stop(); }
+    }
+  }
+}
+Controller:
+
+java
+Copy
+Edit
+@RestController
+@RequestMapping("/batch")
+public class BatchController {
+  private final BatchJobListener listener;
+  public BatchController(BatchJobListener listener) { this.listener = listener; }
+
+  @PostMapping("/run")
+  public ResponseEntity<?> run() {
+    listener.startRun();
+    return ResponseEntity.accepted().build();
+  }
+}
+This approach is great if you really want a listener that you can start and stop per request. It avoids sharing a raw KafkaConsumer.
