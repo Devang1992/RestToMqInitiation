@@ -1,0 +1,237 @@
+totally—here’s a clean, event-driven pattern that works great with curl (so Autosys is happy) and still gives you live progress. We’ll use SSE (Server-Sent Events) instead of WebSockets because curl supports SSE natively, proxies like it, and it’s simple HTTP.
+
+What you get
+POST /jobs → start the job, returns a jobId
+
+GET /jobs/{jobId} → get current status (polling)
+
+GET /jobs/{jobId}/events → SSE stream of progress/events (curl-friendly)
+
+GET /jobs/{jobId}/result → download the output (optional)
+
+POST /jobs/{jobId}/cancel → cancel (optional)
+
+Spring Boot skeleton
+Job store (in-memory)
+java
+Copy
+Edit
+@Component
+public class JobStore {
+  public enum State { QUEUED, RUNNING, COMPLETED, FAILED, CANCELLED }
+
+  public static record JobInfo(State state, String msg, Integer percent, String resultPath) {}
+
+  private final java.util.concurrent.ConcurrentHashMap<String, JobInfo> jobs = new java.util.concurrent.ConcurrentHashMap<>();
+
+  public void put(String id, JobInfo info) { jobs.put(id, info); }
+  public JobInfo get(String id) { return jobs.get(id); }
+  public void update(String id, java.util.function.UnaryOperator<JobInfo> fn) {
+    jobs.computeIfPresent(id, (k,v) -> fn.apply(v));
+  }
+}
+SSE hub
+java
+Copy
+Edit
+@Component
+public class SseHub {
+  private final java.util.concurrent.ConcurrentHashMap<String, java.util.List<SseEmitter>> emitters = new java.util.concurrent.ConcurrentHashMap<>();
+
+  public SseEmitter register(String jobId) {
+    SseEmitter em = new SseEmitter(0L); // no timeout
+    emitters.compute(jobId, (k, list) -> {
+      if (list == null) list = new java.util.concurrent.CopyOnWriteArrayList<>();
+      list.add(em);
+      return list;
+    });
+    em.onCompletion(() -> remove(jobId, em));
+    em.onTimeout(() -> remove(jobId, em));
+    em.onError(e -> remove(jobId, em));
+    return em;
+  }
+
+  private void remove(String jobId, SseEmitter em) {
+    var list = emitters.get(jobId);
+    if (list != null) list.remove(em);
+  }
+
+  public void send(String jobId, String event, Object data) {
+    var list = emitters.get(jobId);
+    if (list == null) return;
+    for (var em : list) {
+      try { em.send(SseEmitter.event().name(event).data(data)); }
+      catch (Exception ignored) {}
+    }
+  }
+
+  public void complete(String jobId) {
+    var list = emitters.remove(jobId);
+    if (list != null) list.forEach(SseEmitter::complete);
+  }
+}
+Controller
+java
+Copy
+Edit
+@RestController
+@RequestMapping("/jobs")
+public class JobController {
+
+  private final JobStore store;
+  private final SseHub sse;
+  private final JobService jobService; // async runner
+
+  public JobController(JobStore store, SseHub sse, JobService jobService) {
+    this.store = store; this.sse = sse; this.jobService = jobService;
+  }
+
+  @PostMapping
+  public Map<String, String> startJob() {
+    String jobId = java.util.UUID.randomUUID().toString();
+    store.put(jobId, new JobStore.JobInfo(JobStore.State.QUEUED, "queued", 0, null));
+    jobService.runAsync(jobId); // return immediately
+    return Map.of("jobId", jobId, "events", "/jobs/" + jobId + "/events");
+  }
+
+  @GetMapping("/{jobId}")
+  public JobStore.JobInfo status(@PathVariable String jobId) {
+    var info = store.get(jobId);
+    if (info == null) throw new ResponseStatusException(HttpStatus.NOT_FOUND);
+    return info;
+  }
+
+  @GetMapping(value="/{jobId}/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+  public SseEmitter events(@PathVariable String jobId) {
+    if (store.get(jobId) == null) throw new ResponseStatusException(HttpStatus.NOT_FOUND);
+    return sse.register(jobId);
+  }
+
+  // Optional: return a generated file
+  @GetMapping("/{jobId}/result")
+  public ResponseEntity<Resource> result(@PathVariable String jobId) throws IOException {
+    var info = store.get(jobId);
+    if (info == null || info.resultPath() == null) throw new ResponseStatusException(HttpStatus.NOT_FOUND);
+    var file = Path.of(info.resultPath());
+    return ResponseEntity.ok()
+      .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=" + file.getFileName())
+      .contentType(MediaType.APPLICATION_OCTET_STREAM)
+      .body(new InputStreamResource(Files.newInputStream(file)));
+  }
+
+  // Optional: cancel
+  @PostMapping("/{jobId}/cancel")
+  public void cancel(@PathVariable String jobId) {
+    jobService.cancel(jobId);
+  }
+}
+Async job service (publish progress to SSE)
+java
+Copy
+Edit
+@Service
+@EnableAsync
+public class JobService {
+
+  private final JobStore store;
+  private final SseHub sse;
+
+  private final java.util.Set<String> cancelled = java.util.Collections.synchronizedSet(new java.util.HashSet<>());
+
+  public JobService(JobStore store, SseHub sse) { this.store = store; this.sse = sse; }
+
+  public void cancel(String jobId) { cancelled.add(jobId); }
+
+  @Async
+  public void runAsync(String jobId) {
+    try {
+      store.update(jobId, old -> new JobStore.JobInfo(JobStore.State.RUNNING, "started", 0, null));
+      sse.send(jobId, "state", Map.of("state", "RUNNING"));
+
+      // >>> your long-running work here <<<
+      // Example: iterate items and publish progress
+      int total = 100; // replace with real total (or -1 if unknown)
+      for (int i = 1; i <= total; i++) {
+        if (cancelled.contains(jobId)) throw new RuntimeException("Cancelled");
+        // ... do unit of work ...
+        if (i % 5 == 0 || i == total) {
+          int pct = (i * 100) / total;
+          store.update(jobId, old -> new JobStore.JobInfo(JobStore.State.RUNNING, "progress", pct, null));
+          sse.send(jobId, "progress", Map.of("percent", pct));
+        }
+      }
+
+      // Example: write an output file
+      String path = "/tmp/result-" + jobId + ".txt";
+      Files.writeString(Path.of(path), "done\n");
+
+      store.put(jobId, new JobStore.JobInfo(JobStore.State.COMPLETED, "done", 100, path));
+      sse.send(jobId, "state", Map.of("state", "COMPLETED"));
+    } catch (Exception e) {
+      store.put(jobId, new JobStore.JobInfo(
+          cancelled.contains(jobId) ? JobStore.State.CANCELLED : JobStore.State.FAILED,
+          e.getMessage(), null, null));
+      sse.send(jobId, "state", Map.of("state", cancelled.contains(jobId) ? "CANCELLED" : "FAILED",
+                                      "error", e.getMessage()));
+    } finally {
+      sse.complete(jobId);
+    }
+  }
+}
+How to use with curl (and Autosys)
+Start a job
+bash
+Copy
+Edit
+JOB_JSON=$(curl -s -X POST http://localhost:8080/jobs)
+JOB_ID=$(echo "$JOB_JSON" | jq -r .jobId)   # or parse manually
+echo "Started: $JOB_ID"
+Stream live events (SSE)
+bash
+Copy
+Edit
+# -N = no buffering; you'll see events as they arrive
+curl -N http://localhost:8080/jobs/$JOB_ID/events
+Events look like:
+
+csharp
+Copy
+Edit
+event: state
+data: {"state":"RUNNING"}
+
+event: progress
+data: {"percent":35}
+Polling (simplest for Autosys)
+bash
+Copy
+Edit
+while true; do
+  OUT=$(curl -s http://localhost:8080/jobs/$JOB_ID)
+  STATE=$(echo "$OUT" | jq -r .state)
+  echo "state=$STATE"
+  if [ "$STATE" = "COMPLETED" ]; then exit 0; fi
+  if [ "$STATE" = "FAILED" ] || [ "$STATE" = "CANCELLED" ]; then exit 1; fi
+  sleep 5
+done
+Download result (optional)
+bash
+Copy
+Edit
+curl -s -o output.txt http://localhost:8080/jobs/$JOB_ID/result
+Why SSE over WebSockets here
+curl-friendly (just curl -N).
+
+Pure HTTP; load balancers/proxies usually don’t need special config.
+
+Autosys can run the same commands in a job script.
+WebSockets aren’t well-supported by curl; you’d need wscat or custom code, which is overkill.
+
+Local testing checklist
+Start your app.
+
+curl -s -X POST http://localhost:8080/jobs → copy jobId.
+
+In one terminal: curl -N http://localhost:8080/jobs/<jobId>/events
+
+In another, curl http://localhost:8080/jobs/<jobId> to poll or curl -O http://localhost:8080/jobs/<jobId>/result after completion.
