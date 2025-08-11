@@ -1,3 +1,90 @@
+Container config (manual ack + not auto-start)
+java
+Copy
+Edit
+@Bean
+KafkaMessageListenerContainer<String, String> batchContainer(
+    ConsumerFactory<String, String> cf, KafkaBatchProperties props, BatchJobListener listener) {
+
+  ContainerProperties cp = new ContainerProperties(props.getKafka().getTopic());
+  cp.setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
+
+  KafkaMessageListenerContainer<String, String> c =
+      new KafkaMessageListenerContainer<>(cf, cp);
+  c.setAutoStartup(false);
+  c.setCommonErrorHandler(new DefaultErrorHandler(new FixedBackOff(0L, 0L)));
+
+  listener.attach(c);
+  return c;
+}
+Listener: snapshot endOffsets at start, then compare positions
+java
+Copy
+Edit
+@Component
+public class BatchJobListener implements AcknowledgingConsumerAwareMessageListener<String, String> {
+
+  private final TemplateMapper mapper;
+  private final BatchFileGenerator fileGen;
+  private KafkaMessageListenerContainer<String, String> container;
+
+  private Map<TopicPartition, Long> endSnapshot = Map.of();
+  private final List<String> rendered = Collections.synchronizedList(new ArrayList<>());
+
+  public BatchJobListener(TemplateMapper mapper, BatchFileGenerator fileGen) {
+    this.mapper = mapper; this.fileGen = fileGen;
+  }
+
+  void attach(KafkaMessageListenerContainer<String, String> c) {
+    this.container = c;
+    // snapshot when partitions are assigned
+    c.getContainerProperties().setConsumerRebalanceListener(new ConsumerAwareRebalanceListener() {
+      @Override public void onPartitionsAssigned(Consumer<?, ?> consumer, Collection<TopicPartition> parts) {
+        // choose your start (beginning or committed)
+        Map<TopicPartition, Long> begins = consumer.beginningOffsets(parts);
+        for (TopicPartition tp : parts) consumer.seek(tp, begins.get(tp));
+
+        endSnapshot = consumer.endOffsets(parts);  // LEO at start time
+      }
+    });
+  }
+
+  @Override
+  public void onMessage(ConsumerRecord<String, String> rec, Acknowledgment ack, Consumer<?, ?> consumer) {
+    rendered.add(mapper.mapTemplate(rec.value(), "NA", "NA"));
+    ack.acknowledge();
+
+    // done when position has reached snapshot end on all assigned partitions
+    boolean done = true;
+    for (TopicPartition tp : consumer.assignment()) {
+      long pos = consumer.position(tp);                 // next offset to fetch (advances across skipped transactional stuff)
+      long end = endSnapshot.getOrDefault(tp, Long.MAX_VALUE);
+      if (pos < end) { done = false; break; }
+    }
+
+    if (done) {
+      try { fileGen.generateFile(new ArrayList<>(rendered), /*output*/ Path.of("...")); }
+      catch (Exception e) { /* log */ }
+      finally { container.stop(); }
+    }
+  }
+}
+Why this works with transactions
+Control/transaction markers still increment offsets, but you don’t see them as records.
+
+The consumer position advances across those markers and any aborted data.
+
+Once the position reaches your snapshot LEO, you have fully “caught up” to the moment you started—regardless of how many offsets were invisible to read_committed.
+
+One nuance (open transactions at snapshot time)
+If a transaction is open at snapshot time, endSnapshot may include offsets you can’t pass until that transaction is committed/aborted and the LSO advances. In practice, the consumer position will stop short until commit, then jump—your job will finish once it becomes readable. That’s usually desirable for a bounded, consistent batch.
+
+If you prefer a hard timeout instead, add an idle timer (e.g., stop if no new records and positions don’t move for N seconds).
+
+
+
+---------------------------------------------------------------------------
+
 Option 2 — Use a Spring Kafka listener container you can start/stop on demand
 This gives you the “start listening on controller call; stop when done” behavior safely.
 
