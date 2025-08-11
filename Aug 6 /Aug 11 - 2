@@ -1,0 +1,204 @@
+Totally—here’s a single, unified setup that does exactly what you want:
+
+Only starts listening when the controller endpoint is called
+
+Works with transactional producers (read_committed)
+
+Uses a snapshot of end offsets at start
+
+Stops automatically when the consumer position ≥ snapshot end on every assigned partition
+
+Manual ack (no endless loops)
+
+No auto-start
+
+1) Minimal config (String values shown; switch to JsonNode if you prefer)
+yaml
+Copy
+Edit
+# application.yml
+spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: batch-job-group
+      enable-auto-commit: false
+      isolation-level: read_committed
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+2) Listener that knows how to finish (position ≥ snapshot end)
+java
+Copy
+Edit
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.TopicPartition;
+import org.springframework.kafka.listener.AcknowledgingConsumerAwareMessageListener;
+import org.springframework.kafka.support.Acknowledgment;
+import org.springframework.stereotype.Component;
+
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+@Component
+public class BatchJobListener implements AcknowledgingConsumerAwareMessageListener<String, String> {
+
+    private final List<String> rendered = Collections.synchronizedList(new ArrayList<>());
+
+    // snapshot of end offsets (LEO at start)
+    private final Map<TopicPartition, Long> endSnapshot = new ConcurrentHashMap<>();
+
+    // container reference so we can stop
+    private volatile org.springframework.kafka.listener.KafkaMessageListenerContainer<String, String> container;
+
+    // Called by config to give the listener the container
+    void attach(org.springframework.kafka.listener.KafkaMessageListenerContainer<String, String> c) {
+        this.container = c;
+    }
+
+    // Called by the rebalance listener to set/refresh the snapshot
+    void setEndSnapshot(Map<TopicPartition, Long> snap) {
+        endSnapshot.clear();
+        endSnapshot.putAll(snap);
+    }
+
+    @Override
+    public void onMessage(ConsumerRecord<String, String> rec,
+                          Acknowledgment ack,
+                          Consumer<?, ?> consumer) {
+
+        // ---- your processing / rendering ----
+        rendered.add(rec.value());
+        // -------------------------------------
+
+        if (ack != null) ack.acknowledge();
+
+        // done when the *position* (next to fetch) has caught up to the snapshot end
+        boolean done = true;
+        for (TopicPartition tp : consumer.assignment()) {
+            long pos = consumer.position(tp); // advances across transactional markers
+            Long end = endSnapshot.get(tp);   // last+1 at start
+            if (end == null || pos < end) {  // not yet caught up
+                done = false;
+                break;
+            }
+        }
+
+        if (done) {
+            try {
+                // finalize: write file, etc.
+                // batchFileGenerator.generateFile(new ArrayList<>(rendered), outputPath);
+            } finally {
+                if (container != null) container.stop();
+            }
+        }
+    }
+}
+3) Container bean (no auto-start) + snapshot on assignment
+java
+Copy
+Edit
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.common.TopicPartition;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.kafka.listener.ContainerProperties;
+import org.springframework.kafka.listener.ConsumerAwareRebalanceListener;
+import org.springframework.kafka.listener.DefaultErrorHandler;
+import org.springframework.kafka.listener.KafkaMessageListenerContainer;
+import org.springframework.util.backoff.FixedBackOff;
+
+import java.util.*;
+
+@Configuration
+public class BatchKafkaConfig {
+
+    private static final String TOPIC = "your-topic";
+
+    @Bean
+    public KafkaMessageListenerContainer<String, String> batchContainer(
+            ConsumerFactory<String, String> cf,
+            BatchJobListener listener) {
+
+        ContainerProperties cp = new ContainerProperties(TOPIC);
+        cp.setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
+
+        // Take snapshot & choose start offsets when partitions are assigned
+        cp.setConsumerRebalanceListener(new ConsumerAwareRebalanceListener() {
+            @Override
+            public void onPartitionsAssigned(Consumer<?, ?> consumer, Collection<TopicPartition> parts) {
+                // (1) choose where to start
+                //    - to read everything available at start: seek to beginning
+                //    - to resume from last commit: do nothing (Kafka will start at committed)
+                Map<TopicPartition, Long> begins = consumer.beginningOffsets(parts);
+                for (TopicPartition tp : parts) {
+                    consumer.seek(tp, begins.get(tp)); // <- use committed start by removing this line
+                }
+
+                // (2) snapshot LEO (last+1) at this moment
+                Map<TopicPartition, Long> ends = consumer.endOffsets(parts);
+                listener.setEndSnapshot(ends);
+            }
+        });
+
+        KafkaMessageListenerContainer<String, String> container =
+                new KafkaMessageListenerContainer<>(cf, cp);
+
+        container.setAutoStartup(false); // IMPORTANT: start only from controller
+        container.setCommonErrorHandler(new DefaultErrorHandler(new FixedBackOff(0, 0)));
+        container.setupMessageListener(listener); // wire listener
+        listener.attach(container);
+        return container;
+    }
+}
+If you prefer JSON values, switch the ConsumerFactory/deserializer generics to JsonNode and adjust the listener <String, JsonNode>.
+
+4) Controller: start on demand
+java
+Copy
+Edit
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/batch")
+public class BatchController {
+
+    private final org.springframework.kafka.listener.KafkaMessageListenerContainer<String, String> container;
+
+    public BatchController(org.springframework.kafka.listener.KafkaMessageListenerContainer<String, String> container) {
+        this.container = container;
+    }
+
+    @PostMapping("/run")
+    public ResponseEntity<String> run() {
+        if (container.isRunning()) {
+            return ResponseEntity.status(409).body("Already running");
+        }
+        container.start(); // <- starts the listener now
+        return ResponseEntity.accepted().body("Started");
+    }
+
+    @PostMapping("/stop")
+    public ResponseEntity<String> stop() {
+        container.stop();
+        return ResponseEntity.ok("Stopped");
+    }
+}
+Why this works (incl. transactions)
+We snapshot end offsets (LEO) in onPartitionsAssigned.
+
+With isolation.level=read_committed, you only receive committed records; the consumer’s position still advances across control/transaction markers and aborted data.
+
+The done check uses position ≥ snapshotEnd, so it finishes cleanly even when “offsets > delivered records”.
+
+Manual acks ensure no endless re-delivery.
+
+Tweak points
+Start offset: remove the seek(tp, begins.get(tp)) line to resume from committed instead of starting at beginning.
+
+Batch delivery: if you want to receive a list per callback, use a ConcurrentKafkaListenerContainerFactory and set setBatchListener(true), then implement BatchAcknowledgingConsumerAwareMessageListener and decrement based on batch—but the position ≥ snapshot logic above already covers transactional quirks, so you can keep single-record listener.
+
+Timeout/idle: add an idle guard if you want to stop after N seconds with no position movement (use cp.setIdleEventInterval(...) and an ApplicationListener).
