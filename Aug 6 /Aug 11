@@ -1,9 +1,94 @@
+Ah gotcha—you mean: only start listening when the controller endpoint is hit. Yes, keep that flow. Here’s the clean pattern:
+
+1) Container bean (don’t auto-start)
+java
+Copy
+@Bean
+KafkaMessageListenerContainer<String, String> batchContainer(
+    ConsumerFactory<String, String> cf, KafkaBatchProperties props,
+    BatchJobListener listener) {
+
+  var cp = new ContainerProperties(props.getKafka().getTopic());
+  cp.setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
+  var c = new KafkaMessageListenerContainer<>(cf, cp);
+  c.setAutoStartup(false);            // <- important
+  c.setCommonErrorHandler(new DefaultErrorHandler(new FixedBackOff(0, 0)));
+  listener.attach(c);                 // listener implements AcknowledgingConsumerAwareMessageListener
+  return c;
+}
+2) Listener (done check uses position() >= endSnapshot)
+java
+Copy
+@Component
+public class BatchJobListener implements AcknowledgingConsumerAwareMessageListener<String,String> {
+  private KafkaMessageListenerContainer<String,String> container;
+  private Map<TopicPartition,Long> endSnapshot = Map.of();
+
+  void attach(KafkaMessageListenerContainer<String,String> c){ this.container = c; }
+
+  void setSnapshot(Map<TopicPartition,Long> snap){ this.endSnapshot = snap; }
+
+  @Override
+  public void onMessage(ConsumerRecord<String,String> rec, Acknowledgment ack, Consumer<?,?> consumer) {
+    // process...
+    ack.acknowledge();
+
+    boolean done = consumer.assignment().stream()
+        .allMatch(tp -> consumer.position(tp) >= endSnapshot.getOrDefault(tp, Long.MAX_VALUE));
+
+    if (done) container.stop(); // finishes the run
+  }
+}
+3) Controller starts listening on demand
+Snapshot end offsets before starting (so it’s a bounded batch), then start the container.
+
+java
+Copy
+@RestController
+@RequestMapping("/batch")
+public class BatchController {
+  private final KafkaMessageListenerContainer<String,String> container;
+  private final ConsumerFactory<String,String> cf;
+  private final KafkaBatchProperties props;
+  private final BatchJobListener listener;
+
+  public BatchController(KafkaMessageListenerContainer<String,String> c,
+                         ConsumerFactory<String,String> cf,
+                         KafkaBatchProperties props,
+                         BatchJobListener listener) {
+    this.container = c; this.cf = cf; this.props = props; this.listener = listener;
+  }
+
+  @PostMapping("/run")
+  public ResponseEntity<?> run() {
+    if (container.isRunning()) return ResponseEntity.status(409).body("Already running");
+
+    // Take snapshot & choose start offsets
+    try (var tmp = cf.createConsumer()) {
+      var parts = tmp.partitionsFor(props.getKafka().getTopic()).stream()
+          .map(p -> new TopicPartition(p.topic(), p.partition())).toList();
+      tmp.assign(parts);
+
+      // choose where to start
+      var begins = tmp.beginningOffsets(parts);
+      for (var tp : parts) tmp.seek(tp, begins.get(tp)); // or keep committed
+
+      var endSnap = tmp.endOffsets(parts);               // LEO at start time
+      listener.setSnapshot(endSnap);
+    }
+
+    container.start();                                   // <- starts listening now
+    return ResponseEntity.accepted().body("Started");
+  }
+}
+---------------------------------------------------------------
+
 Container config (manual ack + not auto-start)
 java
 Copy
 Edit
 @Bean
-KafkaMessageListenerContainer<String, String> batchContainer(
+KafkaMessageListenerContainer<Stri--- String> batchContainer(
     ConsumerFactory<String, String> cf, KafkaBatchProperties props, BatchJobListener listener) {
 
   ContainerProperties cp = new ContainerProperties(props.getKafka().getTopic());
