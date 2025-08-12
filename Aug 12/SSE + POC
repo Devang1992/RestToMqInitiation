@@ -1,0 +1,350 @@
+here’s a drop-in SSE wiring for both POCs (idle-based and offset-snapshot) that you can drive from Autosys with curl. It’s lean, production-friendly, and includes live progress events.
+
+SSE hub (shared)
+java
+Copy
+Edit
+// SseHub.java
+@Component
+public class SseHub {
+  private final Map<String, List<SseEmitter>> emitters = new ConcurrentHashMap<>();
+
+  public SseEmitter register(String jobId) {
+    var em = new SseEmitter(0L);
+    emitters.compute(jobId, (k, v) -> {
+      if (v == null) v = new CopyOnWriteArrayList<>();
+      v.add(em); return v;
+    });
+    Runnable remove = () -> emitters.computeIfPresent(jobId, (k, v) -> { v.remove(em); return v.isEmpty()?null:v; });
+    em.onCompletion(remove); em.onTimeout(remove); em.onError(t -> remove.run());
+    return em;
+  }
+
+  public void send(String jobId, String event, Object data) {
+    var list = emitters.get(jobId); if (list == null) return;
+    for (var em : list) try { em.send(SseEmitter.event().name(event).data(data)); } catch (Exception ignored) {}
+  }
+
+  public void complete(String jobId) {
+    var list = emitters.remove(jobId); if (list != null) list.forEach(SseEmitter::complete);
+  }
+}
+Temp container per request + SSE
+java
+Copy
+Edit
+// TempKafkaBatchService.java
+@Service
+public class TempKafkaBatchService {
+
+  private final ConsumerFactory<String, String> cf;
+  private final SseHub sse;
+
+  public TempKafkaBatchService(ConsumerFactory<String, String> cf, SseHub sse) {
+    this.cf = cf; this.sse = sse;
+  }
+
+  /* ===================== POC A — Idle-based stop ===================== */
+
+  public String runIdle(String topic, long idleMs, Consumer<ConsumerRecord<String,String>> onRecord, Runnable onComplete) {
+    String jobId = UUID.randomUUID().toString();
+
+    ContainerProperties cp = new ContainerProperties(topic);
+    cp.setGroupId("grp-" + jobId);
+    cp.setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
+    cp.setPollTimeout(2000);
+
+    var container = new KafkaMessageListenerContainer<>(cf, cp);
+    container.setBeanName("idle-" + jobId);
+    container.setAutoStartup(false);
+    container.setCommonErrorHandler(new DefaultErrorHandler(new FixedBackOff(0,0)));
+
+    var listener = new IdleListener(jobId, container, idleMs, onRecord, onComplete, sse);
+    container.setupMessageListener(listener);
+
+    sse.send(jobId, "state", Map.of("state","QUEUED"));
+    listener.beginRun();
+    container.start();
+    sse.send(jobId, "state", Map.of("state","RUNNING", "mode","IDLE", "idleMs", idleMs));
+    return jobId;
+  }
+
+  static final class IdleListener implements AcknowledgingConsumerAwareMessageListener<String,String> {
+    private final String jobId;
+    private final KafkaMessageListenerContainer<String,String> container;
+    private final long idleMs;
+    private final Consumer<ConsumerRecord<String,String>> onRecord;
+    private final Runnable onComplete;
+    private final SseHub sse;
+    private final AtomicBoolean finished = new AtomicBoolean(false);
+    private final AtomicLong last = new AtomicLong();
+
+    private ScheduledExecutorService watchdog;
+
+    IdleListener(String jobId,
+                 KafkaMessageListenerContainer<String,String> container,
+                 long idleMs,
+                 Consumer<ConsumerRecord<String,String>> onRecord,
+                 Runnable onComplete,
+                 SseHub sse) {
+      this.jobId = jobId; this.container = container; this.idleMs = idleMs;
+      this.onRecord = onRecord != null ? onRecord : r -> {};
+      this.onComplete = onComplete != null ? onComplete : () -> {};
+      this.sse = sse;
+    }
+
+    void beginRun() {
+      last.set(System.currentTimeMillis());
+      if (watchdog != null) watchdog.shutdownNow();
+      watchdog = Executors.newSingleThreadScheduledExecutor();
+      long period = Math.max(1000, idleMs / 4);
+      watchdog.scheduleWithFixedDelay(() -> {
+        long idleFor = System.currentTimeMillis() - last.get();
+        if (idleFor >= idleMs) finish("IDLE_TIMEOUT", Map.of("idleMs", idleMs, "idleFor", idleFor));
+      }, idleMs, period, TimeUnit.MILLISECONDS);
+    }
+
+    @Override
+    public void onMessage(ConsumerRecord<String, String> rec, Acknowledgment ack, Consumer<?, ?> consumer) {
+      try {
+        onRecord.accept(rec);
+        sse.send(jobId, "record", Map.of("topic", rec.topic(), "partition", rec.partition(), "offset", rec.offset()));
+        if (ack != null) ack.acknowledge();
+        last.set(System.currentTimeMillis());
+      } catch (Throwable t) {
+        finish("FAILED", Map.of("error", t.getMessage()));
+      }
+    }
+
+    private void finish(String state, Map<String, Object> extra) {
+      if (!finished.compareAndSet(false, true)) return;
+      try { onComplete.run(); } catch (Throwable ignore) {}
+      finally {
+        sse.send(jobId, "state", merge(Map.of("state", state), extra));
+        sse.complete(jobId);
+        if (watchdog != null) watchdog.shutdownNow();
+        container.stop();
+      }
+    }
+
+    private Map<String,Object> merge(Map<String,Object> a, Map<String,Object> b) {
+      var m = new LinkedHashMap<String,Object>(a); m.putAll(b); return m;
+    }
+  }
+
+  /* ============ POC B — Snapshot end, transactional-safe stop ============ */
+
+  public String runSnapshot(String topic, StartMode startMode,
+                            Consumer<List<ConsumerRecord<String,String>>> onBatch, Runnable onComplete) {
+
+    String jobId = UUID.randomUUID().toString();
+
+    ContainerProperties cp = new ContainerProperties(topic);
+    cp.setGroupId("grp-" + jobId);
+    cp.setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
+    cp.setPollTimeout(2000);
+
+    final Map<TopicPartition, Long> endSnap = new ConcurrentHashMap<>();
+    final Map<TopicPartition, Long> startPos = new ConcurrentHashMap<>();
+
+    cp.setConsumerRebalanceListener(new ConsumerAwareRebalanceListener() {
+      @Override public void onPartitionsAssigned(Consumer<?, ?> c, Collection<TopicPartition> parts) {
+        // choose start
+        try {
+          if (startMode == StartMode.BEGINNING) {
+            var begins = c.beginningOffsets(parts);
+            for (TopicPartition tp : parts) c.seek(tp, begins.get(tp));
+          } else if (startMode == StartMode.END) {
+            var ends = c.endOffsets(parts);
+            for (TopicPartition tp : parts) c.seek(tp, ends.get(tp));
+          }
+          // record starting positions post-seek (committed if COMMITTED)
+          startPos.clear();
+          for (TopicPartition tp : parts) startPos.put(tp, c.position(tp));
+          // snapshot LEO
+          endSnap.clear();
+          endSnap.putAll(c.endOffsets(parts));
+
+        } catch (Exception e) { /* let listener error handler handle */ }
+      }
+    });
+
+    var container = new KafkaMessageListenerContainer<>(cf, cp);
+    container.setBeanName("snap-" + jobId);
+    container.setAutoStartup(false);
+    container.setCommonErrorHandler(new DefaultErrorHandler(new FixedBackOff(0,0)));
+
+    var listener = new SnapshotListener(jobId, container, endSnap, startPos, onBatch, onComplete, sse);
+    container.setupMessageListener(listener);
+
+    sse.send(jobId, "state", Map.of("state","QUEUED"));
+    container.start();
+    sse.send(jobId, "state", Map.of("state","RUNNING", "mode","SNAPSHOT", "startMode", startMode.name()));
+    return jobId;
+  }
+
+  public enum StartMode { BEGINNING, COMMITTED, END }
+
+  static final class SnapshotListener implements BatchAcknowledgingConsumerAwareMessageListener<String,String> {
+    private final String jobId;
+    private final KafkaMessageListenerContainer<String,String> container;
+    private final Map<TopicPartition, Long> endSnap;
+    private final Map<TopicPartition, Long> startPos;
+    private final Consumer<List<ConsumerRecord<String,String>>> onBatch;
+    private final Runnable onComplete;
+    private final SseHub sse;
+    private final AtomicBoolean finished = new AtomicBoolean(false);
+
+    SnapshotListener(String jobId,
+                     KafkaMessageListenerContainer<String,String> container,
+                     Map<TopicPartition, Long> endSnap,
+                     Map<TopicPartition, Long> startPos,
+                     Consumer<List<ConsumerRecord<String,String>>> onBatch,
+                     Runnable onComplete,
+                     SseHub sse) {
+      this.jobId = jobId; this.container = container; this.endSnap = endSnap;
+      this.startPos = startPos; this.onBatch = onBatch!=null?onBatch:rs->{};
+      this.onComplete = onComplete!=null?onComplete:()->{}; this.sse = sse;
+    }
+
+    @Override
+    public void onMessage(List<ConsumerRecord<String, String>> records, Acknowledgment ack, Consumer<?, ?> consumer) {
+      try {
+        if (!records.isEmpty()) {
+          onBatch.accept(records);
+          sse.send(jobId, "batch", Map.of(
+              "count", records.size(),
+              "firstOffset", records.get(0).offset(),
+              "lastOffset",  records.get(records.size()-1).offset()));
+        }
+        if (ack != null) ack.acknowledge();
+
+        // progress based on positions vs snapshot (handles transactions)
+        long total = 0, done = 0;
+        for (TopicPartition tp : consumer.assignment()) {
+          long start = startPos.getOrDefault(tp, 0L);
+          long end   = endSnap.getOrDefault(tp, start);
+          long pos   = consumer.position(tp);
+          total += Math.max(0, end - start);
+          done  += Math.max(0, Math.min(pos, end) - start);
+        }
+        if (total > 0) {
+          int pct = (int)Math.min(100, (done * 100.0 / total));
+          sse.send(jobId, "progress", Map.of("done", done, "total", total, "percent", pct));
+        }
+
+        // stop when positions have reached snapshot end on all partitions
+        boolean allReached = consumer.assignment().stream()
+            .allMatch(tp -> consumer.position(tp) >= endSnap.getOrDefault(tp, Long.MAX_VALUE));
+
+        if (allReached && finished.compareAndSet(false, true)) {
+          try { onComplete.run(); } finally {
+            sse.send(jobId, "state", Map.of("state","COMPLETED"));
+            sse.complete(jobId);
+            container.stop();
+          }
+        }
+      } catch (Throwable t) {
+        if (finished.compareAndSet(false, true)) {
+          sse.send(jobId, "state", Map.of("state","FAILED","error", t.getMessage()));
+          sse.complete(jobId);
+          container.stop();
+        }
+      }
+    }
+  }
+}
+Controller (start + SSE endpoint)
+java
+Copy
+Edit
+// BatchJobController.java
+@RestController
+@RequestMapping("/batch")
+public class BatchJobController {
+
+  private final TempKafkaBatchService svc;
+  private final SseHub sse;
+
+  public BatchJobController(TempKafkaBatchService svc, SseHub sse) {
+    this.svc = svc; this.sse = sse;
+  }
+
+  @PostMapping("/run/idle")
+  public Map<String,String> runIdle(@RequestParam String topic,
+                                    @RequestParam(defaultValue = "60000") long idleMs) {
+    var bucket = Collections.synchronizedList(new ArrayList<String>());
+
+    String jobId = svc.runIdle(topic, idleMs,
+        rec -> bucket.add(rec.value()),
+        () -> { /* finalize: write file from bucket if you want */ });
+
+    return Map.of("jobId", jobId, "events", "/batch/events/" + jobId);
+  }
+
+  @PostMapping("/run/snapshot")
+  public Map<String,String> runSnapshot(@RequestParam String topic,
+                                        @RequestParam(defaultValue = "BEGINNING") TempKafkaBatchService.StartMode start) {
+    var bucket = Collections.synchronizedList(new ArrayList<String>());
+
+    String jobId = svc.runSnapshot(topic, start,
+        recs -> { for (var r : recs) bucket.add(r.value()); },
+        () -> { /* finalize: write file from bucket if you want */ });
+
+    return Map.of("jobId", jobId, "events", "/batch/events/" + jobId);
+  }
+
+  @GetMapping(value = "/events/{jobId}", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+  public SseEmitter events(@PathVariable String jobId) {
+    return sse.register(jobId);
+  }
+}
+What the SSE stream looks like (examples)
+csharp
+Copy
+Edit
+event: state
+data: {"state":"QUEUED"}
+
+event: state
+data: {"state":"RUNNING","mode":"SNAPSHOT","startMode":"BEGINNING"}
+
+event: progress
+data: {"done":1200,"total":10000,"percent":12}
+
+event: batch
+data: {"count":500,"firstOffset":12345,"lastOffset":12844}
+
+event: state
+data: {"state":"COMPLETED"}
+Autosys / curl usage
+Start a job (snapshot mode):
+
+bash
+Copy
+Edit
+JOB=$(curl -s -X POST "http://localhost:8080/batch/run/snapshot?topic=my-topic&start=BEGINNING")
+JOB_ID=$(echo "$JOB" | jq -r .jobId)   # or parse manually
+echo "Job $JOB_ID started"
+Stream progress (SSE):
+
+bash
+Copy
+Edit
+curl -N "http://localhost:8080/batch/events/$JOB_ID"
+Start idle-based job (stop after 15s idle):
+
+bash
+Copy
+Edit
+curl -s -X POST "http://localhost:8080/batch/run/idle?topic=my-topic&idleMs=15000"
+Why this setup works
+Temporary container per request → no shared KafkaConsumer, safe lifecycle.
+
+Manual ack → no re-delivery loops.
+
+Idle POC → stops after pure inactivity; simplest operationally.
+
+Snapshot POC → uses positions vs end snapshot, so it handles transactional producers correctly.
+
+SSE → dead simple over curl; Autosys can watch logs in real time.
