@@ -1,0 +1,326 @@
+POC A (Timed / Idle-based): stop after N seconds with no delivered records
+
+POC B (Offset snapshot / transactional-safe): stop when the consumer position has caught up to a snapshot of end offsets (works with read_committed + transactions)
+
+Both use:
+
+A fresh container per call (no shared consumer)
+
+Manual acks (so we don’t loop forever)
+
+Optional hooks so you can wire your render/file-write logic
+
+Shared dependencies & config
+java
+Copy
+Edit
+// application.yml (minimal)
+spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      enable-auto-commit: false
+      isolation-level: read_committed
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+Inject the standard ConsumerFactory<String,String> that Spring Boot autoconfigures.
+
+Service: build a container per request
+java
+Copy
+Edit
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.TopicPartition;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.kafka.listener.*;
+import org.springframework.kafka.support.Acknowledgment;
+import org.springframework.stereotype.Service;
+import org.springframework.util.backoff.FixedBackOff;
+
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.function.Consumer as JConsumer;
+
+@Service
+public class TempKafkaBatchService {
+
+  private final ConsumerFactory<String, String> consumerFactory;
+
+  public TempKafkaBatchService(ConsumerFactory<String, String> consumerFactory) {
+    this.consumerFactory = consumerFactory;
+  }
+
+  /* ========== POC A: TIME/IDLE-BASED STOP ========== */
+
+  public String runTimed(String topic,
+                         long idleMillis,
+                         JConsumer<ConsumerRecord<String,String>> onRecord,
+                         Runnable onComplete,
+                         JConsumer<Throwable> onError) {
+
+    String jobId = UUID.randomUUID().toString();
+    String containerId = "batch-timed-" + jobId;
+
+    ContainerProperties cp = new ContainerProperties(topic);
+    cp.setGroupId("grp-" + jobId);               // isolate this run
+    cp.setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
+    cp.setPollTimeout(2000);
+
+    KafkaMessageListenerContainer<String,String> container =
+        new KafkaMessageListenerContainer<>(consumerFactory, cp);
+    container.setBeanName(containerId);
+    container.setAutoStartup(false);
+    container.setCommonErrorHandler(new DefaultErrorHandler(new FixedBackOff(0,0)));
+
+    // Listener with an idle watchdog
+    BatchIdleListener listener = new BatchIdleListener(container, idleMillis, onRecord, onComplete, onError);
+    container.setupMessageListener(listener);
+
+    // start the job
+    listener.beginRun();
+    container.start();
+
+    return jobId;
+  }
+
+  static final class BatchIdleListener
+      implements AcknowledgingConsumerAwareMessageListener<String,String> {
+
+    private final KafkaMessageListenerContainer<String,String> container;
+    private final long idleMs;
+    private final JConsumer<ConsumerRecord<String,String>> onRecord;
+    private final Runnable onComplete;
+    private final JConsumer<Throwable> onError;
+
+    private final AtomicBoolean finished = new AtomicBoolean(false);
+    private final AtomicBoolean running  = new AtomicBoolean(false);
+    private final AtomicLong lastRecordAt = new AtomicLong(0L);
+
+    private ScheduledExecutorService watchdog;
+
+    BatchIdleListener(KafkaMessageListenerContainer<String,String> container,
+                      long idleMs,
+                      JConsumer<ConsumerRecord<String,String>> onRecord,
+                      Runnable onComplete,
+                      JConsumer<Throwable> onError) {
+      this.container = container;
+      this.idleMs = idleMs;
+      this.onRecord = onRecord != null ? onRecord : r -> {};
+      this.onComplete = onComplete != null ? onComplete : () -> {};
+      this.onError = onError != null ? onError : e -> {};
+    }
+
+    void beginRun() {
+      finished.set(false);
+      running.set(true);
+      lastRecordAt.set(System.currentTimeMillis());
+      startWatchdog();
+    }
+
+    private void startWatchdog() {
+      if (watchdog != null) watchdog.shutdownNow();
+      watchdog = Executors.newSingleThreadScheduledExecutor();
+      long period = Math.max(1000, idleMs / 4);
+      watchdog.scheduleWithFixedDelay(() -> {
+        if (!running.get() || finished.get()) return;
+        long idleFor = System.currentTimeMillis() - lastRecordAt.get();
+        if (idleFor >= idleMs) finalizeAndStop();
+      }, idleMs, period, TimeUnit.MILLISECONDS);
+    }
+
+    private void finalizeAndStop() {
+      if (!finished.compareAndSet(false, true)) return;
+      try { onComplete.run(); }
+      catch (Throwable t) { onError.accept(t); }
+      finally {
+        running.set(false);
+        if (watchdog != null) watchdog.shutdownNow();
+        container.stop();
+      }
+    }
+
+    @Override
+    public void onMessage(ConsumerRecord<String, String> rec,
+                          Acknowledgment ack,
+                          Consumer<?, ?> consumer) {
+      try {
+        onRecord.accept(rec);                   // your render/accumulate here
+        if (ack != null) ack.acknowledge();
+        lastRecordAt.set(System.currentTimeMillis());
+      } catch (Throwable t) {
+        onError.accept(t);
+      }
+    }
+  }
+
+  /* ========== POC B: OFFSET SNAPSHOT, TRANSACTIONAL-SAFE ========== */
+
+  public String runToSnapshot(String topic,
+                              StartMode startMode,
+                              JConsumer<List<ConsumerRecord<String,String>>> onBatch,
+                              Runnable onComplete,
+                              JConsumer<Throwable> onError) {
+
+    String jobId = UUID.randomUUID().toString();
+    String containerId = "batch-snap-" + jobId;
+
+    ContainerProperties cp = new ContainerProperties(topic);
+    cp.setGroupId("grp-" + jobId);
+    cp.setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
+    cp.setPollTimeout(2000);
+
+    // Snapshot the end offsets and choose where to start when partitions are assigned
+    final Map<TopicPartition, Long> endSnapshot = new ConcurrentHashMap<>();
+    cp.setConsumerRebalanceListener(new ConsumerAwareRebalanceListener() {
+      @Override
+      public void onPartitionsAssigned(Consumer<?, ?> c, Collection<TopicPartition> parts) {
+        try {
+          // pick a start position
+          if (startMode == StartMode.BEGINNING) {
+            Map<TopicPartition, Long> begins = c.beginningOffsets(parts);
+            for (TopicPartition tp : parts) c.seek(tp, begins.get(tp));
+          } else if (startMode == StartMode.END) {
+            Map<TopicPartition, Long> ends = c.endOffsets(parts);
+            for (TopicPartition tp : parts) c.seek(tp, ends.get(tp));
+          } // else COMMITTED: do nothing
+
+          // snapshot LEO (last+1) at start time
+          Map<TopicPartition, Long> endsNow = c.endOffsets(parts);
+          endSnapshot.clear();
+          endSnapshot.putAll(endsNow);
+        } catch (Exception e) {
+          // ignore; listener error flow will handle
+        }
+      }
+    });
+
+    KafkaMessageListenerContainer<String,String> container =
+        new KafkaMessageListenerContainer<>(consumerFactory, cp);
+    container.setBeanName(containerId);
+    container.setAutoStartup(false);
+    container.setCommonErrorHandler(new DefaultErrorHandler(new FixedBackOff(0,0)));
+
+    // Batch listener avoids multiple finalize calls within one poll
+    BatchOnceListener listener = new BatchOnceListener(container, endSnapshot, onBatch, onComplete, onError);
+    container.setupMessageListener(listener);
+
+    container.start();
+    return jobId;
+  }
+
+  public enum StartMode { BEGINNING, COMMITTED, END }
+
+  static final class BatchOnceListener
+      implements BatchAcknowledgingConsumerAwareMessageListener<String,String> {
+
+    private final KafkaMessageListenerContainer<String,String> container;
+    private final Map<TopicPartition, Long> endSnapshot;
+    private final JConsumer<List<ConsumerRecord<String,String>>> onBatch;
+    private final Runnable onComplete;
+    private final JConsumer<Throwable> onError;
+
+    private final AtomicBoolean finished = new AtomicBoolean(false);
+
+    BatchOnceListener(KafkaMessageListenerContainer<String,String> container,
+                      Map<TopicPartition, Long> endSnapshot,
+                      JConsumer<List<ConsumerRecord<String,String>>> onBatch,
+                      Runnable onComplete,
+                      JConsumer<Throwable> onError) {
+      this.container = container;
+      this.endSnapshot = endSnapshot;
+      this.onBatch = onBatch != null ? onBatch : recs -> {};
+      this.onComplete = onComplete != null ? onComplete : () -> {};
+      this.onError = onError != null ? onError : e -> {};
+    }
+
+    @Override
+    public void onMessage(List<ConsumerRecord<String, String>> records,
+                          Acknowledgment ack,
+                          Consumer<?, ?> consumer) {
+      try {
+        if (!records.isEmpty()) onBatch.accept(records);   // your render/accumulate here
+        if (ack != null) ack.acknowledge();
+
+        // Check completion ONCE per poll:
+        boolean done = true;
+        for (TopicPartition tp : consumer.assignment()) {
+          long pos = consumer.position(tp);                // next to fetch (advances across txn markers)
+          long end = endSnapshot.getOrDefault(tp, Long.MAX_VALUE);
+          if (pos < end) { done = false; break; }
+        }
+
+        if (done && finished.compareAndSet(false, true)) {
+          try { onComplete.run(); } catch (Throwable t) { onError.accept(t); }
+          finally { container.stop(); }
+        }
+      } catch (Throwable t) {
+        onError.accept(t);
+        // stop on unrecoverable error to avoid loops
+        if (finished.compareAndSet(false, true)) container.stop();
+      }
+    }
+  }
+}
+How you’d call it (controller sketch)
+java
+Copy
+Edit
+@RestController
+@RequestMapping("/batch")
+public class BatchController {
+
+  private final TempKafkaBatchService svc;
+
+  public BatchController(TempKafkaBatchService svc) {
+    this.svc = svc;
+  }
+
+  // TIMED
+  @PostMapping("/run/idle")
+  public String runIdle(@RequestParam String topic,
+                        @RequestParam(defaultValue = "60000") long idleMs) {
+
+    List<String> bucket = Collections.synchronizedList(new ArrayList<>());
+
+    return svc.runTimed(
+        topic,
+        idleMs,
+        rec -> bucket.add(rec.value()),
+        () -> {
+          // finalize: write your file with bucket
+          // batchFileGenerator.generateFile(bucket, outputPath);
+        },
+        err -> { /* log */ });
+  }
+
+  // OFFSET SNAPSHOT (transactional-safe)
+  @PostMapping("/run/snapshot")
+  public String runSnapshot(@RequestParam String topic,
+                            @RequestParam(defaultValue = "BEGINNING") TempKafkaBatchService.StartMode start) {
+
+    List<String> bucket = Collections.synchronizedList(new ArrayList<>());
+
+    return svc.runToSnapshot(
+        topic,
+        start,
+        recs -> { for (var r : recs) bucket.add(r.value()); },
+        () -> {
+          // finalize: write your file with bucket
+          // batchFileGenerator.generateFile(bucket, outputPath);
+        },
+        err -> { /* log */ });
+  }
+}
+Why these POCs fix your pain points
+Per-request container: no shared KafkaConsumer, no thread-safety headaches.
+
+Manual ack: Acknowledgment is non-null; no re-delivery loops.
+
+Timed POC (idle): ignores transactional offset quirks; stops after pure inactivity.
+
+Offset POC (snapshot): uses position() >= snapshotEnd so it finishes even when offsets > delivered records (transactional markers, aborted msgs).
+
+Batch listener in snapshot POC: prevents running finalize/stop multiple times in the same poll.
