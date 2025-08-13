@@ -1,0 +1,338 @@
+Sweet — here’s everything you need to run the Spring Batch + KafkaItemReader version:
+
+POM deps (works with Spring Boot 3.x / Spring Batch 5.x)
+
+Batch config wiring KafkaItemReader + your TemplateMapper + BatchFileGenerator
+
+Controller to POST a run and GET status
+
+Notes on headers/offsets & where to tweak
+
+1) Maven (pom.xml)
+Use the Spring Boot BOM to manage versions; you only add starters:
+
+xml
+Copy
+Edit
+<project>
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.3.1</version> <!-- or your Boot 3.x -->
+    <relativePath/> 
+  </parent>
+
+  <dependencies>
+    <!-- REST endpoints to launch & poll -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+
+    <!-- Spring Batch (core + infra) -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-batch</artifactId>
+    </dependency>
+
+    <!-- Kafka client + Spring integration -->
+    <dependency>
+      <groupId>org.springframework.kafka</groupId>
+      <artifactId>spring-kafka</artifactId>
+    </dependency>
+
+    <!-- optional: JSON binding for controller payloads -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+
+    <!-- your templating lib (e.g., handlebars) if not already on classpath -->
+    <!-- <dependency>
+      <groupId>com.github.jknack</groupId>
+      <artifactId>handlebars</artifactId>
+      <version>4.4.0</version>
+    </dependency> -->
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+✅ With Boot 3.x this brings Spring Batch 5.x and a KafkaItemReader (package org.springframework.batch.item.kafka.*) via managed versions. You don’t need to pin specific versions.
+
+2) Batch config (Kafka → TemplateMapper → BatchFileGenerator)
+This wires a time-based cutoff: if no records arrive for idleMs, the step ends. It also shows how to read headers/offsets and render each message through your TemplateMapper, then write the whole file once via your BatchFileGenerator.
+
+java
+Copy
+Edit
+// IdleTerminatingReader.java
+package com.yourapp.batch;
+
+import org.springframework.batch.item.*;
+
+public class IdleTerminatingReader<T> implements ItemStreamReader<T> {
+  private final ItemStreamReader<T> delegate;
+  private final long idleMs;
+  private long lastRead;
+
+  public IdleTerminatingReader(ItemStreamReader<T> delegate, long idleMs) {
+    this.delegate = delegate; this.idleMs = idleMs;
+  }
+
+  @Override public void open(ExecutionContext ec) throws ItemStreamException {
+    delegate.open(ec); lastRead = System.currentTimeMillis();
+  }
+  @Override public void update(ExecutionContext ec) throws ItemStreamException { delegate.update(ec); }
+  @Override public void close() throws ItemStreamException { delegate.close(); }
+
+  @Override public T read() throws Exception {
+    T item = delegate.read();
+    if (item != null) { lastRead = System.currentTimeMillis(); return item; }
+    if (System.currentTimeMillis() - lastRead >= idleMs) return null; // tell Batch "we're done"
+    // brief backoff to avoid hot loop (optional)
+    Thread.sleep(Math.min(200, idleMs / 10));
+    return item; // null -> framework will call read() again
+  }
+}
+java
+Copy
+Edit
+// KafkaBatchConfig.java
+package com.yourapp.batch;
+
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.springframework.batch.core.*;
+import org.springframework.batch.core.configuration.annotation.*;
+import org.springframework.batch.core.job.builder.JobBuilder;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.core.step.builder.StepBuilder;
+import org.springframework.batch.item.*;
+import org.springframework.batch.item.kafka.KafkaItemReader;
+import org.springframework.batch.item.kafka.builder.KafkaItemReaderBuilder;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.*;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.transaction.PlatformTransactionManager;
+
+// YOUR existing beans
+import com.yourapp.transform.TemplateMapper;
+import com.yourapp.transform.BatchFileGenerator;
+
+@Configuration
+@EnableBatchProcessing
+public class KafkaBatchConfig {
+
+  // -------- READER (Kafka) --------
+  @Bean
+  @StepScope
+  public KafkaItemReader<String,String> kafkaItemReader(
+      ConsumerFactory<String,String> cf,
+      @Value("#{jobParameters['topic']}") String topic,
+      @Value("#{jobParameters['groupId'] ?: 'batch-' + T(java.util.UUID).randomUUID().toString()}") String groupId,
+      @Value("#{jobParameters['partitions'] ?: '0'}") String partitionsCsv,
+      @Value("#{jobParameters['autoOffsetReset'] ?: 'earliest'}") String autoOffsetReset) {
+
+    Map<String,Object> props = new HashMap<>(cf.getConfigurationProperties());
+    props.put("group.id", groupId);
+    props.put("enable.auto.commit", "false");
+    props.put("isolation.level", "read_committed");
+    props.put("auto.offset.reset", autoOffsetReset);
+
+    var builder = new KafkaItemReaderBuilder<String,String>()
+        .name("kafkaItemReader")
+        .topic(topic)
+        .consumerProperties(props)
+        .pollTimeout(2000);
+
+    // partitions: comma-separated list -> ints
+    for (String p : partitionsCsv.split(",")) {
+      if (!p.isBlank()) builder = builder.partitions(Integer.parseInt(p.trim()));
+    }
+
+    return builder.build();
+  }
+
+  // Wrap reader with idle cutoff
+  @Bean
+  @StepScope
+  public ItemStreamReader<ConsumerRecord<String,String>> idleReader(
+      KafkaItemReader<String,String> kafkaReader,
+      @Value("#{jobParameters['idleMs'] ?: 60000}") long idleMs) {
+    return new IdleTerminatingReader<>(kafkaReader, idleMs);
+  }
+
+  // -------- PROCESSOR (TemplateMapper) --------
+  @Bean
+  @StepScope
+  public ItemProcessor<ConsumerRecord<String,String>, String> templateProcessor(TemplateMapper mapper) {
+    return rec -> {
+      // headers example
+      var adviceHdr = rec.headers().lastHeader("ADVICE_CODE");
+      var prodHdr   = rec.headers().lastHeader("PROD_CODE");
+      String advice = adviceHdr == null ? "NA" : new String(adviceHdr.value(), StandardCharsets.UTF_8);
+      String prod   = prodHdr   == null ? "NA" : new String(prodHdr.value(),   StandardCharsets.UTF_8);
+
+      // your existing TemplateMapper API (adjust arg order to yours)
+      return mapper.mapTemplate(rec.value(), advice, prod);
+    };
+  }
+
+  // -------- WRITER (BatchFileGenerator) --------
+  /** Accumulates all rendered strings, writes once at step end. */
+  @Bean
+  @StepScope
+  public ItemStreamWriter<String> batchFileWriter(BatchFileGenerator fileGen,
+      @Value("#{jobParameters['outputPath']}") String outputPathStr) {
+
+    return new ItemStreamWriter<>() {
+      private final List<String> buffer = new CopyOnWriteArrayList<>();
+
+      @Override public void open(ExecutionContext ec) { buffer.clear(); }
+      @Override public void update(ExecutionContext ec) { /* no-op */ }
+      @Override public void close() { buffer.clear(); }
+
+      @Override
+      public void write(List<? extends String> items) {
+        buffer.addAll(items);
+      }
+
+      @BeforeStep
+      public void before(StepExecution se) { /* could clear buffer here too */ }
+
+      @AfterStep
+      public ExitStatus after(StepExecution se) {
+        try {
+          fileGen.generateFile(new ArrayList<>(buffer), java.nio.file.Path.of(outputPathStr));
+          return ExitStatus.COMPLETED;
+        } catch (Exception e) {
+          se.addFailureException(e);
+          return ExitStatus.FAILED;
+        } finally {
+          buffer.clear();
+        }
+      }
+    };
+  }
+
+  // -------- STEP & JOB --------
+  @Bean
+  public Step kafkaStep(JobRepository repo, PlatformTransactionManager tx,
+                        ItemStreamReader<ConsumerRecord<String,String>> idleReader,
+                        ItemProcessor<ConsumerRecord<String,String>, String> processor,
+                        ItemStreamWriter<String> batchFileWriter) {
+    return new StepBuilder("kafkaStep", repo)
+        .<ConsumerRecord<String,String>, String>chunk(500, tx)
+        .reader(idleReader)
+        .processor(processor)
+        .writer(batchFileWriter)
+        .build();
+  }
+
+  @Bean
+  public Job kafkaJob(JobRepository repo, Step kafkaStep) {
+    return new JobBuilder("kafkaJob", repo).start(kafkaStep).build();
+  }
+}
+Where do TemplateMapper and BatchFileGenerator come from?
+Mark them as Spring beans (@Component/@Service). The config above injects them and calls your existing methods:
+
+TemplateMapper.mapTemplate(String payload, String adviceCode, String prodCode)
+
+BatchFileGenerator.generateFile(List<String> rendered, Path outputPath)
+
+3) Controller: POST to launch, GET to poll
+java
+Copy
+Edit
+// BatchJobController.java
+package com.yourapp.api;
+
+import java.util.Map;
+import org.springframework.batch.core.*;
+import org.springframework.batch.core.explore.JobExplorer;
+import org.springframework.batch.core.launch.JobLauncher;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/batch-job")
+public class BatchJobController {
+
+  private final JobLauncher launcher;
+  private final JobExplorer explorer;
+  private final Job kafkaJob;
+
+  public BatchJobController(JobLauncher launcher, JobExplorer explorer, Job kafkaJob) {
+    this.launcher = launcher; this.explorer = explorer; this.kafkaJob = kafkaJob;
+  }
+
+  @PostMapping
+  public Map<String,Object> launch(
+      @RequestParam String topic,
+      @RequestParam(defaultValue="0") String partitions,           // e.g., "0,1,2"
+      @RequestParam(defaultValue="earliest") String autoOffsetReset,
+      @RequestParam(defaultValue="60000") long idleMs,
+      @RequestParam String outputPath) throws Exception {
+
+    JobParameters params = new JobParametersBuilder()
+        .addString("topic", topic)
+        .addString("partitions", partitions)
+        .addString("autoOffsetReset", autoOffsetReset)
+        .addLong("idleMs", idleMs)
+        .addString("outputPath", outputPath)
+        .addLong("ts", System.currentTimeMillis())   // make params unique
+        .toJobParameters();
+
+    JobExecution exec = launcher.run(kafkaJob, params);
+    return Map.of("executionId", exec.getId(), "statusUrl", "/batch-job/" + exec.getId());
+  }
+
+  @GetMapping("/{executionId}")
+  public ResponseEntity<Map<String,Object>> status(@PathVariable long executionId) {
+    JobExecution je = explorer.getJobExecution(executionId);
+    if (je == null) return ResponseEntity.notFound().build();
+    var step = je.getStepExecutions().stream().findFirst().orElse(null);
+
+    return ResponseEntity.ok(Map.of(
+        "id", je.getId(),
+        "status", je.getStatus().toString(),
+        "startTime", je.getStartTime(),
+        "endTime", je.getEndTime(),
+        "exitCode", je.getExitStatus().getExitCode(),
+        "read", step == null ? 0 : step.getReadCount(),
+        "written", step == null ? 0 : step.getWriteCount()
+    ));
+  }
+}
+Where to place your classes
+TemplateMapper — your existing implementation. Annotate with @Component and expose any helpers you already added (e.g., amount/zip helpers).
+
+BatchFileGenerator — your generator that paginates and writes the final file. Annotate with @Component. The writer calls generateFile() once at the end of the step.
+
+Headers & offsets (quick reminder)
+Inside templateProcessor you already have the ConsumerRecord:
+
+java
+Copy
+Edit
+int partition = rec.partition();
+long offset   = rec.offset();
+var hdr       = rec.headers().lastHeader("ADVICE_CODE");
+String advice = hdr == null ? "NA" : new String(hdr.value(), StandardCharsets.UTF_8);
+Pass these into your TemplateMapper if needed (or include them in the final layout).
+
+If you also want the “snapshot/offset-based stop”
+The Batch version above uses idleMs to finish. If you prefer the snapshot end offset logic (to guarantee a bounded batch at start time), use the temporary-listener POC we built earlier for snapshot mode. Spring Batch’s KafkaItemReader doesn’t expose Consumer methods to check position() inside the step; doing snapshot-stop is much easier with the listener-container POC.
