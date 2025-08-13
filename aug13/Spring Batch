@@ -1,0 +1,144 @@
+2) Spring Batch + KafkaItemReader (time-poll + header/offset access)
+Use this if you want first-class Job/Step metadata, restartability, and Spring Batch dashboards.
+
+Reader wrapper that stops after being idle for N ms
+java
+Copy
+Edit
+/** Wrap any ItemStreamReader to stop after idleMs with no items. */
+public class IdleTerminatingReader<T> implements ItemStreamReader<T> {
+  private final ItemStreamReader<T> delegate;
+  private final long idleMs;
+  private long lastRead = System.currentTimeMillis();
+  public IdleTerminatingReader(ItemStreamReader<T> delegate, long idleMs) { this.delegate = delegate; this.idleMs = idleMs; }
+  @Override public void open(ExecutionContext ec) { delegate.open(ec); lastRead = System.currentTimeMillis(); }
+  @Override public void update(ExecutionContext ec) { delegate.update(ec); }
+  @Override public void close() { delegate.close(); }
+  @Override public T read() throws Exception {
+    T item = delegate.read();
+    if (item != null) { lastRead = System.currentTimeMillis(); return item; }
+    if (System.currentTimeMillis() - lastRead >= idleMs) return null; // end step
+    return item; // null -> framework will re-call read(); you can also Thread.sleep() here minimally
+  }
+}
+Batch configuration
+java
+Copy
+Edit
+@Configuration
+@EnableBatchProcessing
+public class KafkaBatchConfig {
+
+  @Bean
+  public KafkaItemReader<String, String> kafkaItemReader(ConsumerFactory<String,String> cf) {
+    // Spring Batch KafkaItemReader (builder name may vary by version)
+    Map<String, Object> props = new HashMap<>(cf.getConfigurationProperties());
+    // ensure a unique group per launch or commit-based resume
+    props.put("group.id", "batch-" + java.util.UUID.randomUUID());
+    props.put("enable.auto.commit", "false");
+    props.put("isolation.level", "read_committed");
+    // to start at earliest *for a new group*:
+    props.put("auto.offset.reset", "earliest");
+
+    return new org.springframework.batch.item.kafka.builder.KafkaItemReaderBuilder<String,String>()
+        .partitions(0)                    // add more if needed
+        .topic("your-topic")
+        .consumerProperties(props)
+        .name("kafkaItemReader")
+        .pollTimeout(2000)               // ms
+        .build();
+  }
+
+  @Bean
+  public ItemProcessor<ConsumerRecord<String,String>, Map<String,Object>> headerProcessor() {
+    return rec -> {
+      Map<String,Object> m = new LinkedHashMap<>();
+      m.put("partition", rec.partition());
+      m.put("offset", rec.offset());
+      m.put("value", rec.value());
+      var h = rec.headers().lastHeader("ADVICE_CODE");
+      m.put("adviceCode", h==null?null:new String(h.value(), java.nio.charset.StandardCharsets.UTF_8));
+      return m;
+    };
+  }
+
+  @Bean
+  public ItemWriter<Map<String,Object>> writer(JobRepository repo, JobStore store) {
+    return items -> {
+      // write to file/db etc. or update JobStore counts
+      // e.g., accumulate to a file
+    };
+  }
+
+  @Bean
+  public Step kafkaStep(JobRepository repo, PlatformTransactionManager tm,
+                        KafkaItemReader<String,String> reader,
+                        ItemProcessor<ConsumerRecord<String,String>, Map<String,Object>> proc,
+                        ItemWriter<Map<String,Object>> writer,
+                        @Value("${batch.idle.ms:60000}") long idleMs) {
+    var idleReader = new IdleTerminatingReader<>(reader, idleMs);
+    return new StepBuilder("kafkaStep", repo)
+        .<ConsumerRecord<String,String>, Map<String,Object>>chunk(500, tm)
+        .reader(idleReader)
+        .processor(proc)
+        .writer(writer)
+        .build();
+  }
+
+  @Bean
+  public Job kafkaJob(JobRepository repo, Step kafkaStep) {
+    return new JobBuilder("kafkaJob", repo).start(kafkaStep).build();
+  }
+}
+REST endpoints to launch and poll a Spring Batch job
+java
+Copy
+Edit
+@RestController
+@RequestMapping("/batch-job")
+public class BatchJobController {
+
+  private final JobLauncher launcher;
+  private final JobExplorer explorer;
+  private final Job kafkaJob;
+
+  public BatchJobController(JobLauncher launcher, JobExplorer explorer, Job kafkaJob) {
+    this.launcher = launcher; this.explorer = explorer; this.kafkaJob = kafkaJob;
+  }
+
+  @PostMapping
+  public Map<String,Object> launch(@RequestParam(defaultValue="60000") long idleMs) throws Exception {
+    JobParameters params = new JobParametersBuilder()
+        .addLong("ts", System.currentTimeMillis())
+        .addLong("idleMs", idleMs)
+        .toJobParameters();
+    JobExecution exec = launcher.run(kafkaJob, params);
+    return Map.of("executionId", exec.getId(), "statusUrl", "/batch-job/" + exec.getId());
+  }
+
+  @GetMapping("/{executionId}")
+  public ResponseEntity<Map<String,Object>> status(@PathVariable long executionId) {
+    JobExecution je = explorer.getJobExecution(executionId);
+    if (je == null) return ResponseEntity.notFound().build();
+    var step = je.getStepExecutions().stream().findFirst().orElse(null);
+    Map<String,Object> out = new LinkedHashMap<>();
+    out.put("id", je.getId());
+    out.put("status", je.getStatus().toString());
+    out.put("startTime", je.getStartTime());
+    out.put("endTime", je.getEndTime());
+    if (step != null) {
+      out.put("readCount", step.getReadCount());
+      out.put("writeCount", step.getWriteCount());
+      out.put("commitCount", step.getCommitCount());
+      out.put("exitStatus", step.getExitStatus().getExitCode());
+    }
+    return ResponseEntity.ok(out);
+  }
+}
+Notes for KafkaItemReader:
+
+You get headers, partition, offset in the ConsumerRecord passed to your processor.
+
+Time-based stop is achieved with IdleTerminatingReader (returns null after idle → step completes).
+
+Starting position: for new group.id you can set auto.offset.reset=earliest. For strict offsets per partition, upgrade to a Batch version that supports partitionInitialOffsets on the builder, or implement a small ItemStreamReader based on a KafkaConsumer where you seek() explicitly.
