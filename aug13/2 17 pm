@@ -1,0 +1,538 @@
+you got it — here’s a clean, from-scratch Spring Boot 3 / Spring Batch 5 setup that:
+
+reads all Kafka consumer settings from application.yml (incl. group.id)
+
+uses KafkaItemReader + an idle cutoff wrapper
+
+reads headers (ADVICE_CODE, PROD_CODE) and passes them to your TemplateMapper
+
+buffers rendered lines and writes one file with a BatchFileGenerator that implements your page rules (65 lines, page # on 65, 63–64 blank, address rules, 72/69 wrapping, etc.)
+
+exposes POST to launch and GET to poll status
+
+Replace package names (com.example.mailservice) with yours.
+
+0) pom.xml
+xml
+Copy
+Edit
+<project>
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.3.1</version>
+    <relativePath/>
+  </parent>
+
+  <dependencies>
+    <!-- REST -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+
+    <!-- Spring Batch 5 -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-batch</artifactId>
+    </dependency>
+
+    <!-- Kafka + Spring integration -->
+    <dependency>
+      <groupId>org.springframework.kafka</groupId>
+      <artifactId>spring-kafka</artifactId>
+    </dependency>
+
+    <!-- Jackson (headers decoding convenience, controller JSON) -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+
+    <!-- Optional: Lombok (if you like) -->
+    <dependency>
+      <groupId>org.projectlombok</groupId>
+      <artifactId>lombok</artifactId>
+      <optional>true</optional>
+    </dependency>
+
+    <!-- Optional: Handlebars if your TemplateMapper really renders templates -->
+    <!--
+    <dependency>
+      <groupId>com.github.jknack</groupId>
+      <artifactId>handlebars</artifactId>
+      <version>4.4.0</version>
+    </dependency>
+    -->
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+1) application.yml (authoritative Kafka config)
+yaml
+Copy
+Edit
+spring:
+  application:
+    name: mail-service
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: mail-batch-default         # <- only here; code doesn’t override it
+      enable-auto-commit: false
+      isolation-level: read_committed
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    properties:
+      max.poll.records: 1000
+
+spring.batch.job.enabled: false
+
+app:
+  batch:
+    idle-ms: 60000           # reader finishes after this idle time
+    poll-timeout-ms: 2000    # KafkaItemReader poll timeout
+2) Idle cutoff wrapper
+java
+Copy
+Edit
+package com.example.mailservice.batch.util;
+
+import org.springframework.batch.item.ExecutionContext;
+import org.springframework.batch.item.ItemStreamException;
+import org.springframework.batch.item.ItemStreamReader;
+
+/** Wrap any ItemStreamReader; end the step when no items arrive for idleMs. */
+public class IdleTerminatingReader<T> implements ItemStreamReader<T> {
+  private final ItemStreamReader<T> delegate;
+  private final long idleMs;
+  private long lastRead;
+
+  public IdleTerminatingReader(ItemStreamReader<T> delegate, long idleMs) {
+    this.delegate = delegate; this.idleMs = idleMs;
+  }
+
+  @Override public void open(ExecutionContext ec) throws ItemStreamException {
+    delegate.open(ec); lastRead = System.currentTimeMillis();
+  }
+  @Override public void update(ExecutionContext ec) throws ItemStreamException { delegate.update(ec); }
+  @Override public void close() throws ItemStreamException { delegate.close(); }
+
+  @Override
+  public T read() throws Exception {
+    T item = delegate.read();
+    if (item != null) { lastRead = System.currentTimeMillis(); return item; }
+    if (System.currentTimeMillis() - lastRead >= idleMs) return null; // end step
+    Thread.sleep(Math.min(200, Math.max(10, idleMs / 10)));
+    return item; // null -> framework calls read() again
+  }
+}
+3) Batch config (Kafka → TemplateMapper → BatchFileGenerator)
+java
+Copy
+Edit
+package com.example.mailservice.batch;
+
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.springframework.batch.core.Job;
+import org.springframework.batch.core.Step;
+import org.springframework.batch.core.configuration.annotation.EnableBatchProcessing;
+import org.springframework.batch.core.job.builder.JobBuilder;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.core.step.builder.StepBuilder;
+import org.springframework.batch.item.Chunk;
+import org.springframework.batch.item.ExecutionContext;
+import org.springframework.batch.item.ItemProcessor;
+import org.springframework.batch.item.ItemStreamException;
+import org.springframework.batch.item.ItemStreamReader;
+import org.springframework.batch.item.ItemStreamWriter;
+import org.springframework.batch.item.kafka.KafkaItemReader;
+import org.springframework.batch.item.kafka.builder.KafkaItemReaderBuilder;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.StepScope;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.transaction.PlatformTransactionManager;
+
+import com.example.mailservice.batch.util.IdleTerminatingReader;
+import com.example.mailservice.transform.TemplateMapper;
+import com.example.mailservice.transform.BatchFileGenerator;
+
+@Configuration
+@EnableBatchProcessing
+public class KafkaBatchConfig {
+
+  // ---------- KafkaItemReader from YAML ConsumerFactory ----------
+  @Bean
+  @StepScope
+  public KafkaItemReader<String,String> kafkaItemReader(
+      ConsumerFactory<String,String> consumerFactory,
+      @Value("#{jobParameters['topic']}") String topic,
+      @Value("#{jobParameters['partitions'] ?: '0'}") String partitionsCsv,
+      @Value("${app.batch.poll-timeout-ms:2000}") long pollTimeoutMs) {
+
+    var builder = new KafkaItemReaderBuilder<String,String>()
+        .name("kafkaItemReader")
+        .topic(topic)
+        .consumerFactory(consumerFactory) // pulls group.id, deserializers, etc. from YAML
+        .pollTimeout(pollTimeoutMs);
+
+    for (String p : partitionsCsv.split(",")) {
+      if (!p.isBlank()) builder = builder.partitions(Integer.parseInt(p.trim()));
+    }
+    return builder.build();
+  }
+
+  // ---------- Wrap reader with idle cutoff ----------
+  @Bean
+  @StepScope
+  public ItemStreamReader<ConsumerRecord<String,String>> idleReader(
+      ItemStreamReader<ConsumerRecord<String,String>> kafkaReader,
+      @Value("#{jobParameters['idleMs'] ?: ${app.batch.idle-ms:60000}}") long idleMs) {
+    return new IdleTerminatingReader<ConsumerRecord<String,String>>(kafkaReader, idleMs);
+  }
+
+  // ---------- PROCESSOR: read headers, call your mapper ----------
+  @Bean
+  @StepScope
+  public ItemProcessor<ConsumerRecord<String,String>, String> templateProcessor(TemplateMapper mapper) {
+    return rec -> {
+      var adviceHdr = rec.headers().lastHeader("ADVICE_CODE");
+      var prodHdr   = rec.headers().lastHeader("PROD_CODE");
+      String advice = adviceHdr == null ? "NA" : new String(adviceHdr.value(), StandardCharsets.UTF_8);
+      String prod   = prodHdr   == null ? "NA" : new String(prodHdr.value(),   StandardCharsets.UTF_8);
+      return mapper.mapTemplate(rec.value(), advice, prod); // adjust signature if needed
+    };
+  }
+
+  // ---------- WRITER: buffer all and write one file ----------
+  @Bean
+  @StepScope
+  public ItemStreamWriter<String> batchFileWriter(
+      BatchFileGenerator fileGen,
+      @Value("#{jobParameters['outputPath']}") String outputPathStr) {
+
+    return new ItemStreamWriter<>() {
+      private final List<String> buffer = new ArrayList<>();
+      @Override public void open(ExecutionContext ec) throws ItemStreamException { buffer.clear(); }
+      @Override public void update(ExecutionContext ec) throws ItemStreamException { }
+      @Override public void close() throws ItemStreamException {
+        try { fileGen.generateFile(new ArrayList<>(buffer), java.nio.file.Path.of(outputPathStr)); }
+        catch (Exception e) { throw new ItemStreamException("Batch file write failed", e); }
+        finally { buffer.clear(); }
+      }
+      @Override public void write(Chunk<? extends String> chunk) { buffer.addAll(chunk.getItems()); }
+    };
+  }
+
+  // ---------- STEP & JOB ----------
+  @Bean
+  public Step kafkaStep(JobRepository repo, PlatformTransactionManager tx,
+                        ItemStreamReader<ConsumerRecord<String,String>> idleReader,
+                        ItemProcessor<ConsumerRecord<String,String>, String> processor,
+                        ItemStreamWriter<String> writer) {
+    return new StepBuilder("kafkaStep", repo)
+        .<ConsumerRecord<String,String>, String>chunk(500, tx)
+        .reader(idleReader)
+        .processor(processor)
+        .writer(writer)
+        .build();
+  }
+
+  @Bean
+  public Job kafkaJob(JobRepository repo, Step kafkaStep) {
+    return new JobBuilder("kafkaJob", repo).start(kafkaStep).build();
+  }
+}
+4) Controller (POST to launch, GET to poll)
+java
+Copy
+Edit
+package com.example.mailservice.api;
+
+import java.util.Map;
+import org.springframework.batch.core.Job;
+import org.springframework.batch.core.JobExecution;
+import org.springframework.batch.core.explore.JobExplorer;
+import org.springframework.batch.core.launch.JobLauncher;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.core.JobParameters;
+import org.springframework.batch.core.JobParametersBuilder;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/batch-job")
+public class BatchJobController {
+
+  private final JobLauncher launcher;
+  private final JobExplorer explorer;
+  private final Job kafkaJob;
+
+  public BatchJobController(JobLauncher launcher, JobExplorer explorer, Job kafkaJob) {
+    this.launcher = launcher; this.explorer = explorer; this.kafkaJob = kafkaJob;
+  }
+
+  @PostMapping
+  public Map<String,Object> launch(@RequestParam String topic,
+                                   @RequestParam(defaultValue="0") String partitions,
+                                   @RequestParam(defaultValue="60000") long idleMs,
+                                   @RequestParam String outputPath) throws Exception {
+
+    JobParameters params = new JobParametersBuilder()
+        .addString("topic", topic)
+        .addString("partitions", partitions)
+        .addLong("idleMs", idleMs)
+        .addString("outputPath", outputPath)
+        .addLong("ts", System.currentTimeMillis()) // uniqueness
+        .toJobParameters();
+
+    JobExecution exec = launcher.run(kafkaJob, params);
+    return Map.of("executionId", exec.getId(), "statusUrl", "/batch-job/" + exec.getId());
+  }
+
+  @GetMapping("/{executionId}")
+  public ResponseEntity<Map<String,Object>> status(@PathVariable long executionId) {
+    var je = explorer.getJobExecution(executionId);
+    if (je == null) return ResponseEntity.notFound().build();
+    var step = je.getStepExecutions().stream().findFirst().orElse(null);
+    return ResponseEntity.ok(Map.of(
+        "id", je.getId(),
+        "status", je.getStatus().toString(),
+        "startTime", je.getStartTime(),
+        "endTime", je.getEndTime(),
+        "exitCode", je.getExitStatus().getExitCode(),
+        "read", step == null ? 0 : step.getReadCount(),
+        "written", step == null ? 0 : step.getWriteCount()
+    ));
+  }
+}
+5) TemplateMapper (stub – plug your real implementation)
+java
+Copy
+Edit
+package com.example.mailservice.transform;
+
+import org.springframework.stereotype.Component;
+
+/** Replace with your real renderer (Handlebars, etc.). */
+@Component
+public class TemplateMapper {
+
+  /**
+   * @param payload   raw message (often JSON or already-rendered text)
+   * @param advice    from header ADVICE_CODE (or "NA")
+   * @param prod      from header PROD_CODE (or "NA")
+   * @return fully rendered, multi-line text for one document/message
+   */
+  public String mapTemplate(String payload, String advice, String prod) {
+    // If you already render templates elsewhere, just return payload.
+    // Or pick a template based on prod/advice and render with payload.
+    return payload;
+  }
+}
+6) BatchFileGenerator (implements your page layout)
+java
+Copy
+Edit
+package com.example.mailservice.transform;
+
+import java.io.IOException;
+import java.nio.file.*;
+import java.util.*;
+import org.springframework.stereotype.Component;
+
+/**
+ * Builds pages with these rules:
+ * - 65 lines per page (1-indexed)
+ * - line 1 = "1" always
+ * - line 2 = "#" only on FIRST page
+ * - page number on line 65 ("Page %02d")
+ * - lines 63 and 64 blank
+ * - address block appears on SECOND+ pages starting at line 8,
+ *   followed by two blank lines, then content
+ * - For first page, we assume the template already contains address;
+ *   we do not re-print the address from generator.
+ * - Content wrapping: each logical content line is wrapped as:
+ *     first visual line: leading " " + up to 72 chars
+ *     subsequent visual lines: leading "   " + up to 69 chars
+ * - Each stored line is padded to LINE_LENGTH
+ */
+@Component
+public class BatchFileGenerator {
+
+  private static final int PAGE_LINES = 65;
+  private static final int CONTENT_LAST_LINE = 62; // 63-64 blank, 65 page number
+  private static final int LINE_ID_LINE = 1;
+  private static final int FIRST_PAGE_HASH_LINE = 2;
+  private static final int FIRST_PAGE_ADDRESS_START = 17; // informational; we don't print on page 1
+  private static final int NEXT_PAGE_ADDRESS_START = 8;
+  private static final int PAGE_NUMBER_LINE = 65;
+  private static final int LINE_LENGTH = 133;
+
+  private static final String END_ADDRESS_MARKER = "[END_ADDRESS]";
+  private static final String SKIP_LINE_MARKER = "_SKIP_LINE_";
+
+  private static String pad(String s) {
+    if (s == null) s = "";
+    if (s.length() >= LINE_LENGTH) return s.substring(0, LINE_LENGTH);
+    return s + " ".repeat(LINE_LENGTH - s.length());
+  }
+
+  public void generateFile(List<String> renderedMessages, Path outputPath) {
+    List<String> out = new ArrayList<>();
+    out.add(getBannerPage()); // if you have a banner, otherwise remove
+
+    int pageCounter = 1;
+    for (String message : renderedMessages) {
+      SplitResult split = extractLines(message);
+      List<String> content = split.contentLines();
+      List<String> address = split.addressBlock();
+
+      boolean firstPage = true;
+      int idx = 0;
+
+      while (idx < content.size()) {
+        List<String> page = blankPage();
+
+        // header
+        page.set(LINE_ID_LINE - 1, pad("1"));
+        if (firstPage) {
+          page.set(FIRST_PAGE_HASH_LINE - 1, pad("#"));
+        }
+
+        // address on second+ pages
+        int contentStartLine;
+        if (firstPage) {
+          contentStartLine = Math.max(FIRST_PAGE_HASH_LINE + 1, LINE_ID_LINE + 1);
+        } else {
+          int aLine = NEXT_PAGE_ADDRESS_START;
+          for (String a : address) {
+            if (aLine > CONTENT_LAST_LINE) break;
+            page.set(aLine - 1, pad(a));
+            aLine++;
+          }
+          if (aLine <= CONTENT_LAST_LINE) { page.set(aLine - 1, pad("")); aLine++; }
+          if (aLine <= CONTENT_LAST_LINE) { page.set(aLine - 1, pad("")); aLine++; }
+          contentStartLine = aLine;
+        }
+
+        // content
+        int linePtr = contentStartLine;
+        while (idx < content.size() && linePtr <= CONTENT_LAST_LINE) {
+          String raw = content.get(idx++);
+          for (String vis : wrapContent(raw)) {
+            if (linePtr > CONTENT_LAST_LINE) break;
+            page.set(linePtr - 1, pad(vis));
+            linePtr++;
+          }
+        }
+
+        // footer page number
+        page.set(PAGE_NUMBER_LINE - 1, pad(String.format("Page %02d", pageCounter++)));
+
+        out.add(String.join("\r\n", page));
+        firstPage = false;
+      }
+    }
+
+    try {
+      Files.createDirectories(outputPath.getParent());
+      Files.writeString(outputPath, String.join("\r\n", out),
+          StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+    } catch (IOException e) {
+      throw new RuntimeException("Error writing batch file", e);
+    }
+  }
+
+  // ---- helpers ----
+
+  private List<String> blankPage() {
+    List<String> page = new ArrayList<>(PAGE_LINES);
+    for (int i = 0; i < PAGE_LINES; i++) page.add(pad(""));
+    return page;
+  }
+
+  /** Split incoming rendered text into addressBlock (until marker) & remaining content. */
+  private SplitResult extractLines(String message) {
+    List<String> content = new ArrayList<>();
+    List<String> address = new ArrayList<>();
+    String[] lines = message.split("\\r?\\n");
+    boolean isAddress = true;
+
+    for (String line : lines) {
+      if (line.contains(SKIP_LINE_MARKER)) continue;
+      if (line.contains(END_ADDRESS_MARKER)) { isAddress = false; continue; }
+      if (isAddress) address.add(line);
+      content.add(line);
+    }
+    return new SplitResult(address, content);
+  }
+
+  /** Wrap a logical content line with rules: " " + 72, then "   " + 69... */
+  private List<String> wrapContent(String s) {
+    List<String> out = new ArrayList<>();
+    if (s == null) { out.add(""); return out; }
+    String text = s;
+    int idx = 0;
+
+    // first line: 1 leading space, max 72 chars
+    int firstTake = Math.min(72, text.length() - idx);
+    out.add(" " + text.substring(idx, idx + firstTake));
+    idx += firstTake;
+
+    // continuations: 3 leading spaces, max 69 chars
+    while (idx < text.length()) {
+      int take = Math.min(69, text.length() - idx);
+      out.add("   " + text.substring(idx, idx + take));
+      idx += take;
+    }
+    return out;
+  }
+
+  /** Replace with your real banner, or return empty string to skip. */
+  private String getBannerPage() {
+    return pad(" "); // a single blank page block start (can be empty: return "";)
+  }
+
+  // data holder
+  public static final class SplitResult {
+    private final List<String> addressBlock;
+    private final List<String> contentLines;
+    public SplitResult(List<String> addressBlock, List<String> contentLines) {
+      this.addressBlock = addressBlock; this.contentLines = contentLines;
+    }
+    public List<String> addressBlock() { return addressBlock; }
+    public List<String> contentLines() { return contentLines; }
+  }
+}
+If your first page already contains the address in the template (as you said), leaving address printing to second+ pages only here is correct.
+
+7) How to run
+POST (start job):
+
+javascript
+Copy
+Edit
+POST http://localhost:8080/batch-job
+  ?topic=your-topic
+  &partitions=0            // comma-separated if multiple
+  &idleMs=15000            // stop after 15s with no new messages
+  &outputPath=/tmp/batch-output.txt
+GET (poll status):
+
+bash
+Copy
+Edit
+GET  http://localhost:8080/batch-job/{executionId}
