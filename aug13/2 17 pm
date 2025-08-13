@@ -1,3 +1,42 @@
+dd deps (if not already):
+
+xml
+Copy
+Edit
+<!-- JDBC + Hikari -->
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-jdbc</artifactId>
+</dependency>
+
+<!-- H2 for Batch metadata tables -->
+<dependency>
+  <groupId>com.h2database</groupId>
+  <artifactId>h2</artifactId>
+  <scope>runtime</scope>
+</dependency>
+application.yml:
+
+yaml
+Copy
+Edit
+spring:
+  datasource:
+    url: jdbc:h2:mem:batchdb;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  h2:
+    console:
+      enabled: true
+
+  batch:
+    jdbc:
+      initialize-schema: always   # create BATCH_* tables on startup
+Restart the app. The BATCH_* tables will be created automatically, and your POST/GET flow should work.
+
+--------------
+
 you got it — here’s a clean, from-scratch Spring Boot 3 / Spring Batch 5 setup that:
 
 reads all Kafka consumer settings from application.yml (incl. group.id)
