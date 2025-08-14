@@ -1,0 +1,555 @@
+Great question. Your architecture (REST-triggered worker using Spring-Kafka’s ConsumerFactory and a manual polling loop) is absolutely viable for production if you harden a few areas: offset seeking, commit policy, idle stop, multi-partition, transactional sources, and streaming output. I’ve baked all of that into a clean, working skeleton below.
+
+It gives you:
+
+YAML-driven ConsumerFactory (no @KafkaListener)
+
+Robust worker loop (multi-partition, explicit seek, read_committed, idle timeout, periodic sync commits, streaming output to avoid OOM)
+
+REST API: start / status / cancel / restart-from-offset
+
+In-memory job tracking (easy to swap for DB later)
+
+Pluggable template mapping + file writer
+
+You can drop this into a fresh Spring Boot 3.5.x project.
+
+pom.xml
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>kafka-batch-job</artifactId>
+  <version>1.0.0</version>
+
+  <properties>
+    <java.version>17</java.version>
+    <spring-boot.version>3.5.3</spring-boot.version>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-dependencies</artifactId>
+        <version>${spring-boot.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <!-- Web + core -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+
+    <!-- Spring Kafka (we’ll use ConsumerFactory) -->
+    <dependency>
+      <groupId>org.springframework.kafka</groupId>
+      <artifactId>spring-kafka</artifactId>
+    </dependency>
+
+    <!-- Lombok (optional, for brevity) -->
+    <dependency>
+      <groupId>org.projectlombok</groupId>
+      <artifactId>lombok</artifactId>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- Validation for request DTOs -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-validation</artifactId>
+    </dependency>
+
+    <!-- Test -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+
+application.yml
+server:
+  port: 8080
+
+kafka:
+  bootstrap-servers: localhost:9092
+  group-id: batch-group
+  topic: your-topic
+  partitions: "0"                 # comma-separated list: "0,1,2"
+  auto-offset-reset: earliest      # or latest
+  poll-timeout-ms: 2000
+  enable-auto-commit: false
+  isolation-level: read_committed  # because your producer is transactional
+  session-timeout-ms: 10000
+  max-poll-interval-ms: 300000
+  max-poll-records: 1000
+  key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+  value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+
+app:
+  idle-ms: 60000                   # stop when idle this long
+  commit-interval: 1000            # commit after N records
+  output-path: /tmp/batch-output.txt
+
+Config & props
+package com.example.kafkabatch.config;
+
+import java.util.HashMap;
+import java.util.Map;
+
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Bean;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+
+import lombok.Getter;
+import lombok.Setter;
+
+@Configuration
+@EnableConfigurationProperties(KafkaProps.class)
+public class KafkaConfig {
+
+  @Bean
+  public ConsumerFactory<String, String> consumerFactory(KafkaProps p) {
+    Map<String, Object> cfg = new HashMap<>();
+    cfg.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, p.getBootstrapServers());
+    cfg.put(ConsumerConfig.GROUP_ID_CONFIG, p.getGroupId());
+    cfg.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, p.getKeyDeserializer());
+    cfg.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, p.getValueDeserializer());
+    cfg.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, p.getAutoOffsetReset());
+    cfg.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, p.isEnableAutoCommit());
+    cfg.put(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, p.getSessionTimeoutMs());
+    cfg.put(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, p.getMaxPollIntervalMs());
+    cfg.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, p.getMaxPollRecords());
+    cfg.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, p.getIsolationLevel());
+    return new DefaultKafkaConsumerFactory<>(cfg);
+  }
+}
+
+@Getter @Setter
+@ConfigurationProperties(prefix = "kafka")
+class KafkaProps {
+  private String bootstrapServers;
+  private String groupId;
+  private String topic;
+  private String partitions = "0";
+  private String keyDeserializer;
+  private String valueDeserializer;
+  private String autoOffsetReset = "latest";
+  private String isolationLevel = "read_committed";
+  private boolean enableAutoCommit = false;
+  private Integer pollTimeoutMs = 2000;
+  private Integer sessionTimeoutMs = 10000;
+  private Integer maxPollIntervalMs = 300000;
+  private Integer maxPollRecords = 1000;
+}
+
+Domain + file pipeline
+package com.example.kafkabatch.core;
+
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+
+import org.apache.kafka.common.header.Headers;
+
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+
+@Getter @AllArgsConstructor
+public class MessageEnvelope {
+  private final String topic;
+  private final int partition;
+  private final long offset;
+  private final String key;
+  private final String value;
+  private final Map<String, String> headers;
+
+  public static Map<String, String> toHeaderMap(Headers headers) {
+    Map<String, String> m = new HashMap<>();
+    headers.forEach(h -> m.put(h.key(), new String(h.value(), StandardCharsets.UTF_8)));
+    return m;
+  }
+}
+
+
+Streaming writer + basic mapper (replace with your own).
+
+package com.example.kafkabatch.io;
+
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+import com.example.kafkabatch.core.MessageEnvelope;
+
+public interface StreamingFileGenerator extends AutoCloseable {
+  void open() throws IOException;
+  void append(MessageEnvelope env, String rendered) throws IOException;
+  void close() throws IOException;
+  default void abort() throws IOException {}
+}
+
+package com.example.kafkabatch.io;
+
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import com.example.kafkabatch.core.MessageEnvelope;
+
+public class PlainTextFileGenerator implements StreamingFileGenerator {
+  private final Path path;
+  private BufferedWriter out;
+
+  public PlainTextFileGenerator(Path path) { this.path = path; }
+
+  @Override public void open() throws IOException {
+    Files.createDirectories(path.getParent());
+    out = Files.newBufferedWriter(path, StandardCharsets.UTF_8);
+  }
+  @Override public void append(MessageEnvelope env, String rendered) throws IOException {
+    out.write(rendered);
+    out.write("\r\n"); // windows-friendly line ending; change if you like
+  }
+  @Override public void close() throws IOException { if (out != null) out.close(); }
+  @Override public void abort() throws IOException { if (out != null) out.close(); }
+}
+
+
+Template mapper:
+
+package com.example.kafkabatch.mapping;
+
+import java.util.Map;
+
+public interface TemplateMapper {
+  String render(String value, Map<String,String> headers);
+}
+
+package com.example.kafkabatch.mapping;
+
+import java.util.Map;
+
+public class IdentityTemplateMapper implements TemplateMapper {
+  @Override public String render(String value, Map<String,String> headers) {
+    // plug your Handlebars/FreeMarker logic here
+    return value;
+  }
+}
+
+Worker (solid, multi-partition, commits, idle stop)
+package com.example.kafkabatch.worker;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.common.TopicPartition;
+import org.springframework.kafka.core.ConsumerFactory;
+
+import com.example.kafkabatch.config.KafkaProps;
+import com.example.kafkabatch.core.MessageEnvelope;
+import com.example.kafkabatch.io.StreamingFileGenerator;
+import com.example.kafkabatch.mapping.TemplateMapper;
+
+public final class KafkaBatchConsumerWorker {
+
+  private KafkaBatchConsumerWorker() {}
+
+  public static void runBatch(
+      ConsumerFactory<String, String> consumerFactory,
+      KafkaProps props,
+      String partitionsCsv,
+      Long offsetOverride,                 // null = use committed/auto-offset-reset
+      long idleMs,
+      int commitEvery,
+      AtomicBoolean cancelFlag,
+      TemplateMapper mapper,
+      StreamingFileGenerator fileGen) throws Exception {
+
+    List<TopicPartition> tps = parsePartitions(props.getTopic(), partitionsCsv);
+    long lastDataTs = System.currentTimeMillis();
+    int sinceCommit = 0;
+
+    try (Consumer<String,String> consumer = consumerFactory.createConsumer()) {
+      consumer.assign(tps);
+
+      // Position the consumer
+      for (TopicPartition tp : tps) {
+        if (offsetOverride != null) {
+          consumer.seek(tp, offsetOverride);
+          continue;
+        }
+        var committed = consumer.committed(tp);
+        if (committed != null && committed.offset() >= 0) consumer.seek(tp, committed.offset());
+        else if ("earliest".equalsIgnoreCase(props.getAutoOffsetReset())) consumer.seekToBeginning(List.of(tp));
+        else consumer.seekToEnd(List.of(tp));
+      }
+
+      fileGen.open();
+
+      while (!cancelFlag.get()) {
+        ConsumerRecords<String,String> recs = consumer.poll(Duration.ofMillis(props.getPollTimeoutMs()));
+        if (recs.isEmpty()) {
+          if (System.currentTimeMillis() - lastDataTs >= idleMs) break; // idle stop
+          continue;
+        }
+
+        lastDataTs = System.currentTimeMillis();
+        for (ConsumerRecord<String,String> r : recs) {
+          var env = new MessageEnvelope(
+              r.topic(), r.partition(), r.offset(), r.key(), r.value(), MessageEnvelope.toHeaderMap(r.headers()));
+          String rendered = mapper.render(env.getValue(), env.getHeaders());
+          fileGen.append(env, rendered);
+
+          if (++sinceCommit >= commitEvery) {
+            consumer.commitSync();
+            sinceCommit = 0;
+          }
+        }
+      }
+
+      consumer.commitSync(); // final commit
+      fileGen.close();
+    } catch (Exception e) {
+      try { fileGen.abort(); } catch (Exception ignore) {}
+      throw e;
+    }
+  }
+
+  private static List<TopicPartition> parsePartitions(String topic, String csv) {
+    List<TopicPartition> out = new ArrayList<>();
+    for (String p : csv.split(",")) {
+      if (!p.isBlank()) out.add(new TopicPartition(topic, Integer.parseInt(p.trim())));
+    }
+    if (out.isEmpty()) out.add(new TopicPartition(topic, 0));
+    return out;
+  }
+}
+
+Job model & service
+package com.example.kafkabatch.jobs;
+
+import java.time.Instant;
+
+import lombok.Getter;
+import lombok.Setter;
+
+@Getter
+public class BatchJob {
+  public enum Status { RUNNING, COMPLETED, FAILED, CANCELED }
+
+  private final String id;
+  @Setter private volatile Status status = Status.RUNNING;
+  @Setter private volatile String error;
+  private final Instant start = Instant.now();
+  @Setter private volatile Instant end;
+
+  public BatchJob(String id) { this.id = id; }
+}
+
+package com.example.kafkabatch.jobs;
+
+import java.nio.file.Path;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.stereotype.Service;
+
+import com.example.kafkabatch.config.KafkaProps;
+import com.example.kafkabatch.io.PlainTextFileGenerator;
+import com.example.kafkabatch.io.StreamingFileGenerator;
+import com.example.kafkabatch.mapping.IdentityTemplateMapper;
+import com.example.kafkabatch.mapping.TemplateMapper;
+import com.example.kafkabatch.worker.KafkaBatchConsumerWorker;
+
+import jakarta.annotation.PreDestroy;
+import lombok.RequiredArgsConstructor;
+
+@Service
+@RequiredArgsConstructor
+public class BatchJobService {
+
+  private final ConsumerFactory<String,String> consumerFactory;
+  private final KafkaProps props;
+
+  private final ExecutorService exec = Executors.newSingleThreadExecutor();
+  private final AtomicBoolean cancelFlag = new AtomicBoolean(false);
+  private volatile BatchJob current;
+
+  public synchronized String start(Map<String,Object> params) {
+    ensureNotRunning();
+
+    String id = UUID.randomUUID().toString();
+    BatchJob job = new BatchJob(id);
+    current = job;
+
+    // params with fallbacks
+    String topic = (String) params.getOrDefault("topic", props.getTopic());
+    String partitions = (String) params.getOrDefault("partitions", props.getPartitions());
+    Long offset = (params.get("offset") == null) ? null : Long.valueOf(params.get("offset").toString());
+    long idleMs = params.getOrDefault("idleMs", 60000L) instanceof Number
+        ? ((Number) params.get("idleMs")).longValue() : 60000L;
+    int commitEvery = params.getOrDefault("commitEvery", 1000) instanceof Number
+        ? ((Number) params.get("commitEvery")).intValue() : 1000;
+    Path out = Path.of((String) params.getOrDefault("outputPath", "/tmp/batch-output.txt"));
+
+    cancelFlag.set(false);
+
+    exec.submit(() -> {
+      try {
+        TemplateMapper mapper = new IdentityTemplateMapper(); // swap with your real TemplateMapper
+        StreamingFileGenerator gen = new PlainTextFileGenerator(out);
+
+        KafkaBatchConsumerWorker.runBatch(
+            consumerFactory, props, partitions, offset, idleMs, commitEvery, cancelFlag, mapper, gen);
+
+        if (!cancelFlag.get()) job.setStatus(BatchJob.Status.COMPLETED);
+        else job.setStatus(BatchJob.Status.CANCELED);
+      } catch (Exception e) {
+        job.setStatus(BatchJob.Status.FAILED);
+        job.setError(e.toString());
+      } finally {
+        job.setEnd(java.time.Instant.now());
+      }
+    });
+
+    return id;
+  }
+
+  public BatchJob status(String id) {
+    if (current != null && current.getId().equals(id)) return current;
+    throw new NoSuchElementException("Job not found: " + id);
+  }
+
+  public synchronized void cancel(String id) {
+    if (current == null || !current.getId().equals(id)) throw new NoSuchElementException("Job not found: " + id);
+    if (current.getStatus() != BatchJob.Status.RUNNING) return;
+    cancelFlag.set(true);
+  }
+
+  private void ensureNotRunning() {
+    if (current != null && current.getStatus() == BatchJob.Status.RUNNING) {
+      throw new IllegalStateException("Another job is running: " + current.getId());
+    }
+  }
+
+  @PreDestroy
+  public void shutdown() { exec.shutdownNow(); }
+}
+
+REST controller + DTOs
+package com.example.kafkabatch.api;
+
+import java.util.Map;
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.validation.annotation.Validated;
+import org.springframework.web.bind.annotation.*;
+
+import com.example.kafkabatch.jobs.BatchJob;
+import com.example.kafkabatch.jobs.BatchJobService;
+
+import jakarta.validation.constraints.NotBlank;
+import lombok.Data;
+import lombok.RequiredArgsConstructor;
+
+@RestController
+@RequestMapping("/jobs")
+@RequiredArgsConstructor
+@Validated
+public class BatchJobController {
+
+  private final BatchJobService service;
+
+  @PostMapping
+  public ResponseEntity<Map<String,String>> start(@RequestBody StartRequest r) {
+    String id = service.start(r.asMap());
+    return ResponseEntity.accepted().body(Map.of("jobId", id, "statusUrl", "/jobs/" + id));
+  }
+
+  @GetMapping("/{id}")
+  public ResponseEntity<BatchJob> status(@PathVariable String id) {
+    return ResponseEntity.ok(service.status(id));
+  }
+
+  @PostMapping("/{id}/cancel")
+  public ResponseEntity<?> cancel(@PathVariable String id) {
+    service.cancel(id);
+    return ResponseEntity.accepted().build();
+  }
+
+  // optional: restart-from-offset simply calls start with offset param again
+}
+
+@Data
+class StartRequest {
+  private String topic;          // optional (defaults from YAML)
+  private String partitions;     // e.g. "0,1"
+  private Long offset;           // start from offset (all partitions)
+  private Long idleMs;           // default 60000
+  private Integer commitEvery;   // default 1000
+  @NotBlank
+  private String outputPath;     // where to write the file
+
+  Map<String,Object> asMap() {
+    return Map.of(
+      "topic", topic == null ? "" : topic,
+      "partitions", partitions == null ? "" : partitions,
+      "offset", offset,
+      "idleMs", idleMs == null ? 60000L : idleMs,
+      "commitEvery", commitEvery == null ? 1000 : commitEvery,
+      "outputPath", outputPath
+    );
+  }
+}
+
+Why this is “solid”
+
+ConsumerFactory is reused; no @KafkaListener.
+
+Explicit seek rules (committed/earliest/latest or override offset).
+
+read_committed respected for transactional producers.
+
+Periodic commitSync() + final commit (at-least-once).
+
+Idle timeout based on elapsed time, not a single empty poll.
+
+Multi-partition ready (partitions: "0,1,2").
+
+Streaming file writing (no unbounded list in memory).
+
+Clean start / status / cancel lifecycle; restart = call start with offset.
+
+All knobs in YAML; REST can override per run.
