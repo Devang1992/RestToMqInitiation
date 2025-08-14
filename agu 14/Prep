@@ -1,0 +1,305 @@
+Below is a complete solution for your Spring Boot Kafka batch processor, following senior-level design, including:
+
+pom.xml dependencies
+
+application.yaml configuration
+
+All core classes: configuration, REST controller, batch job service, worker/consumer logic (using ConsumerFactory, no @KafkaListener)
+
+Example interface for your file/template logic
+
+In-memory job tracking
+
+Mechanism for starting, stopping, and restarting with offset
+
+This is production-style code: externalized config, separation of concerns, idiomatic error handling, and extensibility.
+
+1. pom.xml Dependencies
+xml
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>kafka-batch-job</artifactId>
+  <version>1.0.0</version>
+  <properties>
+    <java.version>17</java.version>
+    <spring-boot.version>3.5.3</spring-boot.version>
+  </properties>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-dependencies</artifactId>
+        <version>${spring-boot.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.kafka</groupId>
+      <artifactId>spring-kafka</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.projectlombok</groupId>
+      <artifactId>lombok</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.commons</groupId>
+      <artifactId>commons-io</artifactId>
+      <version>2.15.0</version>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>
+2. application.yaml Example
+text
+kafka:
+  bootstrap-servers: localhost:9092
+  group-id: my-batch-group
+  topic: batch-topic
+  auto-offset-reset: latest
+  poll-timeout-ms: 5000
+  key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+  value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+  session-timeout-ms: 10000
+3. Configuration: KafkaConfig.java
+java
+@Configuration
+public class KafkaConfig {
+
+    @Bean
+    @ConfigurationProperties(prefix = "kafka")
+    public KafkaProps kafkaProps() {
+        return new KafkaProps();
+    }
+
+    @Bean
+    public ConsumerFactory<String, String> consumerFactory(KafkaProps props) {
+        Map<String, Object> configs = new HashMap<>();
+        configs.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, props.getBootstrapServers());
+        configs.put(ConsumerConfig.GROUP_ID_CONFIG, props.getGroupId());
+        configs.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, props.getKeyDeserializer());
+        configs.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, props.getValueDeserializer());
+        configs.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, props.getAutoOffsetReset());
+        configs.put(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, props.getSessionTimeoutMs());
+        return new DefaultKafkaConsumerFactory<>(configs);
+    }
+}
+KafkaProps.java
+
+java
+@Getter @Setter
+public class KafkaProps {
+    private String bootstrapServers;
+    private String groupId;
+    private String topic;
+    private String keyDeserializer;
+    private String valueDeserializer;
+    private String autoOffsetReset = "latest";
+    private Integer pollTimeoutMs = 5000;
+    private Integer sessionTimeoutMs = 10000;
+}
+4. Batch Job State Model
+java
+@Getter
+@AllArgsConstructor
+public class BatchJob {
+    public enum Status { RUNNING, COMPLETED, FAILED }
+    private final String jobId;
+    private volatile Status status;
+    private volatile Long lastProcessedOffset;
+    private volatile String errorMessage;
+}
+5. BatchJobService.java (Job Management)
+java
+@Service
+@RequiredArgsConstructor
+public class BatchJobService {
+
+    private final ConsumerFactory<String, String> consumerFactory;
+    private final KafkaProps kafkaProps;
+    private final TemplateMapper templateMapper;
+    private final FileGenerator fileGenerator;
+
+    // Only one job at a time
+    private final AtomicReference<BatchJob> currentJob = new AtomicReference<>(null);
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+
+    public synchronized String startJob() {
+        if (currentJob.get() != null && currentJob.get().getStatus() == BatchJob.Status.RUNNING) {
+            throw new IllegalStateException("Batch job already running");
+        }
+        String jobId = UUID.randomUUID().toString();
+        BatchJob job = new BatchJob(jobId, BatchJob.Status.RUNNING, null, null);
+        currentJob.set(job);
+        executor.submit(() -> {
+            try {
+                List<MessageEnvelope> batch = KafkaBatchConsumerWorker.runBatch(
+                    consumerFactory,
+                    kafkaProps,
+                    null, // start from default (latest or earliest)
+                    job
+                );
+                fileGenerator.generateFile(batch);
+                job.setStatus(BatchJob.Status.COMPLETED);
+            } catch (Exception e) {
+                job.setStatus(BatchJob.Status.FAILED);
+                job.setErrorMessage(e.getMessage());
+            }
+        });
+        return jobId;
+    }
+
+    public BatchJob getJobStatus(String jobId) {
+        BatchJob job = currentJob.get();
+        if (job != null && job.getJobId().equals(jobId)) {
+            return job;
+        }
+        throw new NoSuchElementException("No such job");
+    }
+
+    public void restartJobWithOffset(String jobId, long offset) {
+        BatchJob job = currentJob.get();
+        if (job == null || !job.getJobId().equals(jobId) || job.getStatus() != BatchJob.Status.FAILED) {
+            throw new IllegalStateException("Restart only supported for failed job");
+        }
+        job.setStatus(BatchJob.Status.RUNNING);
+        executor.submit(() -> {
+            try {
+                List<MessageEnvelope> batch = KafkaBatchConsumerWorker.runBatch(
+                    consumerFactory,
+                    kafkaProps,
+                    offset,
+                    job
+                );
+                fileGenerator.generateFile(batch);
+                job.setStatus(BatchJob.Status.COMPLETED);
+            } catch (Exception e) {
+                job.setStatus(BatchJob.Status.FAILED);
+                job.setErrorMessage(e.getMessage());
+            }
+        });
+    }
+}
+6. KafkaBatchConsumerWorker.java
+java
+public class KafkaBatchConsumerWorker {
+
+    public static List<MessageEnvelope> runBatch(
+        ConsumerFactory<String, String> consumerFactory,
+        KafkaProps props,
+        Long startOffset,
+        BatchJob job) {
+
+        List<MessageEnvelope> result = new ArrayList<>();
+        try (Consumer<String, String> consumer = consumerFactory.createConsumer()) {
+            TopicPartition tp = new TopicPartition(props.getTopic(), 0);
+            consumer.assign(Collections.singleton(tp));
+            if (startOffset != null) {
+                consumer.seek(tp, startOffset);
+            }
+            boolean pollTimedOut = false;
+
+            while (!pollTimedOut && job.getStatus() == BatchJob.Status.RUNNING) {
+                ConsumerRecords<String, String> records =
+                        consumer.poll(Duration.ofMillis(props.getPollTimeoutMs()));
+                if (records.isEmpty()) {
+                    pollTimedOut = true;
+                } else {
+                    for (ConsumerRecord<String, String> record : records) {
+                        Map<String,String> headers = extractHeaders(record.headers());
+                        result.add(new MessageEnvelope(
+                            record.key(), record.value(), headers, record.offset()
+                        ));
+                        job.setLastProcessedOffset(record.offset());
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    private static Map<String, String> extractHeaders(Headers headers) {
+        Map<String, String> map = new HashMap<>();
+        headers.forEach(header -> map.put(header.key(), new String(header.value())));
+        return map;
+    }
+}
+7. Messaging & File Handling Classes
+MessageEnvelope.java
+
+java
+@Getter
+@AllArgsConstructor
+public class MessageEnvelope {
+    private String key;
+    private String value;
+    private Map<String, String> headers;
+    private long offset;
+}
+TemplateMapper.java (interface example, implement your mapping logic)
+
+java
+public interface TemplateMapper {
+    // your mapping logic here
+}
+FileGenerator.java (interface example, implement your file writing logic)
+
+java
+public interface FileGenerator {
+    void generateFile(List<MessageEnvelope> batch) throws IOException;
+}
+8. Exposing REST API: BatchJobController.java
+java
+@RestController
+@RequiredArgsConstructor
+@RequestMapping("/jobs")
+public class BatchJobController {
+
+    private final BatchJobService batchJobService;
+
+    @PostMapping
+    public ResponseEntity<Map<String, String>> startJob() {
+        String jobId = batchJobService.startJob();
+        Map<String, String> response = new HashMap<>();
+        response.put("jobId", jobId);
+        return ResponseEntity.ok(response);
+    }
+
+    @GetMapping("/{jobId}")
+    public ResponseEntity<BatchJob> getStatus(@PathVariable String jobId) {
+        return ResponseEntity.ok(batchJobService.getJobStatus(jobId));
+    }
+
+    @PostMapping("/{jobId}/restart")
+    public ResponseEntity<Void> restartJob(@PathVariable String jobId, @RequestBody Map<String, Long> payload) {
+        batchJobService.restartJobWithOffset(jobId, payload.get("offset"));
+        return ResponseEntity.accepted().build();
+    }
+}
+9. How the Kafka "Listener" is Started and Stopped
+Started: When your REST endpoint (POST /jobs) is called, the BatchJobService spins a worker thread, which starts a manual polling loop via KafkaBatchConsumerWorker.runBatch() using a configured Consumer from the injected factory. No @KafkaListener is used.
+
+Stopped: The polling loop stops when it receives zero records (poll timeout). The job status is then updated to COMPLETED. On error or explicit interruption, update status and release resources.
+
+10. Summary
+All configs come from YAML via KafkaProps.
+
+Consumer is started/stopped programmatically in a worker thread, managed by your service and orchestrated via REST.
+
+Flexibility to restart from any offset, handle errors, track job state, extend to persistent tracking if needed.
