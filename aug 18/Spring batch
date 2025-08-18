@@ -1,0 +1,188 @@
+What changes
+
+Use Spring Batch to define one Job with one Step (a Tasklet that runs your current Kafka polling loop and writes the file).
+
+Persist executions in the Batch JobRepository (H2 in-memory for local, a real DB in SIT/DEV/PROD).
+
+Control via REST using JobOperator (start/stop/restart) and JobExplorer (status).
+
+No custom in-memory tracking required.
+
+Minimal setup
+pom.xml (add Spring Batch + H2)
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-batch</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.springframework.kafka</groupId>
+  <artifactId>spring-kafka</artifactId>
+</dependency>
+<dependency>
+  <groupId>com.h2database</groupId>
+  <artifactId>h2</artifactId>
+  <scope>runtime</scope>
+</dependency>
+
+application.yaml
+spring:
+  datasource:
+    url: jdbc:h2:mem:batchdb;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  h2.console.enabled: true
+  batch:
+    jdbc.initialize-schema: always   # creates BATCH_* tables
+    job.enabled: false               # don't auto-run jobs at startup
+
+kafka:
+  bootstrap-servers: localhost:9092
+  group-id: ep_cp_pants_mail_service_group
+  topic: ep_wires_engine_pants_processed
+  auto-offset-reset: earliest
+  key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+  value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+  # …your other props…
+
+Kafka ConsumerFactory bean (uses Boot’s KafkaProperties)
+@Configuration
+@RequiredArgsConstructor
+public class KafkaConfig {
+  private final org.springframework.boot.autoconfigure.kafka.KafkaProperties props;
+
+  @Bean
+  public ConsumerFactory<String, String> consumerFactory() {
+    // Boot 3.x signature needs an sslBundles arg; pass null if you don't use bundles locally
+    return new DefaultKafkaConsumerFactory<>(props.buildConsumerProperties(null));
+  }
+}
+
+The Batch job + tasklet
+@Configuration
+@EnableBatchProcessing
+@RequiredArgsConstructor
+public class BatchJobConfig {
+
+  private final JobRepository jobRepository;
+  private final PlatformTransactionManager transactionManager;
+
+  @Bean
+  public Job kafkaBatchJob(Step kafkaStep) {
+    return new JobBuilder("kafkaBatchJob", jobRepository)
+        .start(kafkaStep)
+        .build();
+  }
+
+  @Bean
+  public Step kafkaStep(Tasklet kafkaPollTasklet) {
+    return new StepBuilder("kafkaPollStep", jobRepository)
+        .tasklet(kafkaPollTasklet, transactionManager)
+        .build();
+  }
+
+  // Your existing worker loop wrapped as a Tasklet
+  @Bean
+  @StepScope
+  public Tasklet kafkaPollTasklet(
+      ConsumerFactory<String,String> consumerFactory,
+      KafkaProps kafkaProps,                        // your @ConfigurationProperties holder
+      TemplateMapper mapper,                        // your existing mapper
+      FileGenerator fileGenerator,                  // your existing file writer
+      @Value("#{jobParameters['offset']}") Long offset,
+      @Value("#{jobParameters['idleMs'] ?: 60000}") Long idleMs,
+      @Value("#{jobParameters['commitEvery'] ?: 1000}") Integer commitEvery
+  ) {
+    return (contribution, chunkContext) -> {
+      KafkaBatchConsumerWorker.runBatch(
+          kafkaProps, consumerFactory, offset, idleMs, commitEvery, mapper, fileGenerator);
+      return RepeatStatus.FINISHED;
+    };
+  }
+
+  // Expose JobOperator for start/stop/restart via REST
+  @Bean
+  public JobOperator jobOperator(JobLauncher launcher, JobRepository repo,
+                                 JobExplorer explorer, JobRegistry registry) {
+    var op = new org.springframework.batch.core.launch.support.SimpleJobOperator();
+    op.setJobLauncher(launcher);
+    op.setJobRepository(repo);
+    op.setJobExplorer(explorer);
+    op.setJobRegistry(registry);
+    return op;
+  }
+}
+
+
+Keep your existing KafkaBatchConsumerWorker.runBatch(...) logic as-is (manual poll loop, optional end-offset snapshot, idle stop, periodic commits) — just call it from the Tasklet.
+
+REST controller (start / status / stop / restart)
+@RestController
+@RequiredArgsConstructor
+@RequestMapping("/batch-job")
+public class BatchController {
+  private final JobOperator jobOperator;
+  private final JobExplorer jobExplorer;
+
+  @PostMapping("/start")
+  public Map<String,Object> start(@RequestBody(required=false) Map<String,Object> p) throws Exception {
+    String params = toParamString(p); // e.g. "offset=123,idleMs=60000,commitEvery=1000,ts=" + System.currentTimeMillis()
+    long execId = jobOperator.start("kafkaBatchJob", params);
+    return Map.of("executionId", execId, "statusUrl", "/batch-job/status/" + execId);
+  }
+
+  @GetMapping("/status/{executionId}")
+  public Map<String,Object> status(@PathVariable long executionId) {
+    var exec = jobExplorer.getJobExecution(executionId);
+    if (exec == null) throw new ResponseStatusException(HttpStatus.NOT_FOUND);
+    return Map.of(
+      "jobName", exec.getJobInstance().getJobName(),
+      "status",  exec.getStatus().toString(),
+      "exitCode", exec.getExitStatus().getExitCode(),
+      "start", exec.getStartTime(),
+      "end", exec.getEndTime(),
+      "params", exec.getJobParameters().toProperties()
+    );
+  }
+
+  @PostMapping("/stop/{executionId}")
+  public void stop(@PathVariable long executionId) throws Exception {
+    jobOperator.stop(executionId);
+  }
+
+  @PostMapping("/restart/{executionId}")
+  public Map<String,Object> restart(@PathVariable long executionId) throws Exception {
+    long newId = jobOperator.restart(executionId);
+    return Map.of("executionId", newId);
+  }
+
+  private static String toParamString(Map<String,Object> p) {
+    if (p == null) p = Map.of();
+    var base = p.entrySet().stream()
+      .map(e -> e.getKey() + "=" + e.getValue())
+      .collect(java.util.stream.Collectors.joining(","));
+    return (base.isEmpty() ? "" : base + ",") + "ts=" + System.currentTimeMillis(); // uniqueness
+  }
+}
+
+Why this is better
+
+No custom in-memory state: Spring Batch persists execution metadata (status, start/end, exit codes) in BATCH_* tables.
+
+Stable IDs: You return the JobExecution id; clients can poll it safely.
+
+Stop/Restart: Out of the box via JobOperator.
+
+Crash-safe status: If your app restarts, the status is still in the DB.
+
+Notes / gotchas
+
+You must keep spring.batch.jdbc.initialize-schema=always for local H2 so the BATCH_* tables are created.
+
+For SIT/DEV/PROD use a real DB schema (PostgreSQL/Oracle/etc.) and set initialize-schema=never after running the official Spring Batch schema DDL once.
+
+If you later want chunk-style with KafkaItemReader, you can swap the Tasklet for a chunk step; for now your manual poll loop inside a Tasklet is perfectly fine and easier to control (idle cutoff, end-offset snapshot, periodic commits).
+
+Controller calls don’t block: JobOperator.start returns immediately with the execution id; Batch runs the job asynchronously.
+
+This conversion gives you the “job with id” semantics you wanted, without you managing lifecycles or garbage-collection yourself.
