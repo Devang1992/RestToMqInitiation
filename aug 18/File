@@ -1,0 +1,230 @@
+Yep—let’s keep your manual polling ConsumerWorker (it gives you the most control) and make it stream-to-file so memory stays O(1) for 10k/day. The idea:
+
+Don’t build a big List<String> of rendered pages.
+
+Render each record → append to a file immediately.
+
+Commit offsets in batches (e.g., every 500/1000).
+
+Rotate/flush by count or bytes so files don’t get huge.
+
+Idle-stop like you already do.
+
+Below is a drop-in pattern you can wire into your existing job.
+
+1) A tiny rolling writer (append + rotate)
+import java.io.*;
+import java.nio.charset.Charset;
+import java.nio.file.*;
+import java.time.*;
+import java.util.concurrent.atomic.AtomicLong;
+
+public final class RollingTextWriter implements Closeable, Flushable {
+    private final Path dir;
+    private final String prefix;
+    private final String suffix;           // e.g. ".TST" or ".txt"
+    private final Charset cs;
+    private final long rotateEveryBytes;   // e.g. 50 * 1024 * 1024 (50MB)
+    private final int  rotateEveryRecords; // e.g. 5000; 0 = disabled
+    private BufferedWriter out;
+    private Path currentFile;
+    private final AtomicLong writtenBytes = new AtomicLong();
+    private int writtenRecords = 0;
+    private int fileIndex = 0;
+
+    public RollingTextWriter(Path dir, String prefix, String suffix,
+                             Charset cs, long rotateEveryBytes, int rotateEveryRecords) throws IOException {
+        this.dir = dir; this.prefix = prefix; this.suffix = suffix;
+        this.cs = cs; this.rotateEveryBytes = rotateEveryBytes; this.rotateEveryRecords = rotateEveryRecords;
+        Files.createDirectories(dir);
+        openNew();
+    }
+
+    private void openNew() throws IOException {
+        String ts = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss").format(LocalDateTime.now());
+        currentFile = dir.resolve(prefix + "-" + ts + "-" + (fileIndex++) + suffix);
+        out = Files.newBufferedWriter(currentFile, cs, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+        writtenBytes.set(0);
+        writtenRecords = 0;
+    }
+
+    public synchronized void writeLine(String line) throws IOException {
+        byte[] bytes = (line + System.lineSeparator()).getBytes(cs);
+        out.write(line);
+        out.newLine();
+        writtenBytes.addAndGet(bytes.length);
+        writtenRecords++;
+
+        if ((rotateEveryBytes > 0 && writtenBytes.get() >= rotateEveryBytes) ||
+            (rotateEveryRecords > 0 && writtenRecords >= rotateEveryRecords)) {
+            rotate();
+        }
+    }
+
+    private void rotate() throws IOException {
+        flush();
+        out.close();
+        openNew();
+    }
+
+    @Override public void flush() throws IOException { out.flush(); }
+    @Override public void close() throws IOException { if (out != null) { flush(); out.close(); } }
+
+    public Path currentFile() { return currentFile; }
+}
+
+2) Streamed ConsumerWorker (no big lists)
+
+This rewires your loop to:
+
+render one message → writer.writeLine(rendered)
+
+commit per commitEvery
+
+stop on idle timeout or cancel
+
+import org.apache.kafka.clients.consumer.*;
+import org.apache.kafka.common.TopicPartition;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+public final class KafkaBatchConsumerWorker {
+
+    public static void runBatchStreaming(
+            ConsumerFactory<String, String> consumerFactory,
+            KafkaProps props,
+            Long offsetOverride,                   // nullable
+            AtomicBoolean cancelFlag,              // you already have this
+            TemplateMapper mapper,                 // your mapper
+            Path outDir, String filePrefix, String fileSuffix,
+            int commitEvery, long rotateBytes, int rotateRecords,
+            long idleMs) throws Exception {
+
+        try (Consumer<String, String> consumer = consumerFactory.createConsumer();
+             RollingTextWriter writer = new RollingTextWriter(
+                     outDir, filePrefix, fileSuffix,
+                     StandardCharsets.UTF_8, rotateBytes, rotateRecords)) {
+
+            // one partition only (your case)
+            TopicPartition tp = new TopicPartition(props.getTopic(), 0);
+            consumer.assign(List.of(tp));
+
+            // position
+            if (offsetOverride != null) {
+                consumer.seek(tp, offsetOverride);
+            } else {
+                // prefer committed if present else autoOffsetReset behavior
+                var committed = consumer.committed(Set.of(tp)).get(tp); // deprecated but OK; alternative below
+                if (committed != null && committed.offset() >= 0) consumer.seek(tp, committed.offset());
+                else if ("earliest".equalsIgnoreCase(props.getAutoOffsetReset())) consumer.seekToBeginning(List.of(tp));
+                else consumer.seekToEnd(List.of(tp));
+            }
+
+            long lastDataTs = System.currentTimeMillis();
+            int sinceCommit = 0;
+            long lastOffset = -1;
+
+            while (!cancelFlag.get()) {
+                ConsumerRecords<String, String> recs = consumer.poll(Duration.ofMillis(props.getPollTimeoutMs()));
+                if (recs.isEmpty()) {
+                    if (System.currentTimeMillis() - lastDataTs >= idleMs) break; // idle stop
+                    continue;
+                }
+
+                for (ConsumerRecord<String, String> r : recs.records(tp)) {
+                    // --- render one message ---
+                    Map<String, String> headers = new HashMap<>();
+                    r.headers().forEach(h -> headers.put(h.key(), new String(h.value(), StandardCharsets.UTF_8)));
+
+                    // adapt to your mapper signature
+                    String rendered = mapper.mapTemplate(r.value(), headers.getOrDefault("ADVICE_CODE", "NA"),
+                                                         headers.getOrDefault("PROD_CODE", "NA"));
+
+                    writer.writeLine(rendered);
+
+                    lastOffset = r.offset();
+                    lastDataTs = System.currentTimeMillis();
+                    sinceCommit++;
+
+                    if (sinceCommit >= commitEvery) {
+                        commitSync(consumer, tp, lastOffset + 1);
+                        sinceCommit = 0;
+                        writer.flush();
+                    }
+                }
+            }
+
+            // final flush/commit
+            writer.flush();
+            if (lastOffset >= 0) commitSync(consumer, tp, lastOffset + 1);
+        }
+    }
+
+    private static void commitSync(Consumer<String, String> consumer, TopicPartition tp, long nextOffset) {
+        Map<TopicPartition, OffsetAndMetadata> offsets = Map.of(tp, new OffsetAndMetadata(nextOffset));
+        consumer.commitSync(offsets);
+    }
+}
+
+
+Note: If you want to avoid the deprecated committed(tp) call, use the map form as shown (committed(Set.of(tp))) which is the non-deprecated API.
+
+3) How to call it from your tasklet/job
+
+Keep your async Spring Batch job like you just set up. In the tasklet, call:
+
+return contribution -> {
+    KafkaBatchConsumerWorker.runBatchStreaming(
+        consumerFactory, props,
+        /*offsetOverride=*/null,
+        cancelFlag,                                  // or new AtomicBoolean(false)
+        templateMapper,
+        Path.of(props.getOutputDir()),               // e.g. /tmp/out
+        "WIRES_" + java.time.LocalDate.now(),        // prefix
+        ".TST",                                      // suffix
+        /*commitEvery=*/1000,                        // commit every 1000 records
+        /*rotateBytes=*/50L * 1024 * 1024,           // rotate ~50MB
+        /*rotateRecords=*/5000,                      // or after 5000 records (whichever first)
+        /*idleMs=*/ props.getIdleMs()                // e.g. 60_000
+    );
+    return RepeatStatus.FINISHED;
+};
+
+
+You can tune:
+
+commitEvery (start with 500–1000)
+
+rotateBytes (50–100 MB typical)
+
+rotateRecords (optional guard, e.g., 5k)
+
+In application.yaml also set:
+
+max.poll.records (e.g., 1000)
+
+max.partition.fetch.bytes (e.g., 16–32 MB)
+
+fetch.max.bytes (broker-ish cap, but client honors)
+
+fetch.min.bytes + fetch.max.wait.ms if you want fatter batches.
+
+Why this is production-safe for 10k/day
+
+O(1) memory: we never hold all rendered pages.
+
+Fast failure recovery: commits happen in chunks; resume from last committed.
+
+Manageable files: rotate by bytes or record count; you won’t end up with a 1–2 GB monolith.
+
+Throughput: batching (poll + commitEvery) keeps Kafka happy.
+
+Backpressure: file IO is the governor; poll will simply come back with fewer/frequent batches if disk is slower.
+
+If you later want the Spring Batch “chunk” model
+
+You can replace the tasklet with a KafkaItemReader + ItemWriter<String> that appends to the same RollingTextWriter. The behavior (stream, rotate, commit every chunk) stays identical; Spring Batch just manages the chunk boundaries/checkpoints for you.
