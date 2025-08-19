@@ -1,0 +1,157 @@
+Thought for 45s
+
+Yep — do it in chunks and append to the same file. Two knobs:
+
+How many records you try to read per poll() → max.poll.records.
+
+How many rendered templates you flush to disk at once → your own chunkSize (accumulate across polls until you hit it).
+
+Max-poll is only a cap (Kafka may return fewer). So accumulate to 200 yourself, write, commit, repeat.
+
+1) Config (yaml)
+kafka:
+  max-poll-records: 200            # cap per poll
+  max-poll-interval-ms: 300000
+  fetch-max-bytes: 52428800        # 50 MB safety
+  max-partition-fetch-bytes: 52428800
+  enable-auto-commit: false
+  isolation-level: read_committed
+
+app:
+  chunk-size: 200                  # flush to disk every 200 rendered records
+  output-path: /tmp/batch-output.txt
+
+
+(Use whatever binding you already have to read app.chunk-size and app.output-path.)
+
+2) Append-friendly writer
+
+Add an “append chunk” method to your generator so you don’t build the whole file in memory:
+
+// BatchFileGeneratorImp.java
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.io.BufferedWriter;
+import java.util.List;
+
+public class BatchFileGeneratorImp {
+
+  // Rendered lines are already 72/69 formatted by your mapper
+  public void writeChunk(List<String> rendered, Path out, boolean append) throws Exception {
+    OpenOption[] opts = append
+        ? new OpenOption[]{StandardOpenOption.CREATE, StandardOpenOption.APPEND}
+        : new OpenOption[]{StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING};
+
+    try (BufferedWriter w = Files.newBufferedWriter(out, StandardCharsets.UTF_8, opts)) {
+      for (String line : rendered) {
+        w.write(line);
+        w.newLine();
+      }
+    }
+  }
+
+  // (optional) header/footer helpers if your format needs them
+  public void writeHeader(Path out) throws Exception {
+    writeChunk(List.of("...header lines..."), out, false);
+  }
+  public void writeFooter(Path out) throws Exception {
+    writeChunk(List.of("...footer lines..."), out, true);
+  }
+}
+
+3) Chunked loop in your worker
+
+Below is the minimal change to your existing KafkaBatchConsumerWorker.runBatch(...).
+Key changes:
+
+keep a chunk buffer
+
+flush to file when chunk.size() >= chunkSize
+
+commit after a successful append
+
+final flush + commit on exit
+
+public static void runBatch(
+    KafkaBatchProperties properties,
+    ConsumerFactory<String, String> consumerFactory,
+    KafkaProps props,
+    Long offsetOverride,
+    boolean cancelFlag,
+    TemplateMapper mapper,
+    BatchFileGeneratorImp fileGen) throws Exception {
+
+  final int chunkSize = properties.getChunkSize();        // 200
+  final Path outputFile = Paths.get(properties.getOutput().getPath());
+
+  long lastDataTs = System.currentTimeMillis();
+  int sinceCommit = 0;
+
+  List<String> chunk = new ArrayList<>(chunkSize);
+  boolean firstChunk = true;
+
+  try (Consumer<String, String> consumer = consumerFactory.createConsumer()) {
+    TopicPartition partition = new TopicPartition(props.getTopic(), 0);
+    consumer.assign(Collections.singleton(partition));
+
+    // ---- seek positioning (your existing logic) ----
+    if (offsetOverride != null) {
+      consumer.seek(partition, offsetOverride);
+    } else {
+      var om = consumer.committed(Set.of(partition)).get(partition);
+      if (om != null && om.offset() >= 0) consumer.seek(partition, om.offset());
+      else if ("earliest".equalsIgnoreCase(props.getAutoOffsetReset()))
+        consumer.seekToBeginning(List.of(partition));
+      else
+        consumer.seekToEnd(List.of(partition));
+    }
+
+    // ---- poll/flush loop ----
+    while (!cancelFlag) {
+      ConsumerRecords<String, String> recs =
+          consumer.poll(Duration.ofMillis(props.getPollTimeoutMs()));
+
+      if (recs.isEmpty()) {
+        // idle stop if needed (optional)
+        if (System.currentTimeMillis() - lastDataTs >= properties.getIdleMs()) break;
+        continue;
+      }
+
+      lastDataTs = System.currentTimeMillis();
+
+      for (ConsumerRecord<String, String> r : recs) {
+        // map -> rendered lines (one string per output line)
+        var env = new MessageEnvelope(r.topic(), r.partition(), r.offset(), r.key(), r.value(),
+                                      MessageEnvelope.toHeaderMap(r.headers()));
+
+        // skip if headers missing (your existing rule)
+        if (!env.getHeaders().containsKey("ADVICE_CODE") || !env.getHeaders().containsKey("PROD_CODE")) {
+          // log & continue
+          continue;
+        }
+
+        String rendered = mapper.mapTemplate(env.getValue(),
+                         properties.templatePathFor(env.getHeaders().get("ADVICE_CODE"),
+                                                    env.getHeaders().get("PROD_CODE")));
+        chunk.add(rendered);
+
+        if (chunk.size() >= chunkSize) {
+          // append + then commit
+          fileGen.writeChunk(chunk, outputFile, !firstChunk);
+          firstChunk = false;
+          chunk.clear();
+
+          consumer.commitSync();               // commit only after the disk write succeeds
+          sinceCommit = 0;
+        }
+      }
+    }
+
+    // flush tail
+    if (!chunk.isEmpty()) {
+      fileGen.writeChunk(chunk, outputFile, !firstChunk);
+      chunk.clear();
+      consumer.commitSync();
+    }
+  }
+}
