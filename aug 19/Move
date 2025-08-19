@@ -1,0 +1,118 @@
+Here’s a clean, production-safe “move to pickup” procedure you can use at the end of your job. It covers both cases:
+
+Same filesystem (best): do an atomic rename.
+
+Different filesystems/mounts (atomic rename not possible): copy → fsync → rename → delete source.
+
+Steps (short)
+
+Write to a staging file (e.g., /staging/myfile.txt.part) and close it.
+
+Flush to disk (fsync) to avoid half-written data.
+
+Try atomic move to the pickup file (e.g., /pickup/myfile.txt).
+
+If atomic move isn’t supported (cross-device):
+4.1 Copy staging → /pickup/myfile.txt.tmp
+4.2 fsync the temp file
+4.3 Rename temp → final name
+4.4 Delete the staging file
+
+Optionally create a .done marker after the final name is in place.
+
+Drop-in Java (imports included)
+import java.io.IOException;
+import java.nio.channels.FileChannel;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+
+public final class FileMoves {
+
+  /** Append a chunk to the staging file (create if missing). */
+  public static void appendChunk(Path stagingFile, List<String> lines) throws IOException {
+    Files.createDirectories(stagingFile.getParent());
+    try (var w = Files.newBufferedWriter(
+        stagingFile, StandardCharsets.UTF_8,
+        StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
+      for (String line : lines) {
+        w.write(line);
+        w.newLine();
+      }
+    }
+  }
+
+  /** Finish: move staging -> pickup (atomic when possible). */
+  public static void finalizeToPickup(Path stagingFile, Path pickupFile) throws IOException {
+    Files.createDirectories(pickupFile.getParent());
+
+    // Ensure all bytes of the staging file are on disk.
+    try (FileChannel ch = FileChannel.open(stagingFile, StandardOpenOption.READ)) {
+      ch.force(true);
+    }
+
+    // 1) Try an atomic rename (works when both paths are on the SAME filesystem).
+    try {
+      Files.move(stagingFile, pickupFile,
+          StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+      return;
+    } catch (AtomicMoveNotSupportedException ex) {
+      // Fall through to cross-filesystem path.
+    }
+
+    // 2) Cross-filesystem fallback: copy -> fsync -> rename -> delete source.
+    Path tmpDest = pickupFile.resolveSibling(pickupFile.getFileName() + ".tmp");
+    Files.copy(stagingFile, tmpDest,
+        StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
+
+    // fsync copied file before exposing it
+    try (FileChannel ch = FileChannel.open(tmpDest, StandardOpenOption.WRITE)) {
+      ch.force(true);
+    }
+
+    // Try to make the final switch as atomically as possible.
+    try {
+      Files.move(tmpDest, pickupFile,
+          StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+    } catch (AtomicMoveNotSupportedException ex) {
+      Files.move(tmpDest, pickupFile, StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    // Source cleanup
+    Files.deleteIfExists(stagingFile);
+  }
+
+  /** Optional: create a ".done" marker file after the final file exists. */
+  public static void createDoneMarker(Path pickupFile) {
+    try {
+      Path done = pickupFile.resolveSibling(pickupFile.getFileName() + ".done");
+      Files.writeString(done, "OK");
+    } catch (IOException ignore) { /* marker is optional */ }
+  }
+}
+
+Usage pattern
+Path staging = Paths.get("/var/app/staging", baseName + ".part");
+Path pickup  = Paths.get("/var/app/pickup",  baseName + ".txt");
+
+// during the job, for each batch of (say) 200 records:
+FileMoves.appendChunk(staging, lines);
+
+// when everything is processed:
+FileMoves.finalizeToPickup(staging, pickup);
+// optionally:
+FileMoves.createDoneMarker(pickup);
+
+Ops notes
+
+Keep TIBCO pointed at the pickup directory and configure it to ignore *.part (or only process *.txt or .done markers).
+
+Prefer staging and pickup on the same mount for atomic rename. If that’s not possible, the fallback above is safe.
+
+Don’t rely on file locks—most external pollers don’t honor them. The staging name + final rename is the portable solution.
+
+If a failure happens mid-job, you’ll only have a .part file in staging (or a stray .tmp in pickup). Clean those on next start.
