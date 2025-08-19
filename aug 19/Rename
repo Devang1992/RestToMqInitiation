@@ -1,0 +1,41 @@
+Great question — and good news:
+
+If you keep the file in the same directory with a staging name (e.g., myfile.txt.part) and then rename it to myfile.txt, nothing is copied. It’s a metadata-only rename, not line-by-line, and it’s effectively instant (milliseconds). Size doesn’t matter — even a 50 MB file is O(1) to rename.
+
+It only becomes a byte-by-byte copy if you move across different filesystems/mounts. Then 50 MB typically takes ~0.1–1s depending on disk/network and fsync.
+
+What to do (same directory)
+
+Write/append to myfile.txt.part.
+
+When done, fsync the staging file.
+
+Files.move(staging, final, ATOMIC_MOVE, REPLACE_EXISTING).
+
+That rename is atomic on the same filesystem, so TIBCO sees the file only when complete.
+
+var tmp  = dir.resolve("myfile.txt.part");
+var done = dir.resolve("myfile.txt");
+
+// flush to disk
+try (var ch = java.nio.channels.FileChannel.open(tmp, java.nio.file.StandardOpenOption.READ)) {
+  ch.force(true);
+}
+
+// atomic rename (same dir / same filesystem)
+try {
+  java.nio.file.Files.move(tmp, done,
+      java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+      java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+} catch (java.nio.file.AtomicMoveNotSupportedException e) {
+  // same-dir usually supports atomic move; this is just a fallback
+  java.nio.file.Files.move(tmp, done, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+}
+
+Tips
+
+Configure TIBCO to ignore *.part (or only pick *.txt), so it never touches the staging file.
+
+Keep staging and final in the same directory (and same filesystem) to guarantee atomic rename and avoid any copy time.
+
+If you must use different directories on different mounts, use the copy → fsync → rename fallback we discussed earlier.
