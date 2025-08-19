@@ -1,0 +1,518 @@
+Awesome — here’s a clean, runnable POC that uses Spring Batch + KafkaItemReader with:
+
+chunk(200) reads (Batch commits every 200),
+
+a tiny append writer that writes to *.part and renames to the final name at the end,
+
+an idle-stop wrapper so the step finishes when no data arrives for idleMs,
+
+async job launcher + JobOperator so your POST returns immediately and you can GET status.
+
+I kept everything constructor-injected (no @Autowired), single partition (0), and YAML-driven.
+
+pom.xml (deps you need)
+<dependencies>
+  <!-- Spring Boot core -->
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter</artifactId>
+  </dependency>
+
+  <!-- Spring Web (controller) -->
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-web</artifactId>
+  </dependency>
+
+  <!-- Spring Batch -->
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-batch</artifactId>
+  </dependency>
+
+  <!-- Kafka client + Spring Kafka -->
+  <dependency>
+    <groupId>org.springframework.kafka</groupId>
+    <artifactId>spring-kafka</artifactId>
+  </dependency>
+
+  <!-- H2 for the Batch JobRepository (POC) -->
+  <dependency>
+    <groupId>com.h2database</groupId>
+    <artifactId>h2</artifactId>
+    <scope>runtime</scope>
+  </dependency>
+
+  <!-- Handlebars + Jackson (optional mapping) -->
+  <dependency>
+    <groupId>com.github.jknack</groupId>
+    <artifactId>handlebars</artifactId>
+    <version>4.3.1</version>
+  </dependency>
+  <dependency>
+    <groupId>com.fasterxml.jackson.core</groupId>
+    <artifactId>jackson-databind</artifactId>
+  </dependency>
+
+  <!-- Lombok (optional) -->
+  <dependency>
+    <groupId>org.projectlombok</groupId>
+    <artifactId>lombok</artifactId>
+    <scope>provided</scope>
+  </dependency>
+</dependencies>
+
+application.yml (dev defaults)
+spring:
+  datasource:
+    url: jdbc:h2:mem:batchdb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  h2:
+    console:
+      enabled: true
+  batch:
+    jdbc:
+      initialize-schema: always
+    job:
+      enabled: false   # we trigger via REST/JobOperator
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: batch-reader
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      max-poll-records: 200             # <= cap per poll
+      properties:
+        isolation.level: read_committed
+        max.partition.fetch.bytes: 16777216  # 16MB per partition
+        fetch.max.bytes: 67108864            # 64MB total
+        fetch.min.bytes: 1048576             # ≥1MB or timeout
+        fetch.max.wait.ms: 500
+
+app:
+  topic: ep_wires_engine_pants_processed
+  partition: 0
+  chunk-size: 200
+  idle-ms: 60000
+  output-dir: /tmp/pickup            # final pickup dir (TIBCO watches this)
+  staging-dir: /tmp/staging          # we write .part here, then rename
+
+Kafka ConsumerFactory (built from spring.kafka.*)
+package demo.config;
+
+import org.springframework.boot.autoconfigure.kafka.KafkaProperties;
+import org.springframework.boot.ssl.SslBundles;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+
+@Configuration
+public class KafkaConsumerConfig {
+
+  @Bean
+  ConsumerFactory<String, String> consumerFactory(KafkaProperties props, SslBundles sslBundles) {
+    var cfg = props.getConsumer().buildProperties(sslBundles); // Boot 3.5+
+    return new DefaultKafkaConsumerFactory<>(cfg);
+  }
+}
+
+Idle-aware wrapper around KafkaItemReader
+package demo.batch;
+
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.springframework.batch.item.*;
+
+import java.time.Duration;
+
+/** Wraps a delegate ItemStreamReader and ends the stream if idle for idleMs. */
+public class IdleAwareItemReader implements ItemStreamReader<ConsumerRecord<String,String>> {
+
+  private final ItemStreamReader<ConsumerRecord<String,String>> delegate;
+  private final long idleMs;
+  private final long pollTimeoutMs; // informational
+
+  private long lastDataTs;
+
+  public IdleAwareItemReader(ItemStreamReader<ConsumerRecord<String,String>> delegate,
+                             long idleMs,
+                             Duration pollTimeout) {
+    this.delegate = delegate;
+    this.idleMs = idleMs;
+    this.pollTimeoutMs = pollTimeout.toMillis();
+    this.lastDataTs = System.currentTimeMillis();
+  }
+
+  @Override public ConsumerRecord<String,String> read() throws Exception {
+    ConsumerRecord<String,String> rec = delegate.read();
+    long now = System.currentTimeMillis();
+    if (rec != null) {
+      lastDataTs = now;
+      return rec;
+    }
+    // no record this time; check idle budget
+    if (now - lastDataTs >= idleMs) {
+      return null; // signal end-of-input -> step finishes
+    }
+    return null;   // allow the framework to call us again (next chunk)
+  }
+
+  @Override public void open(ExecutionContext executionContext) throws ItemStreamException {
+    delegate.open(executionContext);
+    lastDataTs = System.currentTimeMillis();
+  }
+  @Override public void update(ExecutionContext executionContext) throws ItemStreamException {
+    delegate.update(executionContext);
+  }
+  @Override public void close() throws ItemStreamException {
+    delegate.close();
+  }
+}
+
+Append writer (ItemStreamWriter<String>) with staging + atomic rename
+package demo.batch;
+
+import org.springframework.batch.item.ExecutionContext;
+import org.springframework.batch.item.ItemStreamException;
+import org.springframework.batch.item.ItemStreamWriter;
+
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.List;
+
+public class StreamingFileItemWriter implements ItemStreamWriter<String> {
+
+  private final Path stagingDir;
+  private final Path pickupDir;
+  private final String baseName; // e.g., "wires_2025-08-19.txt"
+
+  private BufferedWriter out;
+  private Path stagingFile;
+  private Path finalFile;
+
+  public StreamingFileItemWriter(Path stagingDir, Path pickupDir, String baseName) {
+    this.stagingDir = stagingDir;
+    this.pickupDir = pickupDir;
+    this.baseName = baseName;
+  }
+
+  @Override
+  public void open(ExecutionContext ctx) throws ItemStreamException {
+    try {
+      Files.createDirectories(stagingDir);
+      Files.createDirectories(pickupDir);
+      this.stagingFile = stagingDir.resolve(baseName + ".part");
+      this.finalFile   = pickupDir.resolve(baseName);
+
+      // append mode so restarts continue
+      this.out = Files.newBufferedWriter(
+          stagingFile, StandardCharsets.UTF_8,
+          StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND);
+
+    } catch (IOException e) {
+      throw new ItemStreamException("Failed to open writer", e);
+    }
+  }
+
+  @Override
+  public void write(List<? extends String> items) throws Exception {
+    for (String s : items) {
+      out.write(s);
+      out.newLine();
+    }
+  }
+
+  @Override
+  public void update(ExecutionContext ctx) throws ItemStreamException {
+    try { out.flush(); } catch (IOException e) { throw new ItemStreamException(e); }
+  }
+
+  @Override
+  public void close() throws ItemStreamException {
+    try {
+      if (out != null) {
+        out.flush();
+        out.close();
+      }
+      // fsync then atomic rename to final
+      try (FileChannel ch = FileChannel.open(stagingFile, StandardOpenOption.READ)) {
+        ch.force(true);
+      }
+      try {
+        Files.move(stagingFile, finalFile,
+            StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+      } catch (AtomicMoveNotSupportedException ex) {
+        Files.move(stagingFile, finalFile, StandardCopyOption.REPLACE_EXISTING);
+      }
+    } catch (IOException e) {
+      throw new ItemStreamException("Failed to close/rename", e);
+    }
+  }
+}
+
+Template mapping (record → rendered text)
+package demo.template;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.jknack.handlebars.Handlebars;
+import com.github.jknack.handlebars.Template;
+import com.github.jknack.handlebars.io.ClassPathTemplateLoader;
+
+import java.io.IOException;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class TemplateMapper {
+  private final ObjectMapper om = new ObjectMapper();
+  private final Handlebars hb = new Handlebars(new ClassPathTemplateLoader("/templates", ".txt"));
+  private final Map<String, Template> cache = new ConcurrentHashMap<>();
+
+  public String render(String payloadJson, String templateName) throws IOException {
+    Map<String,Object> model = om.readValue(payloadJson, new TypeReference<>() {});
+    Template tpl = cache.computeIfAbsent(templateName, n -> {
+      try { return hb.compile(n); } catch (IOException e) { throw new RuntimeException(e); }
+    });
+    return tpl.apply(model);
+  }
+}
+
+Batch config: Reader, Processor, Writer, Step, Job, Async launcher
+package demo.batch;
+
+import demo.template.TemplateMapper;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.springframework.batch.core.Job;
+import org.springframework.batch.core.Step;
+import org.springframework.batch.core.configuration.JobRegistry;
+import org.springframework.batch.core.configuration.annotation.EnableBatchProcessing;
+import org.springframework.batch.core.configuration.annotation.StepScope;
+import org.springframework.batch.core.explore.JobExplorer;
+import org.springframework.batch.core.job.builder.JobBuilder;
+import org.springframework.batch.core.launch.JobLauncher;
+import org.springframework.batch.core.launch.JobOperator;
+import org.springframework.batch.core.launch.support.SimpleJobOperator;
+import org.springframework.batch.core.launch.support.TaskExecutorJobLauncher;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.core.step.builder.StepBuilder;
+import org.springframework.batch.item.ItemProcessor;
+import org.springframework.batch.item.ItemStreamReader;
+import org.springframework.batch.item.ItemStreamWriter;
+import org.springframework.batch.item.kafka.KafkaItemReader;
+import org.springframework.batch.item.kafka.builder.KafkaItemReaderBuilder;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.task.TaskExecutor;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.transaction.PlatformTransactionManager;
+
+import java.nio.file.Path;
+import java.time.Duration;
+
+@Configuration
+@EnableBatchProcessing
+public class BatchJobConfig {
+
+  // ========= Reader =========
+  @Bean
+  @StepScope
+  public KafkaItemReader<String,String> kafkaItemReader(
+      ConsumerFactory<String,String> consumerFactory,
+      @Value("${app.topic}") String topic,
+      @Value("${app.partition}") int partition,
+      @Value("#{jobParameters['pollTimeoutMs'] ?: 500}") Long pollTimeoutMs
+  ) {
+    return new KafkaItemReaderBuilder<String,String>()
+        .consumerFactory(consumerFactory)
+        .partitions(new int[]{partition})
+        .name("kafkaReader")
+        .topic(topic)
+        .pollTimeout(Duration.ofMillis(pollTimeoutMs))
+        .saveState(true)     // restartable via ExecutionContext
+        .build();
+  }
+
+  @Bean
+  @StepScope
+  public ItemStreamReader<ConsumerRecord<String,String>> idleAwareReader(
+      KafkaItemReader<String,String> delegate,
+      @Value("${app.idle-ms}") long idleMs,
+      @Value("#{jobParameters['pollTimeoutMs'] ?: 500}") Long pollTimeoutMs
+  ) {
+    return new IdleAwareItemReader(delegate, idleMs, Duration.ofMillis(pollTimeoutMs));
+  }
+
+  // ========= Processor =========
+  @Bean
+  @StepScope
+  public ItemProcessor<ConsumerRecord<String,String>, String> processor(TemplateMapper mapper) {
+    return rec -> {
+      // choose template name based on headers (example)
+      String advice = rec.headers().lastHeader("ADVICE_CODE") != null
+          ? new String(rec.headers().lastHeader("ADVICE_CODE").value())
+          : "MCD";
+      String prod = rec.headers().lastHeader("PROD_CODE") != null
+          ? new String(rec.headers().lastHeader("PROD_CODE").value())
+          : "ML";
+
+      String tpl = switch (advice) {
+        case "CSFXLIR" -> "CS_BK_SW";
+        case "CSSWFLTR" -> "CS_BK";
+        case "MCC" -> prod.equals("CTP") ? "IN_CS_MLC" : "IN_CS_ML";
+        case "MCD" -> prod.equals("CTP") ? "OT_CS_MLC" : "OT_CS_ML";
+        default -> "MCD";
+      };
+      return mapper.render(rec.value(), tpl);
+    };
+  }
+
+  // ========= Writer =========
+  @Bean
+  @StepScope
+  public ItemStreamWriter<String> writer(
+      @Value("${app.staging-dir}") String stagingDir,
+      @Value("${app.output-dir}") String pickupDir,
+      @Value("#{jobParameters['baseName'] ?: 'wires_' + T(java.time.LocalDate).now()}") String baseName
+  ) {
+    return new StreamingFileItemWriter(Path.of(stagingDir), Path.of(pickupDir), baseName + ".txt");
+  }
+
+  // ========= Step / Job (chunk 200) =========
+  @Bean
+  public Step kafkaChunkStep(JobRepository repo,
+                             PlatformTransactionManager tx,
+                             ItemStreamReader<ConsumerRecord<String,String>> idleAwareReader,
+                             ItemProcessor<ConsumerRecord<String,String>, String> processor,
+                             ItemStreamWriter<String> writer,
+                             @Value("${app.chunk-size}") int chunk) {
+
+    return new StepBuilder("kafkaChunkStep", repo)
+        .<ConsumerRecord<String,String>, String>chunk(chunk, tx)
+        .reader(idleAwareReader)
+        .processor(processor)
+        .writer(writer)
+        .build();
+  }
+
+  @Bean
+  public Job kafkaBatchJob(JobRepository repo, Step kafkaChunkStep) {
+    return new JobBuilder("kafkaBatchJob", repo)
+        .incrementer(new org.springframework.batch.core.launch.support.RunIdIncrementer())
+        .start(kafkaChunkStep)
+        .build();
+  }
+
+  // ========= Async launcher + JobOperator =========
+  @Bean
+  public TaskExecutor batchExecutor() {
+    ThreadPoolTaskExecutor tp = new ThreadPoolTaskExecutor();
+    tp.setCorePoolSize(2);
+    tp.setMaxPoolSize(4);
+    tp.setQueueCapacity(0);
+    tp.setThreadNamePrefix("batch-");
+    tp.initialize();
+    return tp;
+  }
+
+  @Bean
+  public JobLauncher asyncJobLauncher(JobRepository repo, TaskExecutor batchExecutor) throws Exception {
+    TaskExecutorJobLauncher l = new TaskExecutorJobLauncher();
+    l.setJobRepository(repo);
+    l.setTaskExecutor(batchExecutor);
+    l.afterPropertiesSet();
+    return l;
+  }
+
+  @Bean
+  public JobOperator jobOperator(JobLauncher launcher, JobRepository repo,
+                                 JobExplorer explorer, JobRegistry registry) {
+    SimpleJobOperator op = new SimpleJobOperator();
+    op.setJobLauncher(launcher);
+    op.setJobRepository(repo);
+    op.setJobExplorer(explorer);
+    op.setJobRegistry(registry);
+    return op;
+  }
+
+  // ========= Mapper bean =========
+  @Bean
+  public TemplateMapper templateMapper() { return new TemplateMapper(); }
+}
+
+REST endpoints (start async; poll status)
+package demo.web;
+
+import org.springframework.batch.core.explore.JobExplorer;
+import org.springframework.batch.core.launch.JobOperator;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.net.URI;
+import java.util.Map;
+import java.util.Properties;
+
+@RestController
+@RequestMapping("/jobs")
+public class BatchController {
+
+  private final JobOperator jobOperator;
+  private final JobExplorer jobExplorer;
+
+  public BatchController(JobOperator jobOperator, JobExplorer jobExplorer) {
+    this.jobOperator = jobOperator;
+    this.jobExplorer = jobExplorer;
+  }
+
+  @PostMapping("/start")
+  public ResponseEntity<Map<String, Object>> start(@RequestBody(required = false) Map<String, Object> body) throws Exception {
+    Properties p = new Properties();
+    if (body != null) body.forEach((k, v) -> p.setProperty(k, String.valueOf(v)));
+    p.putIfAbsent("baseName", "wires_" + java.time.LocalDate.now());   // file base name
+    p.putIfAbsent("pollTimeoutMs", "500");
+    p.putIfAbsent("ts", String.valueOf(System.currentTimeMillis()));    // uniqueness
+
+    long execId = jobOperator.start("kafkaBatchJob", p);
+    URI status = URI.create("/jobs/status/" + execId);
+    return ResponseEntity.accepted().location(status).body(Map.of("executionId", execId, "statusUrl", status.toString(), "params", p));
+  }
+
+  @GetMapping("/status/{execId}")
+  public Map<String, Object> status(@PathVariable long execId) {
+    var exec = jobExplorer.getJobExecution(execId);
+    if (exec == null) throw new org.springframework.web.server.ResponseStatusException(HttpStatus.NOT_FOUND, "No such execution");
+    return Map.of(
+        "id", exec.getId(),
+        "job", exec.getJobInstance().getJobName(),
+        "status", exec.getStatus().toString(),
+        "exitCode", exec.getExitStatus().getExitCode(),
+        "start", exec.getStartTime(),
+        "end", exec.getEndTime(),
+        "params", exec.getJobParameters().toProperties()
+    );
+  }
+}
+
+How this answers your requirements
+
+200 at a time: chunk(200) + max-poll-records: 200. Batch calls write() with ~200 items; writer appends them to the same *.part file.
+
+Append, one file: writer opens *.part once in append mode; update() flushes per commit; close() fsyncs and renames to the final name so TIBCO only sees a complete file.
+
+Idle stop: if no data for idleMs, IdleAwareItemReader returns null → step finishes cleanly.
+
+Async: controller returns 202 Accepted immediately; job runs on a pool thread; poll status via GET.
+
+Restartable: KafkaItemReader.saveState(true) stores offsets in the Batch ExecutionContext. If the app restarts, re-run with the same parameters (or startNextInstance) and it resumes from the last checkpoint; the writer reopens the same *.part and keeps appending.
+
+If you want the end-offset snapshot cutoff as well, we can add a tiny StepExecutionListener to capture endOffsets(partition 0) at beforeStep and stop when record.offset() >= snapshotEnd. But for a daily drain with idle-stop and read_committed, this POC is enough to get you running.
