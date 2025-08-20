@@ -1,0 +1,247 @@
+application.yml (only the bits we need)
+spring:
+  batch:
+    job:
+      enabled: false    # start via REST
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: mail-batch-reader
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      enable-auto-commit: false
+      auto-offset-reset: earliest
+      max-poll-records: 200
+
+app:
+  topic: ep_wires_engine_pants_processed
+  partition: 0
+  poll-timeout-ms: 500
+  chunk-size: 200
+
+  output:
+    path: tmp/output/wires.out        # relative to app working dir; use absolute in prod
+
+2) Simple file writer (append)
+package com.td.payments.pants.mailservice.poc;
+
+import org.springframework.batch.item.*;
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.List;
+
+public class PartFileAppendWriter implements ItemStreamWriter<String> {
+
+    private final Path targetFile;
+    private BufferedWriter out;
+
+    public PartFileAppendWriter(Path targetFile) {
+        this.targetFile = targetFile;
+    }
+
+    @Override
+    public void open(ExecutionContext ctx) throws ItemStreamException {
+        try {
+            Files.createDirectories(targetFile.getParent());
+            out = Files.newBufferedWriter(
+                    targetFile,
+                    StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.WRITE,
+                    StandardOpenOption.APPEND
+            );
+        } catch (IOException e) {
+            throw new ItemStreamException("Open writer failed", e);
+        }
+    }
+
+    @Override public void update(ExecutionContext ctx) { /* no-op */ }
+
+    @Override
+    public void close() throws ItemStreamException {
+        try {
+            if (out != null) out.close();
+        } catch (IOException e) {
+            throw new ItemStreamException("Close writer failed", e);
+        }
+    }
+
+    @Override
+    public void write(List<? extends String> items) throws Exception {
+        for (String line : items) {
+            out.write(line);
+            out.newLine();
+        }
+        out.flush();
+    }
+}
+
+3) Job config: Kafka → lines → file
+package com.td.payments.pants.mailservice.poc;
+
+import lombok.RequiredArgsConstructor;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.springframework.batch.core.Job;
+import org.springframework.batch.core.Step;
+import org.springframework.batch.core.configuration.annotation.StepScope;
+import org.springframework.batch.core.job.builder.JobBuilder;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.core.step.builder.StepBuilder;
+import org.springframework.batch.item.*;
+import org.springframework.batch.item.kafka.KafkaItemReader;
+import org.springframework.batch.item.kafka.builder.KafkaItemReaderBuilder;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.task.SimpleAsyncTaskExecutor;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.transaction.PlatformTransactionManager;
+
+import java.nio.file.Path;
+import java.time.Duration;
+
+@Configuration
+@RequiredArgsConstructor
+public class JobConfig {
+
+    private final JobRepository jobRepository;
+    private final PlatformTransactionManager transactionManager;
+    private final org.springframework.kafka.core.ConsumerFactory<String,String> consumerFactory;
+    private final org.springframework.core.env.Environment env;
+
+    // ---- Props helpers
+    int chunkSize()        { return Integer.parseInt(env.getProperty("app.chunk-size", "200")); }
+    String topic()         { return env.getProperty("app.topic"); }
+    int partition()        { return Integer.parseInt(env.getProperty("app.partition", "0")); }
+    long pollTimeoutMs()   { return Long.parseLong(env.getProperty("app.poll-timeout-ms", "500")); }
+    Path outputPath()      { return Path.of(env.getProperty("app.output.path", "tmp/output/wires.out")); }
+
+    // ---- Kafka ItemReader (ConsumerRecord<K,V>)
+    @Bean
+    @StepScope
+    public KafkaItemReader<String,String> kafkaItemReader() {
+        return new KafkaItemReaderBuilder<String,String>()
+                .name("kafkaItemReader")
+                .consumerFactory(consumerFactory)
+                .partitions(partition())
+                .topic(topic())
+                .pollTimeout(Duration.ofMillis(pollTimeoutMs()))
+                .build();
+    }
+
+    // ---- Adapter: map ConsumerRecord -> "key\tvalue" (or just value if you prefer)
+    @Bean
+    @StepScope
+    public ItemStreamReader<String> valueReader(KafkaItemReader<String,String> delegate) {
+        return new ItemStreamReader<>() {
+            @Override public void open(ExecutionContext ctx) throws ItemStreamException { delegate.open(ctx); }
+            @Override public void update(ExecutionContext ctx) throws ItemStreamException { delegate.update(ctx); }
+            @Override public void close() throws ItemStreamException { delegate.close(); }
+
+            @Override
+            public String read() throws Exception {
+                ConsumerRecord<String,String> rec = delegate.read();
+                if (rec == null) return null;
+                String key   = rec.key()   == null ? "" : rec.key();
+                String value = rec.value() == null ? "" : rec.value();
+                return key + "\t" + value;       // change to `return value;` if you only want the value
+            }
+        };
+    }
+
+    // ---- Writer: append to one file
+    @Bean
+    @StepScope
+    public PartFileAppendWriter appendWriter() {
+        return new PartFileAppendWriter(outputPath());
+    }
+
+    // ---- Step
+    @Bean
+    public Step ingestStep(ItemStreamReader<String> valueReader,
+                           PartFileAppendWriter appendWriter) {
+        return new StepBuilder("ingestStep", jobRepository)
+                .<String, String>chunk(chunkSize(), transactionManager)
+                .reader(valueReader)
+                .writer(appendWriter)
+                .build();
+    }
+
+    // ---- Job
+    @Bean
+    public Job kafkaFileJob(Step ingestStep) {
+        return new JobBuilder("kafkaFileJob", jobRepository)
+                .start(ingestStep)
+                .build();
+    }
+
+    // ---- Async job launcher (separate bean name to avoid clashes)
+    @Bean
+    public org.springframework.batch.core.launch.JobLauncher asyncJobLauncher() throws Exception {
+        var jl = new org.springframework.batch.core.launch.support.SimpleJobLauncher();
+        jl.setJobRepository(jobRepository);
+        jl.setTaskExecutor(new SimpleAsyncTaskExecutor("batch-"));
+        jl.afterPropertiesSet();
+        return jl;
+    }
+}
+
+4) Tiny controller to fire the job (returns immediately)
+package com.td.payments.pants.mailservice.controller;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.batch.core.Job;
+import org.springframework.batch.core.JobParameters;
+import org.springframework.batch.core.JobParametersBuilder;
+import org.springframework.batch.core.explore.JobExplorer;
+import org.springframework.batch.core.launch.JobLauncher;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.net.URI;
+
+@RestController
+@RequiredArgsConstructor
+public class BatchControllers {
+
+    private final Job kafkaFileJob;
+    private final JobLauncher asyncJobLauncher;  // our async bean
+    private final JobExplorer jobExplorer;
+
+    @PostMapping("/jobs/start")
+    public ResponseEntity<String> start() throws Exception {
+        JobParameters params = new JobParametersBuilder()
+                .addLong("run.id", System.currentTimeMillis()) // make each run unique
+                .toJobParameters();
+
+        var exec = asyncJobLauncher.run(kafkaFileJob, params); // returns immediately
+
+        return ResponseEntity.accepted()
+                .location(URI.create("/jobs/executions/" + exec.getId()))
+                .body("Started executionId=" + exec.getId());
+    }
+
+    @GetMapping("/jobs/executions/{id}")
+    public Object status(@PathVariable long id) {
+        return jobExplorer.getJobExecution(id);
+    }
+}
+
+Notes / choices we made
+
+No headers: we use the plain KafkaItemReader<String,String> and adapt the ConsumerRecord to a string line.
+
+No bean-name collisions: we created asyncJobLauncher (custom name) so Boot’s default jobLauncher stays intact.
+
+Append-only file: PartFileAppendWriter creates parent dirs and appends safely.
+
+Async: the REST call returns 202 Accepted immediately with a link to check status.
+
+Chunking: controlled via app.chunk-size (default 200).
+
+If you want only value, just change this line in valueReader:
+
+return value;   // instead of key + "\t" + value
+
+
+This is intentionally bare-bones and reliable. You can layer back the “.part → rename” and banner step later, but this will read from Kafka and write to a single file today.
