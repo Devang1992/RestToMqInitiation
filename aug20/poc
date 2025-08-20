@@ -1,0 +1,757 @@
+Absolutely — here’s a fresh POC with the three critical fixes baked in:
+
+#1 Cross-step context fix: promote partFile / baseName from step EC → job EC so the finalize step can read them.
+
+#2 No OOM on finalize: stream banner + body into a tmp file, then atomic rename (no readAllBytes()).
+
+#3 Kafka hardening: dedicated group id + sane consumer timeouts; explicit UTF-8 header decode.
+
+Everything is YAML-driven; no manual property maps. It’s still the same two-step flow:
+
+ingestStep: KafkaItemReader → processor (per-message templating) → append to *.part
+
+finalizeStep: write banner → stream-copy body → fsync → atomic rename to final, using a filename pattern.
+
+pom.xml
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>demo</groupId>
+  <artifactId>kafka-batch-file-processor</artifactId>
+  <version>1.0.0</version>
+
+  <properties>
+    <java.version>17</java.version>
+    <spring-boot.version>3.5.3</spring-boot.version>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-dependencies</artifactId>
+        <version>${spring-boot.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <!-- Core + Web -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+
+    <!-- Spring Batch -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-batch</artifactId>
+    </dependency>
+
+    <!-- Kafka -->
+    <dependency>
+      <groupId>org.springframework.kafka</groupId>
+      <artifactId>spring-kafka</artifactId>
+    </dependency>
+
+    <!-- H2 for JobRepository (file mode in YAML) -->
+    <dependency>
+      <groupId>com.h2database</groupId>
+      <artifactId>h2</artifactId>
+      <scope>runtime</scope>
+    </dependency>
+
+    <!-- Handlebars + Jackson -->
+    <dependency>
+      <groupId>com.github.jknack</groupId>
+      <artifactId>handlebars</artifactId>
+      <version>4.3.1</version>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+
+    <!-- Optional: Lombok -->
+    <dependency>
+      <groupId>org.projectlombok</groupId>
+      <artifactId>lombok</artifactId>
+      <scope>provided</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+
+src/main/resources/application.yml
+
+(Uses your values; I kept them and only rely on what we actually use.)
+
+spring:
+  application:
+    name: kafka-batch-file-processor
+
+  batch:
+    jdbc:
+      initialize-schema: always
+    job:
+      enabled: false  # trigger via REST
+
+  datasource:
+    url: jdbc:h2:file:/var/app/batch/batchdb;AUTO_SERVER=TRUE;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+    hikari:
+      maximum-pool-size: 5
+
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: kafka-batch-file-processor-dedicated
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      max-poll-records: 200
+      properties:
+        isolation.level: read_committed
+        fetch.max.bytes: 67108864
+        max.partition.fetch.bytes: 16777216
+        fetch.min.bytes: 1048576
+        fetch.max.wait.ms: 500
+        max.poll.interval.ms: 900000    # 15 min
+        session.timeout.ms: 15000
+        heartbeat.interval.ms: 5000
+        allow.auto.create.topics: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,batch
+
+app:
+  topic: ${KAFKA_TOPIC:ep_wires_engine_pants_processed}
+  partition: ${KAFKA_PARTITION:0}
+  chunk-size: ${BATCH_CHUNK_SIZE:200}
+  idle-ms: ${BATCH_IDLE_MS:60000}
+  poll-timeout-ms: ${BATCH_POLL_TIMEOUT:500}
+
+  staging-dir: ${STAGING_DIR:/tmp/staging}
+  pickup-dir: ${PICKUP_DIR:/tmp/pickup}
+
+  filename-pattern: ${FILENAME_PATTERN:wires_{yyyyMMdd}_{execId}_r{read}_w{written}_f{filtered}_s{skippedTotal}.txt}
+
+  banner:
+    - "******** Daily Wires Report ********"
+    - "Generated: {now}"
+    - "Execution ID: {execId}"
+    - "Job ID: {jobId}"
+    - "Metrics: Read={read}, Written={written}, Filtered={filtered}, Skipped={skippedTotal}"
+    - "File: {finalFileName}"
+    - "----------------------------------------"
+
+
+Put your templates under src/main/resources/templates/*.txt.
+
+KafkaBatchFileProcessorApplication.java
+package demo;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class KafkaBatchFileProcessorApplication {
+  public static void main(String[] args) {
+    SpringApplication.run(KafkaBatchFileProcessorApplication.class, args);
+  }
+}
+
+Config props (AppProps.java)
+package demo.config;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+
+@Component
+@ConfigurationProperties(prefix = "app")
+public class AppProps {
+  private String topic;
+  private int partition;
+  private int chunkSize;
+  private long idleMs;
+  private long pollTimeoutMs;
+  private String stagingDir;
+  private String pickupDir;
+  private String filenamePattern;
+  private List<String> banner;
+
+  public String getTopic() { return topic; }
+  public void setTopic(String topic) { this.topic = topic; }
+
+  public int getPartition() { return partition; }
+  public void setPartition(int partition) { this.partition = partition; }
+
+  public int getChunkSize() { return chunkSize; }
+  public void setChunkSize(int chunkSize) { this.chunkSize = chunkSize; }
+
+  public long getIdleMs() { return idleMs; }
+  public void setIdleMs(long idleMs) { this.idleMs = idleMs; }
+
+  public long getPollTimeoutMs() { return pollTimeoutMs; }
+  public void setPollTimeoutMs(long pollTimeoutMs) { this.pollTimeoutMs = pollTimeoutMs; }
+
+  public String getStagingDir() { return stagingDir; }
+  public void setStagingDir(String stagingDir) { this.stagingDir = stagingDir; }
+
+  public String getPickupDir() { return pickupDir; }
+  public void setPickupDir(String pickupDir) { this.pickupDir = pickupDir; }
+
+  public String getFilenamePattern() { return filenamePattern; }
+  public void setFilenamePattern(String filenamePattern) { this.filenamePattern = filenamePattern; }
+
+  public List<String> getBanner() { return banner; }
+  public void setBanner(List<String> banner) { this.banner = banner; }
+}
+
+Kafka ConsumerFactory from Boot props (KafkaConsumerConfig.java)
+package demo.config;
+
+import org.springframework.boot.autoconfigure.kafka.KafkaProperties;
+import org.springframework.boot.ssl.SslBundles;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+
+@Configuration
+public class KafkaConsumerConfig {
+  @Bean
+  ConsumerFactory<String, String> consumerFactory(KafkaProperties props, SslBundles sslBundles) {
+    var cfg = props.getConsumer().buildProperties(sslBundles); // Boot 3.5+
+    return new DefaultKafkaConsumerFactory<>(cfg);
+  }
+}
+
+Handlebars templating (TemplateMapper.java)
+package demo.template;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.jknack.handlebars.Handlebars;
+import com.github.jknack.handlebars.Template;
+import com.github.jknack.handlebars.io.ClassPathTemplateLoader;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class TemplateMapper {
+  private final ObjectMapper om = new ObjectMapper();
+  private final Handlebars hb = new Handlebars(new ClassPathTemplateLoader("/templates", ".txt"));
+  private final Map<String, Template> cache = new ConcurrentHashMap<>();
+
+  public String render(String payloadJson, String templateName) throws IOException {
+    Map<String,Object> model = om.readValue(payloadJson.getBytes(StandardCharsets.UTF_8), new TypeReference<>() {});
+    Template tpl = cache.computeIfAbsent(templateName, n -> {
+      try { return hb.compile(n); } catch (IOException e) { throw new RuntimeException(e); }
+    });
+    return tpl.apply(model);
+  }
+}
+
+Idle-aware reader wrapper (IdleAwareItemReader.java)
+package demo.batch;
+
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.springframework.batch.item.*;
+
+public class IdleAwareItemReader implements ItemStreamReader<ConsumerRecord<String, String>> {
+
+  private final ItemStreamReader<ConsumerRecord<String, String>> delegate;
+  private final long idleMs;
+  private final long sleepMs;
+  private long lastDataTs;
+
+  public IdleAwareItemReader(ItemStreamReader<ConsumerRecord<String, String>> delegate,
+                             long idleMs, long pollTimeoutMs) {
+    this.delegate = delegate;
+    this.idleMs = idleMs;
+    this.sleepMs = Math.max(50L, Math.min(pollTimeoutMs, 500L));
+    this.lastDataTs = System.currentTimeMillis();
+  }
+
+  @Override
+  public ConsumerRecord<String, String> read() throws Exception {
+    while (true) {
+      ConsumerRecord<String, String> rec = delegate.read();
+      long now = System.currentTimeMillis();
+      if (rec != null) { lastDataTs = now; return rec; }
+      if (now - lastDataTs >= idleMs) return null; // end of input
+      Thread.sleep(sleepMs);
+    }
+  }
+
+  @Override public void open(ExecutionContext ctx) throws ItemStreamException { delegate.open(ctx); lastDataTs = System.currentTimeMillis(); }
+  @Override public void update(ExecutionContext ctx) throws ItemStreamException { delegate.update(ctx); }
+  @Override public void close() throws ItemStreamException { delegate.close(); }
+}
+
+Step-1 writer: append to .part (PartFileAppendWriter.java)
+package demo.batch;
+
+import org.springframework.batch.item.ExecutionContext;
+import org.springframework.batch.item.ItemStreamException;
+import org.springframework.batch.item.ItemStreamWriter;
+
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.List;
+
+public class PartFileAppendWriter implements ItemStreamWriter<String> {
+  private final Path stagingDir;
+  private final String baseName;
+  private BufferedWriter out;
+  private Path partFile;
+
+  public PartFileAppendWriter(Path stagingDir, String baseName) {
+    this.stagingDir = stagingDir;
+    this.baseName = baseName;
+  }
+
+  @Override
+  public void open(ExecutionContext ctx) throws ItemStreamException {
+    try {
+      Files.createDirectories(stagingDir);
+      this.partFile = stagingDir.resolve(baseName + ".part");
+      ctx.putString("partFile", partFile.toString());
+      ctx.putString("baseName", baseName);   // promoted after step
+      this.out = Files.newBufferedWriter(
+          partFile, StandardCharsets.UTF_8,
+          StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND);
+    } catch (IOException e) {
+      throw new ItemStreamException("Open writer failed", e);
+    }
+  }
+
+  @Override
+  public void write(List<? extends String> items) throws Exception {
+    for (String s : items) {
+      out.write(s);
+      out.write('\n'); // normalize LF (avoid platform newLine)
+    }
+  }
+
+  @Override public void update(ExecutionContext ctx) throws ItemStreamException {
+    try { out.flush(); } catch (IOException e) { throw new ItemStreamException(e); }
+  }
+
+  @Override public void close() throws ItemStreamException {
+    try { if (out != null) out.close(); } catch (IOException e) { throw new ItemStreamException(e); }
+  }
+}
+
+Filename pattern resolver (FilenamePatternResolver.java)
+package demo.batch;
+
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.Map;
+
+public class FilenamePatternResolver {
+  public String resolve(String pattern, Map<String,Object> vars) {
+    String out = pattern;
+    var now = ZonedDateTime.now();
+    out = out.replace("{date}", now.toLocalDate().toString());
+    out = out.replace("{yyyyMMdd}", now.format(DateTimeFormatter.ofPattern("yyyyMMdd")));
+    out = out.replace("{now}", now.toString());
+    for (var e : vars.entrySet()) out = out.replace("{" + e.getKey() + "}", String.valueOf(e.getValue()));
+    return out.replaceAll("\\s+", "_");
+  }
+}
+
+Finalize tasklet (streaming + job EC) (FinalizeFileTasklet.java)
+package demo.batch;
+
+import demo.config.AppProps;
+import org.springframework.batch.core.StepContribution;
+import org.springframework.batch.core.scope.context.ChunkContext;
+import org.springframework.batch.core.step.tasklet.Tasklet;
+import org.springframework.batch.repeat.RepeatStatus;
+
+import java.io.BufferedWriter;
+import java.io.OutputStreamWriter;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import static java.nio.file.StandardOpenOption.*;
+
+public class FinalizeFileTasklet implements Tasklet {
+
+  private final Path pickupDir;
+  private final Path stagingDir;
+  private final String filenamePattern;
+  private final List<String> bannerTemplate;
+  private final FilenamePatternResolver resolver = new FilenamePatternResolver();
+
+  public FinalizeFileTasklet(AppProps props) {
+    this.pickupDir = Path.of(props.getPickupDir());
+    this.stagingDir = Path.of(props.getStagingDir());
+    this.filenamePattern = props.getFilenamePattern();
+    this.bannerTemplate = props.getBanner();
+  }
+
+  @Override
+  public RepeatStatus execute(StepContribution contrib, ChunkContext ctx) throws Exception {
+    var stepExec = ctx.getStepContext().getStepExecution();
+    var jobExec  = stepExec.getJobExecution();
+    var jobCtx   = jobExec.getExecutionContext();  // <-- read/write JOB context
+
+    // Read promoted values from JOB EC (from ingest step)
+    String baseName = jobCtx.getString("baseName");
+    Path   part     = Paths.get(jobCtx.getString("partFile"));
+
+    // Pull metrics from ingest step
+    var ingest = jobExec.getStepExecutions().stream()
+        .filter(se -> "ingestStep".equals(se.getStepName()))
+        .findFirst().orElse(null);
+    long read     = ingest != null ? ingest.getReadCount() : 0;
+    long written  = ingest != null ? ingest.getWriteCount() : 0;
+    long filtered = ingest != null ? ingest.getFilterCount() : 0;
+    long skipped  = ingest != null ? (ingest.getReadSkipCount() + ingest.getProcessSkipCount() + ingest.getWriteSkipCount()) : 0;
+
+    // Build filename from pattern
+    Map<String,Object> vars = new HashMap<>();
+    vars.put("execId", jobExec.getId());
+    vars.put("jobId", jobExec.getJobId());
+    vars.put("read", read);
+    vars.put("written", written);
+    vars.put("filtered", filtered);
+    vars.put("skippedTotal", skipped);
+
+    Files.createDirectories(pickupDir);
+    String finalName = resolver.resolve(filenamePattern, vars);
+    Path finalTmp = pickupDir.resolve(finalName + ".tmp");
+    Path finalOut = pickupDir.resolve(finalName);
+    vars.put("finalFileName", finalName);
+
+    // Stream banner + body into tmp
+    try (var out = Files.newOutputStream(finalTmp, CREATE, TRUNCATE_EXISTING, WRITE);
+         var bw  = new BufferedWriter(new OutputStreamWriter(out, StandardCharsets.UTF_8))) {
+      if (bannerTemplate != null) {
+        for (String line : bannerTemplate) { bw.write(resolver.resolve(line, vars)); bw.write('\n'); }
+        bw.flush();
+      }
+      try (var in = Files.newInputStream(part)) { in.transferTo(out); }
+    }
+
+    // fsync tmp then atomic rename
+    try (FileChannel ch = FileChannel.open(finalTmp, WRITE)) { ch.force(true); }
+    try {
+      Files.move(finalTmp, finalOut, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+    } catch (AtomicMoveNotSupportedException e) {
+      Files.move(finalTmp, finalOut, StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    // Cleanup .part
+    Files.deleteIfExists(part);
+
+    // Optionally expose final path for logs (job listener etc.)
+    jobCtx.putString("finalFile", finalOut.toString());
+
+    contrib.incrementWriteCount(1); // "one file produced"
+    return RepeatStatus.FINISHED;
+  }
+}
+
+Batch wiring + context promotion (JobConfig.java)
+package demo.batch;
+
+import demo.config.AppProps;
+import demo.template.TemplateMapper;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.springframework.batch.core.Job;
+import org.springframework.batch.core.Step;
+import org.springframework.batch.core.configuration.JobRegistry;
+import org.springframework.batch.core.configuration.annotation.EnableBatchProcessing;
+import org.springframework.batch.core.explore.JobExplorer;
+import org.springframework.batch.core.job.builder.JobBuilder;
+import org.springframework.batch.core.launch.JobLauncher;
+import org.springframework.batch.core.launch.JobOperator;
+import org.springframework.batch.core.launch.support.SimpleJobOperator;
+import org.springframework.batch.core.launch.support.TaskExecutorJobLauncher;
+import org.springframework.batch.core.listener.ExecutionContextPromotionListener;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.core.step.builder.StepBuilder;
+import org.springframework.batch.item.ItemProcessor;
+import org.springframework.batch.item.ItemStreamReader;
+import org.springframework.batch.item.kafka.KafkaItemReader;
+import org.springframework.batch.item.kafka.builder.KafkaItemReaderBuilder;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.task.TaskExecutor;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.transaction.PlatformTransactionManager;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.time.Duration;
+
+@Configuration
+@EnableBatchProcessing
+public class JobConfig {
+
+  // KafkaItemReader pinned to one partition
+  @Bean
+  @org.springframework.batch.core.configuration.annotation.StepScope
+  KafkaItemReader<String,String> kafkaItemReader(ConsumerFactory<String,String> cf, AppProps p) {
+    return new KafkaItemReaderBuilder<String,String>()
+        .consumerFactory(cf)
+        .topic(p.getTopic())
+        .partitions(new int[]{p.getPartition()})
+        .name("kafkaReader")
+        .pollTimeout(Duration.ofMillis(p.getPollTimeoutMs()))
+        .saveState(true)
+        .build();
+  }
+
+  // Idle-aware wrapper
+  @Bean
+  @org.springframework.batch.core.configuration.annotation.StepScope
+  ItemStreamReader<ConsumerRecord<String,String>> idleAwareReader(
+      KafkaItemReader<String,String> delegate, AppProps p) {
+    return new IdleAwareItemReader(delegate, p.getIdleMs(), p.getPollTimeoutMs());
+  }
+
+  // Processor: per-message templating, robust header decode (UTF-8)
+  @Bean
+  @org.springframework.batch.core.configuration.annotation.StepScope
+  ItemProcessor<ConsumerRecord<String,String>, String> processor(TemplateMapper mapper) {
+    return rec -> {
+      String advice = header(rec, "ADVICE_CODE", "MCD");
+      String prod   = header(rec, "PROD_CODE", "ML");
+      String tpl = switch (advice) {
+        case "CSFXLIR"  -> "CS_BK_SW";
+        case "CSSWFLTR" -> "CS_BK";
+        case "MCC"      -> prod.equals("CTP") ? "IN_CS_MLC" : "IN_CS_ML";
+        case "MCD"      -> prod.equals("CTP") ? "OT_CS_MLC" : "OT_CS_ML";
+        default         -> "MCD";
+      };
+      return mapper.render(rec.value(), tpl);
+    };
+  }
+
+  private static String header(ConsumerRecord<String,String> rec, String key, String dflt) {
+    var h = rec.headers().lastHeader(key);
+    if (h == null) return dflt;
+    var s = new String(h.value(), StandardCharsets.UTF_8).trim();
+    return s.isEmpty() ? dflt : s;
+  }
+
+  // Writer for step 1
+  @Bean
+  @org.springframework.batch.core.configuration.annotation.StepScope
+  PartFileAppendWriter partWriter(AppProps p,
+    @org.springframework.beans.factory.annotation.Value("#{jobParameters['baseName'] ?: 'wires_'+T(java.time.LocalDate).now()}") String baseName) {
+    return new PartFileAppendWriter(Path.of(p.getStagingDir()), baseName);
+  }
+
+  // Promote step EC → job EC so finalize can read it
+  @Bean
+  public ExecutionContextPromotionListener promotePartKeys() {
+    var l = new ExecutionContextPromotionListener();
+    l.setKeys(new String[]{"partFile", "baseName"});
+    l.setStrict(true);
+    return l;
+  }
+
+  // Step 1: ingest (chunk)
+  @Bean
+  Step ingestStep(JobRepository repo, PlatformTransactionManager tx,
+                  ItemStreamReader<ConsumerRecord<String,String>> idleAwareReader,
+                  ItemProcessor<ConsumerRecord<String,String>, String> processor,
+                  PartFileAppendWriter partWriter,
+                  AppProps p,
+                  ExecutionContextPromotionListener promotePartKeys) {
+
+    return new StepBuilder("ingestStep", repo)
+        .<ConsumerRecord<String,String>, String>chunk(p.getChunkSize(), tx)
+        .reader(idleAwareReader)
+        .processor(processor)
+        .writer(partWriter)
+        .listener(promotePartKeys)   // <-- fix #1
+        .build();
+  }
+
+  // Step 2: finalize (banner + atomic rename, streaming)  // fix #2
+  @Bean
+  Step finalizeStep(JobRepository repo, PlatformTransactionManager tx, AppProps p) {
+    return new StepBuilder("finalizeStep", repo)
+        .tasklet(new FinalizeFileTasklet(p), tx)
+        .build();
+  }
+
+  // Job
+  @Bean
+  Job kafkaFileJob(JobRepository repo, Step ingestStep, Step finalizeStep) {
+    return new JobBuilder("kafkaFileJob", repo)
+        .incrementer(new org.springframework.batch.core.launch.support.RunIdIncrementer())
+        .start(ingestStep)
+        .next(finalizeStep)
+        .build();
+  }
+
+  // Async launcher + operator (same as before)
+  @Bean
+  TaskExecutor batchExecutor() {
+    var tp = new ThreadPoolTaskExecutor();
+    tp.setCorePoolSize(2);
+    tp.setMaxPoolSize(4);
+    tp.setQueueCapacity(0);
+    tp.setThreadNamePrefix("batch-");
+    tp.initialize();
+    return tp;
+  }
+
+  @Bean
+  JobLauncher asyncJobLauncher(JobRepository repo, TaskExecutor batchExecutor) throws Exception {
+    var l = new TaskExecutorJobLauncher();
+    l.setJobRepository(repo);
+    l.setTaskExecutor(batchExecutor);
+    l.afterPropertiesSet();
+    return l;
+  }
+
+  @Bean
+  JobOperator jobOperator(JobLauncher launcher, JobRepository repo, JobExplorer explorer, JobRegistry registry) {
+    var op = new SimpleJobOperator();
+    op.setJobLauncher(launcher);
+    op.setJobRepository(repo);
+    op.setJobExplorer(explorer);
+    op.setJobRegistry(registry);
+    return op;
+  }
+
+  @Bean
+  demo.template.TemplateMapper templateMapper() { return new demo.template.TemplateMapper(); }
+}
+
+REST controller (BatchController.java)
+package demo.web;
+
+import org.springframework.batch.core.explore.JobExplorer;
+import org.springframework.batch.core.launch.JobOperator;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.net.URI;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Properties;
+
+@RestController
+@RequestMapping("/jobs")
+public class BatchController {
+
+  private final JobOperator jobOperator;
+  private final JobExplorer jobExplorer;
+
+  public BatchController(JobOperator jobOperator, JobExplorer jobExplorer) {
+    this.jobOperator = jobOperator;
+    this.jobExplorer = jobExplorer;
+  }
+
+  @PostMapping("/start")
+  public ResponseEntity<Map<String, Object>> start(@RequestBody(required = false) Map<String, Object> body) throws Exception {
+    Properties p = new Properties();
+    if (body != null) body.forEach((k, v) -> p.setProperty(k, String.valueOf(v)));
+    // unique baseName for the .part to avoid overlap; final name comes from pattern
+    p.putIfAbsent("baseName", "wires_" + java.time.LocalDate.now() + "_" + java.util.UUID.randomUUID());
+    p.putIfAbsent("ts", String.valueOf(System.currentTimeMillis()));
+
+    long execId = jobOperator.start("kafkaFileJob", p);
+    URI status = URI.create("/jobs/status/" + execId);
+    return ResponseEntity.accepted()
+        .location(status)
+        .body(Map.of("executionId", execId, "statusUrl", status.toString(), "params", p));
+  }
+
+  @GetMapping("/status/{execId}")
+  public Map<String, Object> status(@PathVariable long execId) {
+    var exec = jobExplorer.getJobExecution(execId);
+    if (exec == null) throw new org.springframework.web.server.ResponseStatusException(HttpStatus.NOT_FOUND, "No such execution");
+
+    var stepMap = new LinkedHashMap<String, Object>();
+    exec.getStepExecutions().forEach(se -> {
+      var m = new LinkedHashMap<String, Object>();
+      m.put("status", se.getStatus().toString());
+      m.put("read", se.getReadCount());
+      m.put("written", se.getWriteCount());
+      m.put("filtered", se.getFilterCount());
+      m.put("readSkips", se.getReadSkipCount());
+      m.put("procSkips", se.getProcessSkipCount());
+      m.put("writeSkips", se.getWriteSkipCount());
+      stepMap.put(se.getStepName(), m);
+    });
+
+    return Map.of(
+        "id", exec.getId(),
+        "job", exec.getJobInstance().getJobName(),
+        "status", exec.getStatus().toString(),
+        "exitCode", exec.getExitStatus().getExitCode(),
+        "start", exec.getStartTime(),
+        "end", exec.getEndTime(),
+        "steps", stepMap,
+        "params", exec.getJobParameters().toProperties()
+    );
+  }
+}
+
+What changed vs your last version
+
+✅ Context promotion: ExecutionContextPromotionListener added to ingestStep; finalize reads from job EC.
+
+✅ Finalize is streaming: writes banner, then in.transferTo(out), fsync, atomic move.
+
+✅ Kafka hardening: YAML with dedicated group id, explicit timeouts; processor decodes headers with UTF-8.
+
+✅ Base .part name is unique per run (UUID) to avoid overlap.
+
+If you want me to also add the optional extras later (retries/skips, summary logger, cleanup, validation, idempotent chunk merge), say the word and I’ll layer them in without changing this structure.
