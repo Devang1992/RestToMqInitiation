@@ -1,0 +1,234 @@
+application.yml (essentials)
+spring:
+  batch:
+    job.enabled: false
+    jdbc.initialize-schema: always
+  datasource:
+    url: jdbc:h2:mem:batchdb;MODE=Oracle;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: kafka-batch-file-processor
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      max-poll-records: 200
+      properties:
+        isolation.level: read_committed
+        fetch.max.bytes: 67108864
+        max.partition.fetch.bytes: 16777216
+        fetch.min.bytes: 1048576
+        fetch.max.wait.ms: 500
+
+app:
+  topic: ep_wires_engine_pants_processed
+  partition: 0
+  chunk-size: 200
+  poll-timeout-ms: 500
+  staging-path: ./wires_out/wires_current.part    # <- same file for whole run
+  final-path:   ./wires_out/wires_final.txt       # <- renamed at end
+
+Config: Reader, Processor, Writer, Step, Job
+@Configuration(proxyBeanMethods = false)
+@RequiredArgsConstructor
+public class JobConfig {
+
+  private final JobRepository jobRepository;
+  private final PlatformTransactionManager transactionManager;
+
+  @Bean("kafkaItemReader")
+  @StepScope
+  public KafkaItemReader<String,String> kafkaItemReader(
+      ConsumerFactory<String,String> cf,
+      @Value("#{jobParameters['topic'] ?: '${app.topic}'}") String topic,
+      @Value("#{jobParameters['partition'] ?: ${app.partition}}") int partition,
+      @Value("#{jobParameters['pollTimeoutMs'] ?: ${app.poll-timeout-ms}}") long pollTimeoutMs
+  ) {
+    return new KafkaItemReaderBuilder<String,String>()
+        .name("kafkaReader")
+        .consumerFactory(cf)
+        .topic(topic)
+        .partitions(partition)
+        .pollTimeout(Duration.ofMillis(pollTimeoutMs))
+        .saveState(true)               // restartable
+        .build();
+  }
+
+  // Map ConsumerRecord -> its value (String). No headers.
+  @Bean
+  @StepScope
+  public ItemProcessor<ConsumerRecord<String,String>, String> valueOnlyProcessor() {
+    return rec -> rec == null ? null : rec.value();
+  }
+
+  // Simple append writer to a single file for the whole run.
+  @Bean
+  @StepScope
+  public FlatFileItemWriter<String> appendWriter(
+      @Value("#{jobParameters['stagingPath'] ?: '${app.staging-path}'}") String stagingPath
+  ) {
+    FlatFileItemWriter<String> w = new FlatFileItemWriter<>();
+    File file = Path.of(stagingPath).toFile();
+    file.getParentFile().mkdirs(); // make sure dir exists
+    w.setResource(new FileSystemResource(file));
+    w.setAppendAllowed(true);      // **append** on reopen/chunks/restarts
+    w.setTransactional(false);     // commit on write, not buffered in TX
+    w.setLineAggregator(new PassThroughLineAggregator<>());
+    return w;
+  }
+
+  // Chunk step: read from Kafka, write values to file.
+  @Bean
+  public Step ingestStep(
+      @Qualifier("kafkaItemReader") ItemStreamReader<ConsumerRecord<String,String>> reader,
+      ItemProcessor<ConsumerRecord<String,String>, String> valueOnlyProcessor,
+      FlatFileItemWriter<String> appendWriter,
+      @Value("${app.chunk-size}") int chunkSize
+  ) {
+    return new StepBuilder("ingestStep", jobRepository)
+        .<ConsumerRecord<String,String>, String>chunk(chunkSize, transactionManager)
+        .reader(reader)
+        .processor(valueOnlyProcessor)
+        .writer(appendWriter)
+        .build();
+  }
+
+  // Tasklet to rename the file at the very end (atomic finalize)
+  @Bean
+  @StepScope
+  public Tasklet finalizeTasklet(
+      @Value("#{jobParameters['stagingPath'] ?: '${app.staging-path}'}") String stagingPath,
+      @Value("#{jobParameters['finalPath']   ?: '${app.final-path}'}") String finalPath
+  ) {
+    return (contribution, chunkCtx) -> {
+      Path src = Path.of(stagingPath);
+      Path dst = Path.of(finalPath);
+      Files.createDirectories(dst.getParent());
+      // replace existing if any (atomic on same filesystem)
+      Files.move(src, dst, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+      return RepeatStatus.FINISHED;
+    };
+  }
+
+  @Bean
+  public Step finalizeStep(Tasklet finalizeTasklet) {
+    return new StepBuilder("finalizeStep", jobRepository)
+        .tasklet(finalizeTasklet, transactionManager)
+        .build();
+  }
+
+  @Bean
+  public Job kafkaFileJob(Step ingestStep, Step finalizeStep) {
+    return new JobBuilder("kafkaFileJob", jobRepository)
+        .start(ingestStep)
+        .next(finalizeStep)
+        .incrementer(new RunIdIncrementer()) // enables startNextInstance
+        .build();
+  }
+}
+
+Async launcher + controller
+@Configuration(proxyBeanMethods = false)
+class BatchInfra {
+
+  @Bean
+  public TaskExecutor jobTaskExecutor() {
+    ThreadPoolTaskExecutor ex = new ThreadPoolTaskExecutor();
+    ex.setCorePoolSize(2);
+    ex.setMaxPoolSize(4);
+    ex.setThreadNamePrefix("batch-");
+    ex.initialize();
+    return ex;
+  }
+
+  @Bean
+  public JobLauncher jobLauncher(JobRepository repo, TaskExecutor jobTaskExecutor) {
+    TaskExecutorJobLauncher jl = new TaskExecutorJobLauncher();
+    jl.setJobRepository(repo);
+    jl.setTaskExecutor(jobTaskExecutor);  // <— async
+    return jl;
+  }
+
+  @Bean
+  public JobOperator jobOperator(JobLauncher launcher, JobRepository repo,
+                                 JobExplorer explorer, JobRegistry registry) {
+    var op = new SimpleJobOperator();
+    op.setJobLauncher(launcher);
+    op.setJobRepository(repo);
+    op.setJobExplorer(explorer);
+    op.setJobRegistry(registry);
+    return op;
+  }
+}
+
+@RestController
+@RequiredArgsConstructor
+class BatchController {
+
+  private final JobOperator jobOperator;
+  private final JobExplorer jobExplorer;
+
+  @PostMapping("/jobs/{jobName}")
+  public ResponseEntity<String> start(
+      @PathVariable String jobName,
+      @RequestBody(required = false) Map<String,Object> params) throws Exception {
+
+    // default params if caller sends nothing
+    Properties p = new Properties();
+    if (params != null) params.forEach((k,v) -> p.put(k, String.valueOf(v)));
+
+    long execId = jobOperator.start(jobName, toParamString(p)); // returns immediately
+    URI status = URI.create("/jobs/executions/" + execId);
+    return ResponseEntity.accepted()
+        .location(status)
+        .body("executionId=" + execId);
+  }
+
+  @GetMapping("/jobs/executions/{id}")
+  public Map<String,Object> status(@PathVariable long id) {
+    var e = jobExplorer.getJobExecution(id);
+    return Map.of("id", id,
+                  "status", e == null ? "UNKNOWN" : String.valueOf(e.getStatus()),
+                  "exitCode", e == null ? "" : String.valueOf(e.getExitStatus()));
+  }
+
+  private static String toParamString(Properties p) {
+    return p.entrySet().stream()
+        .map(e -> e.getKey()+"="+e.getValue())
+        .collect(java.util.stream.Collectors.joining(","));
+  }
+}
+
+
+How it behaves
+
+The POST /jobs/kafkaFileJob starts the job asynchronously and returns 202 Accepted with the execution ID.
+
+The step reads only key/value from Kafka and appends each value as a line into wires_current.part.
+
+When the chunk step finishes (KafkaItemReader returns null because there are no more records within the current assignment / poll timeout), the finalize step renames *.part → final filename atomically.
+
+Notes/limits
+
+This version does not read headers—you said that’s OK.
+
+If your topic keeps getting new data constantly and you don’t want to include late arrivals, start the consumer with a captured end offset (you can add that later) or run during a quiet window.
+
+If you need daily rotation names, pass finalPath as a job parameter from the controller.
+
+Typical start body (Postman)
+
+{
+  "topic": "ep_wires_engine_pants_processed",
+  "partition": 0,
+  "chunkSize": 200,
+  "stagingPath": "./wires_out/wires_20250820.part",
+  "finalPath": "./wires_out/wires_20250820.txt",
+  "pollTimeoutMs": 500
+}
+
+
+If you still get hung-up behavior (job never ends), that means your broker is never giving an empty poll—then we can reintroduce a tiny idle timeout (just a few lines) inside the reader bean without the cross-bean wrapper. But try this first: it’s the simplest stable path with KafkaItemReader and no headers.
