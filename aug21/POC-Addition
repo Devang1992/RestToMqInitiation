@@ -1,0 +1,102 @@
+Yes — you can keep everything else the same and only swap the reader side to return String (the Kafka value). The mistake that caused your “value() is not public in java.lang.String” error was that the wrapper’s delegate.read() was already returning a String, not a ConsumerRecord, so rec.value() tried to call a method on String.
+
+Below is the minimal, working change set:
+
+1) Keep the KafkaItemReader as-is (it returns ConsumerRecord)
+// returns ConsumerRecord<String,String>
+@Bean
+@StepScope
+KafkaItemReader<String, String> kafkaItemReader(
+    ConsumerFactory<String, String> cf, AppProps p) {
+
+  return new KafkaItemReaderBuilder<String,String>()
+      .consumerFactory(cf)
+      .topic(p.getTopic())
+      .partitions(new int[]{ p.getPartition() })
+      .name("kafkaReader")
+      .pollTimeout(Duration.ofMillis(p.getPollTimeoutMs()))
+      .saveState(true)
+      .build();
+}
+
+2) Add a tiny adapter that exposes ItemStreamReader<String>
+
+It delegates to the Kafka reader, pulls the value only, and forwards open/update/close.
+
+@Bean
+@StepScope
+ItemStreamReader<String> valueOnlyReader(
+    ItemStreamReader<ConsumerRecord<String,String>> delegate,  // <-- IMPORTANT TYPE
+    AppProps p) {
+
+  return new ItemStreamReader<>() {
+    @Override public void open(ExecutionContext ctx) throws ItemStreamException { delegate.open(ctx); }
+    @Override public void update(ExecutionContext ctx) throws ItemStreamException { delegate.update(ctx); }
+    @Override public void close() throws ItemStreamException { delegate.close(); }
+
+    @Override
+    public String read() throws Exception {
+      var rec = delegate.read();           // this is ConsumerRecord<String,String>
+      return (rec == null) ? null : rec.value();   // expose only the value
+    }
+  };
+}
+
+
+If you want idle-timeout behavior, you can wrap that delegate with your IdleAwareItemReader first, and then adapt to String. Just keep the types straight:
+
+KafkaItemReader → (optional) IdleAwareItemReader → valueOnlyReader (String).
+
+3) Adjust processor and step generics to <String, String>
+
+No headers now—process the raw value (JSON or plain text). You can still render with your template mapper if you parse the value.
+
+@Bean
+@StepScope
+ItemProcessor<String, String> processor(TemplateMapper mapper) {
+  return payloadJson -> {
+    // either return payload as-is, or render a template based on fields inside the JSON
+    // e.g. pick template by "adviceCode" field if you like:
+    // var advice = JsonPath.read(payloadJson, "$.ADVICE_CODE");
+    // var tpl = resolveTemplate(advice, ...);
+    // return mapper.render(payloadJson, tpl);
+    return payloadJson;  // simplest: just write the value
+  };
+}
+
+4) Wire the step to use the new reader
+
+Everything else (writer, context promotion, finalize tasklet) stays the same.
+
+@Bean
+Step ingestStep(JobRepository repo, PlatformTransactionManager tx,
+                ItemStreamReader<String> valueOnlyReader,
+                ItemProcessor<String,String> processor,
+                PartFileAppendWriter partWriter,
+                AppProps p,
+                ExecutionContextPromotionListener promotePartKeys) {
+
+  return new StepBuilder("ingestStep", repo)
+      .<String, String>chunk(p.getChunkSize(), tx)
+      .reader(valueOnlyReader)       // <-- now String
+      .processor(processor)          // <-- String -> String
+      .writer(partWriter)            // <-- writes lines
+      .listener(promotePartKeys)
+      .build();
+}
+
+Why this works (and what went wrong before)
+
+KafkaItemReader<K,V> always yields ConsumerRecord<K,V>.
+
+Your wrapper must therefore accept ItemStreamReader<ConsumerRecord<K,V>> as delegate.
+
+In your screenshot, the IDE said “value() is not public in java.lang.String” which only happens if rec was already a String. That means the wrapper’s generic type wasn’t aligned and the delegate had the wrong signature.
+
+With the types above, the pipeline is:
+
+KafkaItemReader<ConsumerRecord> → (optional IdleAwareItemReader) → valueOnlyReader: ItemStreamReader<String> → ItemProcessor<String,String> → PartFileAppendWriter.
+
+You’ll get key/value-free, value-only lines in your *.part, the finalize step still runs (banner → stream → atomic rename), and your job remains restartable.
+
+If you want me to fold idle-timeout into this String-only flow or add a simple “pick-template-from-JSON-field” processor, I can drop those in the same pattern without touching the rest.
