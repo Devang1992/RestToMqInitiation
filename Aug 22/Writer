@@ -1,0 +1,110 @@
+Single-file append writer (restart-safe)
+package com.yourpkg.batch;
+
+import org.springframework.batch.item.Chunk;
+import org.springframework.batch.item.ExecutionContext;
+import org.springframework.batch.item.ItemStreamException;
+import org.springframework.batch.item.ItemStreamWriter;
+
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.file.*;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+
+public class SingleFileAppendWriter implements ItemStreamWriter<String> {
+
+    private static final String EC_KEY_OUT_PATH = "writer.out.path";
+
+    private final Path dir;
+    private final String filePattern; // e.g. "WIRES_${date}_run${runId}.txt"
+    private BufferedWriter bw;
+    private Path outPath;
+
+    public SingleFileAppendWriter(Path dir, String filePattern) {
+        this.dir = dir;
+        this.filePattern = filePattern;
+    }
+
+    @Override
+    public void open(ExecutionContext ec) throws ItemStreamException {
+        try {
+            Files.createDirectories(dir);
+
+            if (ec != null && ec.containsKey(EC_KEY_OUT_PATH)) {
+                // Resume same file on restart
+                outPath = Paths.get(ec.getString(EC_KEY_OUT_PATH));
+            } else {
+                // Decide file name ONCE per step run
+                String date = new SimpleDateFormat("yyyyMMdd").format(new Date());
+                String runId = String.valueOf(System.currentTimeMillis()); // stable for this run
+                String fileName = filePattern
+                        .replace("${date}", date)
+                        .replace("${runId}", runId);
+
+                outPath = dir.resolve(fileName);
+                if (ec != null) ec.putString(EC_KEY_OUT_PATH, outPath.toString());
+            }
+
+            bw = Files.newBufferedWriter(
+                    outPath,
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE
+            );
+        } catch (IOException e) {
+            throw new ItemStreamException("Failed to open writer for " + outPath, e);
+        }
+    }
+
+    @Override
+    public void write(Chunk<? extends String> items) throws Exception {
+        for (String line : items) {
+            bw.write(line);
+            bw.newLine(); // platform line ending
+        }
+    }
+
+    @Override
+    public void update(ExecutionContext ec) throws ItemStreamException {
+        try {
+            if (bw != null) bw.flush(); // ensure data hits disk between chunks
+        } catch (IOException e) {
+            throw new ItemStreamException("Flush failed for " + outPath, e);
+        }
+    }
+
+    @Override
+    public void close() throws ItemStreamException {
+        try {
+            if (bw != null) {
+                bw.flush();
+                bw.close();
+            }
+        } catch (IOException e) {
+            throw new ItemStreamException("Failed to close writer for " + outPath, e);
+        }
+    }
+}
+
+2) Wire it in your config
+// in your @Configuration class
+@Bean
+public ItemStreamWriter<String> fileWriter(BatchProps props) {
+    return new SingleFileAppendWriter(
+            Path.of(props.getOutputDir()),
+            props.getFilePattern() // e.g. "WIRES_${date}_run${runId}.txt"
+    );
+}
+
+3) Make sure your pattern is stable for the run
+
+Use a pattern like WIRES_${date}_run${runId}.txt. The writer resolves ${runId} once in open() and stores it in the ExecutionContext, so every chunk goes to the same file—even across restarts.
+
+4) Why this solves it
+
+Filename chosen once → not recomputed per chunk.
+
+Append mode → StandardOpenOption.APPEND keeps adding to the same file.
+
+Restart-safe → on restart, we read the saved path from the ExecutionContext and continue appending.
+
+If you also want a “finalize/rename” step (write to .part then atomic-rename to final name at the end), I can add a tiny second step that does Files.move(tmp, final, ATOMIC_MOVE) after the main step completes.
