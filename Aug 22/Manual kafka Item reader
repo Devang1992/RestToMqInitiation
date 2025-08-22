@@ -1,0 +1,261 @@
+Awesome—here’s a drop-in, version-agnostic ManualKafkaItemReader that returns ConsumerRecord<K,V> and plays nicely with Spring Batch 5 / Boot 3.4.6. Then I wire it in a clean @Configuration so your step is <ConsumerRecord<String,String>, String>.
+
+1) ManualKafkaItemReader.java
+package com.yourpkg.batch;
+
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.common.TopicPartition;
+import org.springframework.batch.item.*;
+import org.springframework.batch.item.support.AbstractItemCountingItemStreamItemReader;
+import org.springframework.kafka.core.ConsumerFactory;
+
+import java.time.Duration;
+import java.util.*;
+
+/**
+ * A simple, robust ItemStreamReader over Kafka that:
+ * - assigns fixed partitions (no group rebalancing)
+ * - supports seek to beginning/end or per-partition initial offsets
+ * - persists positions in the Step ExecutionContext (restartable)
+ * - commits synchronously on update()
+ */
+public class ManualKafkaItemReader<K, V>
+        extends AbstractItemCountingItemStreamItemReader<org.apache.kafka.clients.consumer.ConsumerRecord<K, V>> {
+
+    private final ConsumerFactory<K, V> consumerFactory;
+    private final String topic;
+    private final List<Integer> partitions;
+    private final Duration pollTimeout;
+    private final boolean startFromEnd;
+    private final Map<Integer, Long> initialOffsets; // partition -> offset
+
+    private Consumer<K, V> consumer;
+    private Iterator<org.apache.kafka.clients.consumer.ConsumerRecord<K, V>> bufferIt = Collections.emptyIterator<>();
+
+    public ManualKafkaItemReader(ConsumerFactory<K, V> consumerFactory,
+                                 String topic,
+                                 List<Integer> partitions,
+                                 Duration pollTimeout,
+                                 boolean startFromEnd,
+                                 Map<Integer, Long> initialOffsets) {
+        setName("manualKafkaItemReader");
+        this.consumerFactory = consumerFactory;
+        this.topic = topic;
+        this.partitions = partitions;
+        this.pollTimeout = pollTimeout;
+        this.startFromEnd = startFromEnd;
+        this.initialOffsets = initialOffsets == null ? Collections.emptyMap() : initialOffsets;
+    }
+
+    @Override
+    protected void doOpen() {
+        this.consumer = consumerFactory.createConsumer();
+        List<TopicPartition> tps = new ArrayList<>();
+        for (Integer p : partitions) tps.add(new TopicPartition(topic, p));
+        consumer.assign(tps);
+
+        // Try restore from ExecutionContext
+        boolean restored = false;
+        ExecutionContext ec = getExecutionContext();
+        for (TopicPartition tp : tps) {
+            String key = offsetKey(tp);
+            if (ec.containsKey(key)) {
+                consumer.seek(tp, ec.getLong(key));
+                restored = true;
+            }
+        }
+
+        if (!restored) {
+            // Seed from initialOffsets if provided
+            boolean usedInitial = false;
+            for (TopicPartition tp : tps) {
+                Long off = initialOffsets.get(tp.partition());
+                if (off != null) {
+                    consumer.seek(tp, off);
+                    usedInitial = true;
+                }
+            }
+            if (!usedInitial) {
+                if (startFromEnd) consumer.seekToEnd(tps);
+                else consumer.seekToBeginning(tps);
+            }
+        }
+    }
+
+    @Override
+    protected org.apache.kafka.clients.consumer.ConsumerRecord<K, V> doRead() {
+        if (!bufferIt.hasNext()) {
+            ConsumerRecords<K, V> polled = consumer.poll(pollTimeout);
+            bufferIt = polled.iterator();
+            if (!bufferIt.hasNext()) return null; // no data this poll
+        }
+        return bufferIt.next();
+    }
+
+    @Override
+    protected void doClose() {
+        if (consumer != null) consumer.close();
+    }
+
+    @Override
+    public void update(ExecutionContext ec) throws ItemStreamException {
+        // Save current positions and commit
+        for (TopicPartition tp : consumer.assignment()) {
+            long pos = consumer.position(tp);
+            ec.putLong(offsetKey(tp), pos);
+        }
+        consumer.commitSync();
+    }
+
+    private String offsetKey(TopicPartition tp) {
+        return "kafka.offset." + tp.topic() + "." + tp.partition();
+    }
+}
+
+2) Properties holder (if you don’t already have one)
+package com.yourpkg.config;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+import java.util.Map;
+
+@Component
+@ConfigurationProperties(prefix = "app.batch")
+public class BatchProps {
+    private String topic;
+    private List<Integer> partitions;
+    private int pollTimeoutMs = 1000;
+    private boolean startFromEnd = false;
+    private Map<Integer, Long> initialOffsets; // partition -> offset (optional)
+    private int chunk = 100;
+    private String outputDir = "./out";
+    private String filePattern = "batch_${ts}.txt";
+    // getters/setters...
+}
+
+3) Batch config wiring ManualKafkaItemReader into a step
+package com.yourpkg.config;
+
+import com.yourpkg.batch.ManualKafkaItemReader;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.springframework.batch.core.Job;
+import org.springframework.batch.core.Step;
+import org.springframework.batch.core.configuration.annotation.EnableBatchProcessing;
+import org.springframework.batch.core.job.builder.JobBuilder;
+import org.springframework.batch.core.launch.support.RunIdIncrementer;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.item.*;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.transaction.PlatformTransactionManager;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.text.SimpleDateFormat;
+import java.time.Duration;
+import java.util.Date;
+import java.util.stream.Collectors;
+
+@Configuration
+@EnableBatchProcessing
+public class BatchConfig {
+
+    private final BatchProps props;
+    private final ConsumerFactory<String, String> consumerFactory;
+
+    public BatchConfig(BatchProps props, ConsumerFactory<String, String> consumerFactory) {
+        this.props = props;
+        this.consumerFactory = consumerFactory;
+    }
+
+    @Bean
+    public ItemStreamReader<ConsumerRecord<String, String>> kafkaReader() {
+        return new ManualKafkaItemReader<>(
+                consumerFactory,
+                props.getTopic(),
+                props.getPartitions(),
+                Duration.ofMillis(props.getPollTimeoutMs()),
+                props.isStartFromEnd(),
+                props.getInitialOffsets()
+        );
+    }
+
+    @Bean
+    public ItemProcessor<ConsumerRecord<String,String>, String> processor() {
+        return rec -> {
+            // one log per record (optional)
+            // log.info("processing: topic={}, p={}, o={}, key={}", rec.topic(), rec.partition(), rec.offset(), rec.key());
+            return (rec.key() == null ? "" : rec.key()) + "|" + (rec.value() == null ? "" : rec.value());
+        };
+    }
+
+    @Bean
+    public ItemStreamWriter<String> fileWriter() {
+        return items -> {
+            Path dir = Path.of(props.getOutputDir());
+            Files.createDirectories(dir);
+            String ts = new SimpleDateFormat("yyyyMMddHHmmss").format(new Date());
+            Path out = dir.resolve(props.getFilePattern().replace("${ts}", ts));
+            Files.write(out,
+                    items.stream().map(s -> s + System.lineSeparator()).collect(Collectors.toList()),
+                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+        };
+    }
+
+    @Bean
+    public Step kafkaToFileStep(JobRepository repo,
+                                PlatformTransactionManager tx,
+                                ItemStreamReader<ConsumerRecord<String,String>> kafkaReader,
+                                ItemProcessor<ConsumerRecord<String,String>, String> processor,
+                                ItemStreamWriter<String> fileWriter) {
+        return new org.springframework.batch.core.step.builder.StepBuilder("kafkaToFileStep", repo)
+                .<ConsumerRecord<String,String>, String>chunk(props.getChunk(), tx)
+                .reader(kafkaReader)
+                .processor(processor)
+                .writer(fileWriter)
+                .build();
+    }
+
+    @Bean
+    public Job kafkaToFileJob(JobRepository repo, Step step) {
+        return new JobBuilder("kafkaToFileJob", repo)
+                .incrementer(new RunIdIncrementer())
+                .start(step)
+                .build();
+    }
+}
+
+4) application.yml (example)
+spring:
+  batch.job.enabled: false
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: my-batch-group
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      enable-auto-commit: false
+      auto-offset-reset: earliest
+
+app:
+  batch:
+    topic: demo-topic
+    partitions: [0]           # explicit assignment (no rebalancing)
+    poll-timeout-ms: 1000
+    start-from-end: false     # true to tail only new data
+    initial-offsets: {}       # e.g. {"0": 12345}
+    chunk: 100
+    output-dir: ./out
+    file-pattern: batch_${ts}.txt
+
+Notes / gotchas
+
+This reader assigns partitions and manages seeks itself; it doesn’t rely on consumer group rebalancing. Run one instance per partition set.
+
+Offsets are saved in the Step ExecutionContext and commitSync() is called in update() → restarts resume correctly.
+
+If you ever see “duplicate logs”, ensure you’re not logging per item in both processor and writer, and the job isn’t launched twice.
