@@ -333,3 +333,81 @@ public class ManualKafkaItemReader<K, V>
   }
 }
 
+------------------------------------------------------------------------------------------------------------------------------
+
+@Override
+public void open(ExecutionContext ec) throws ItemStreamException {
+    try {
+        // Create & assign once per open()
+        this.consumer = consumerFactory.createConsumer();
+        List<TopicPartition> tps = new ArrayList<>();
+        for (Integer p : partitions) tps.add(new TopicPartition(topic, p));
+        consumer.assign(tps);
+
+        // 1) Try to restore from Step ExecutionContext (restart)
+        boolean restored = false;
+        if (ec != null) {
+            for (TopicPartition tp : tps) {
+                String key = offsetKey(tp);
+                if (ec.containsKey(key)) {
+                    long pos = ec.getLong(key);
+
+                    // Guard against out-of-range after retention/compaction
+                    long begin = consumer.beginningOffsets(Collections.singleton(tp)).get(tp);
+                    long end   = consumer.endOffsets(Collections.singleton(tp)).get(tp);
+                    long safe  = Math.max(begin, Math.min(pos, end));
+                    consumer.seek(tp, safe);
+                    restored = true;
+                }
+            }
+        }
+
+        // 2) If not restored, seed from initialOffsets or fallback
+        if (!restored) {
+            boolean usedInitial = false;
+            for (TopicPartition tp : tps) {
+                Long off = initialOffsets.get(tp.partition());
+                if (off != null) {
+                    consumer.seek(tp, off);
+                    usedInitial = true;
+                }
+            }
+            if (!usedInitial) {
+                if (startFromEnd) consumer.seekToEnd(tps);
+                else consumer.seekToBeginning(tps);
+            }
+        }
+    } catch (Exception e) {
+        throw new ItemStreamException("Failed to open ManualKafkaItemReader", e);
+    }
+}
+
+/**
+ * Required by AbstractItemCountingItemStreamItemReader but unused here.
+ * We deliberately keep all initialization in open(ExecutionContext) so we
+ * can use the Step's ExecutionContext for offset restoration.
+ */
+@Override
+protected void doOpen() throws Exception { /* no-op on purpose */ }
+
+/**
+ * Required by AbstractItemCountingItemStreamItemReader but unused here.
+ * Actual resource cleanup is done in close().
+ */
+@Override
+protected void doClose() throws Exception { /* no-op on purpose */ }
+
+@Override
+public void close() throws ItemStreamException {
+    if (consumer != null) consumer.close();
+}
+
+@Override
+public void update(ExecutionContext ec) throws ItemStreamException {
+    // Persist current positions and commit so restarts resume accurately.
+    for (TopicPartition tp : consumer.assignment()) {
+        long pos = consumer.position(tp);
+        ec.putLong(offsetKey(tp), pos);
+    }
+    consumer.commitSync();
+}
