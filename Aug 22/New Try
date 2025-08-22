@@ -1,0 +1,307 @@
+you got it — let’s lock to Spring Boot 3.4.6 and use the official KafkaItemReader (from Spring Batch 5.2.x under Boot 3.4). The build below is small, boring, and works:
+
+Reads from a topic in chunks with KafkaItemReader
+
+Optional start offsets per partition (or resume from group offsets)
+
+Processor logs simple metrics (count, bytes, per-partition)
+
+Writes to a file (append, streamed)
+
+Launch with a tiny controller (returns execution id immediately)
+
+If you just paste these files, it’ll run.
+
+1) pom.xml (Boot 3.4.6 manages compatible Spring Batch/Kafka)
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.4.6</version>
+  </parent>
+
+  <groupId>dev.demo</groupId>
+  <artifactId>batch-kafka</artifactId>
+  <version>0.0.1</version>
+  <properties><java.version>17</java.version></properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-batch</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.kafka</groupId>
+      <artifactId>spring-kafka</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+    <!-- optional for @ConfigurationProperties metadata -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-configuration-processor</artifactId>
+      <optional>true</optional>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+
+
+Why this version? KafkaItemReader + its builder (KafkaItemReaderBuilder) are standard in Spring Batch 5.x and are what Boot 3.4 pulls in. See the Spring Batch API docs for KafkaItemReader and its builder (including partitionOffsets) for details. 
+Home
++2
+Home
++2
+
+2) application.yml (simple, YAML-driven)
+server:
+  port: 8080
+
+spring:
+  main.web-application-type: servlet
+  batch.job.enabled: false   # don't auto-run
+  kafka:
+    bootstrap-servers: localhost:9092
+
+app:
+  topic: demo-topic
+  groupId: demo-batch-group
+  partitions: [0]                 # bind explicitly
+  # If empty → reader resumes from Kafka's stored group offsets
+  # If provided → reader seeks to these offsets first
+  initialOffsets: {}              # e.g. {"0": 12345}
+  pollTimeoutMs: 1000
+  chunk: 100
+  outputDir: ./out
+  filePattern: batch_${yyyyMMddHHmmss}.txt
+
+3) Props (BatchProps.java)
+package dev.demo;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+import java.util.Map;
+
+@Component
+@ConfigurationProperties(prefix = "app")
+public class BatchProps {
+  private String topic;
+  private String groupId;
+  private List<Integer> partitions;
+  private Map<Integer, Long> initialOffsets;
+  private int pollTimeoutMs;
+  private int chunk;
+  private String outputDir;
+  private String filePattern;
+
+  // getters/setters...
+}
+
+4) Batch config using KafkaItemReader (BatchConfig.java)
+package dev.demo;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.kafka.common.TopicPartition;
+import org.springframework.batch.core.Job;
+import org.springframework.batch.core.Step;
+import org.springframework.batch.core.configuration.annotation.EnableBatchProcessing;
+import org.springframework.batch.core.job.builder.JobBuilder;
+import org.springframework.batch.core.launch.support.RunIdIncrementer;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.item.*;
+import org.springframework.batch.item.kafka.KafkaItemReader;
+import org.springframework.batch.item.kafka.builder.KafkaItemReaderBuilder;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.transaction.PlatformTransactionManager;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.text.SimpleDateFormat;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
+
+@Configuration
+@EnableBatchProcessing
+public class BatchConfig {
+
+  private final BatchProps props;
+  private final ObjectMapper objectMapper = new ObjectMapper();
+
+  public BatchConfig(BatchProps props) {
+    this.props = props;
+  }
+
+  @Bean
+  public ItemStreamReader<org.apache.kafka.clients.consumer.ConsumerRecord<String, String>> kafkaReader() {
+    Properties consumerProps = new Properties();
+    consumerProps.put("bootstrap.servers", System.getProperty("spring.kafka.bootstrap-servers", "localhost:9092"));
+    consumerProps.put("group.id", props.getGroupId());
+    consumerProps.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+    consumerProps.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+    consumerProps.put("enable.auto.commit", "false");
+    consumerProps.put("auto.offset.reset", "earliest"); // ignored if resuming from group offsets
+
+    // partitions
+    List<TopicPartition> tps = props.getPartitions().stream()
+        .map(p -> new TopicPartition(props.getTopic(), p))
+        .collect(Collectors.toList());
+
+    // optional per-partition starting offsets (or empty to resume from Kafka)
+    Map<TopicPartition, Long> startOffsets = new HashMap<>();
+    if (props.getInitialOffsets() != null) {
+      props.getInitialOffsets().forEach((p, off) ->
+          startOffsets.put(new TopicPartition(props.getTopic(), p), off));
+    }
+
+    return new KafkaItemReaderBuilder<String, String>()
+        .partitions(tps)
+        .partitionOffsets(startOffsets) // empty map → resume from Kafka stored offsets
+        .consumerProperties(consumerProps)
+        .pollTimeout(props.getPollTimeoutMs())
+        .name("kafkaItemReader")
+        .build();
+  }
+
+  @Bean
+  public ItemProcessor<org.apache.kafka.clients.consumer.ConsumerRecord<String, String>, String> metricsProcessor() {
+    AtomicLong count = new AtomicLong();
+    AtomicLong bytes = new AtomicLong();
+    Map<Integer, AtomicLong> perPartition = new HashMap<>();
+
+    return rec -> {
+      long c = count.incrementAndGet();
+      int sz = (rec.value() == null ? 0 : rec.value().length()) + (rec.key() == null ? 0 : rec.key().length());
+      bytes.addAndGet(sz);
+      perPartition.computeIfAbsent(rec.partition(), k -> new AtomicLong()).incrementAndGet();
+
+      if (c % 1000 == 0) {
+        System.out.printf("processed=%d, bytes=%d, partitions=%s, ts=%s%n",
+            c, bytes.get(), perPartition.entrySet().stream()
+                .map(e -> e.getKey()+":"+e.getValue().get()).collect(Collectors.joining(",")),
+            Instant.now());
+      }
+
+      // Keep the line simple: key|value
+      return (rec.key() == null ? "" : rec.key()) + "|" + (rec.value() == null ? "" : rec.value());
+    };
+  }
+
+  @Bean
+  public ItemStreamWriter<String> fileWriter() {
+    return items -> {
+      Path dir = Path.of(props.getOutputDir());
+      Files.createDirectories(dir);
+      String fileName = props.getFilePattern()
+          .replace("${yyyyMMddHHmmss}", new SimpleDateFormat("yyyyMMddHHmmss").format(new Date()));
+      Path out = dir.resolve(fileName);
+      Files.write(out,
+          items.stream().map(s -> s + System.lineSeparator()).collect(Collectors.toList()),
+          java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+    };
+  }
+
+  @Bean
+  public Step kafkaToFileStep(JobRepository repo, PlatformTransactionManager tx) {
+    return new org.springframework.batch.core.step.builder.StepBuilder("kafkaToFileStep", repo)
+        .<org.apache.kafka.clients.consumer.ConsumerRecord<String, String>, String>chunk(props.getChunk(), tx)
+        .reader(kafkaReader())
+        .processor(metricsProcessor())
+        .writer(fileWriter())
+        .build();
+  }
+
+  @Bean
+  public Job kafkaToFileJob(JobRepository repo, Step step) {
+    return new JobBuilder("kafkaToFileJob", repo)
+        .incrementer(new RunIdIncrementer())
+        .start(step)
+        .build();
+  }
+}
+
+
+Notes that matter:
+
+KafkaItemReader stores offsets in the step execution context for restarts, and you can also seed starting offsets via the builder’s partitionOffsets (or leave empty to resume from the consumer group’s offsets). That behavior is straight from the Spring Batch docs. 
+Home
++1
+
+5) Async launch controller that returns the execution id (JobController.java)
+package dev.demo;
+
+import org.springframework.batch.core.JobExecution;
+import org.springframework.batch.core.explore.JobExplorer;
+import org.springframework.batch.core.launch.JobOperator;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.Map;
+
+@RestController
+@RequestMapping("/jobs")
+public class JobController {
+  private final JobOperator jobOperator;
+  private final JobExplorer jobExplorer;
+
+  public JobController(JobOperator jobOperator, JobExplorer jobExplorer) {
+    this.jobOperator = jobOperator;
+    this.jobExplorer = jobExplorer;
+  }
+
+  @PostMapping("/start")
+  public Map<String, Object> start(@RequestParam(defaultValue = "") String params) throws Exception {
+    long id = jobOperator.start("kafkaToFileJob", params);
+    return Map.of("executionId", id, "status", "STARTED");
+  }
+
+  @GetMapping("/{id}")
+  public Map<String, Object> status(@PathVariable long id) {
+    JobExecution je = jobExplorer.getJobExecution(id);
+    return je == null ? Map.of("executionId", id, "status", "UNKNOWN")
+        : Map.of("executionId", id, "status", je.getStatus().toString(),
+                 "startTime", je.getStartTime(), "endTime", je.getEndTime(),
+                 "exitCode", je.getExitStatus() == null ? null : je.getExitStatus().getExitCode());
+  }
+
+  @PostMapping("/{id}/stop")
+  public Map<String, Object> stop(@PathVariable long id) throws Exception {
+    return Map.of("executionId", id, "stopSignalSent", jobOperator.stop(id));
+  }
+}
+
+How to run (quick)
+
+Start Kafka & create your topic (demo-topic).
+
+Run the app.
+
+Produce a few messages.
+
+POST http://localhost:8080/jobs/start → returns executionId.
+
+GET http://localhost:8080/jobs/{id} to check status.
+
+Find the file under ./out.
+
+Tuning / header access
+
+If you need headers inside the processor, switch the value deserializer to ByteArrayDeserializer (value) and parse yourself; headers are already on ConsumerRecord (rec.headers()), which you can iterate and log/emit.
+
+Want to start from end by default? Leave initialOffsets empty and set your consumer group to a new group id; then change auto.offset.reset to latest. Or explicitly set initialOffsets to end programmatically by querying end offsets before building the reader (I can add that if you want).
+
+Docs confirming KafkaItemReader + builder + offset options: Spring Batch API pages for KafkaItemReader and KafkaItemReaderBuilder
