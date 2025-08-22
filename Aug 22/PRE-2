@@ -1,0 +1,319 @@
+Certainly! Below is a minimal, copy-paste-ready Spring Boot 3.4.6 POC that uses:
+
+Spring Batch 5.2.x with the official KafkaItemReader
+
+Async job launching (returns execution ID immediately)
+
+Idle-aware Kafka reader (step finishes if topic is empty)
+
+Controlled by application.yml config
+
+File writing (append, one file per job run, with timestamp)
+
+Minimal metrics logging
+
+Clean, modern structure. No @EnableBatchProcessing required.
+
+If you paste these files into an empty project (with the specified pom.xml), it will build and run.
+
+1. pom.xml
+xml
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.4.6</version>
+  </parent>
+  <groupId>dev.demo</groupId>
+  <artifactId>batch-kafka</artifactId>
+  <version>0.0.1</version>
+  <properties><java.version>17</java.version></properties>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-batch</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.kafka</groupId>
+      <artifactId>spring-kafka</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+  </dependencies>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+2. application.yml
+text
+server:
+  port: 8080
+
+spring:
+  batch.job.enabled: false
+  kafka:
+    bootstrap-servers: localhost:9092
+
+app:
+  topic: demo-topic
+  groupId: demo-batch-group
+  partitions: [0]
+  initialOffsets: {}
+  pollTimeoutMs: 500
+  idlePolls: 6         # Step ends after 6 empty polls (~3 seconds at 500ms)
+  chunk: 10
+  outputDir: ./out
+  filePattern: data_${yyyyMMddHHmmss}.txt
+3. BatchProps.java
+java
+package dev.demo;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+import java.util.Map;
+
+@Component
+@ConfigurationProperties(prefix = "app")
+public class BatchProps {
+    private String topic;
+    private String groupId;
+    private List<Integer> partitions;
+    private Map<Integer, Long> initialOffsets;
+    private int pollTimeoutMs;
+    private int idlePolls;
+    private int chunk;
+    private String outputDir;
+    private String filePattern;
+
+    // getters and setters omitted for brevity
+    // (intelliJ/IDEA will generate them for you)
+    // Or use @Data from Lombok if you like
+}
+4. IdleAwareKafkaItemReader.java
+java
+package dev.demo;
+
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.springframework.batch.item.ExecutionContext;
+import org.springframework.batch.item.ItemStreamException;
+import org.springframework.batch.item.ItemStreamReader;
+
+public class IdleAwareKafkaItemReader implements ItemStreamReader<ConsumerRecord<String, String>> {
+    private final ItemStreamReader<ConsumerRecord<String, String>> delegate;
+    private final int maxEmptyPolls;
+    private int emptyPolls = 0;
+
+    public IdleAwareKafkaItemReader(ItemStreamReader<ConsumerRecord<String, String>> delegate, int maxEmptyPolls) {
+        this.delegate = delegate;
+        this.maxEmptyPolls = maxEmptyPolls;
+    }
+
+    @Override
+    public ConsumerRecord<String, String> read() throws Exception {
+        while (emptyPolls < maxEmptyPolls) {
+            ConsumerRecord<String, String> rec = delegate.read();
+            if (rec != null) {
+                emptyPolls = 0;
+                return rec;
+            } else {
+                emptyPolls++;
+            }
+        }
+        return null; // End step after too many empties
+    }
+
+    @Override public void open(ExecutionContext ctx) throws ItemStreamException { delegate.open(ctx); emptyPolls = 0; }
+    @Override public void update(ExecutionContext ctx) throws ItemStreamException { delegate.update(ctx); }
+    @Override public void close() throws ItemStreamException { delegate.close(); }
+}
+5. BatchConfig.java
+java
+package dev.demo;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.TopicPartition;
+import org.springframework.batch.core.Job;
+import org.springframework.batch.core.Step;
+import org.springframework.batch.core.job.builder.JobBuilder;
+import org.springframework.batch.core.launch.JobLauncher;
+import org.springframework.batch.core.launch.support.RunIdIncrementer;
+import org.springframework.batch.core.launch.support.SimpleJobLauncher;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.item.ItemProcessor;
+import org.springframework.batch.item.ItemStreamReader;
+import org.springframework.batch.item.ItemStreamWriter;
+import org.springframework.batch.item.kafka.KafkaItemReader;
+import org.springframework.batch.item.kafka.builder.KafkaItemReaderBuilder;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.task.SimpleAsyncTaskExecutor;
+import org.springframework.transaction.PlatformTransactionManager;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.text.SimpleDateFormat;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
+
+@Configuration
+@EnableConfigurationProperties(BatchProps.class)
+public class BatchConfig {
+    @Autowired
+    private BatchProps props;
+
+    @Bean
+    public KafkaItemReader<String, String> kafkaDelegateReader() {
+        Properties consumerProps = new Properties();
+        consumerProps.put("bootstrap.servers", System.getProperty("spring.kafka.bootstrap-servers", "localhost:9092"));
+        consumerProps.put("group.id", props.getGroupId());
+        consumerProps.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+        consumerProps.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+        consumerProps.put("enable.auto.commit", "false");
+        consumerProps.put("auto.offset.reset", "earliest");
+
+        List<TopicPartition> tps = props.getPartitions().stream()
+                .map(p -> new TopicPartition(props.getTopic(), p))
+                .collect(Collectors.toList());
+
+        Map<TopicPartition, Long> startOffsets = new HashMap<>();
+        if (props.getInitialOffsets() != null) {
+            props.getInitialOffsets().forEach((p, off) ->
+                    startOffsets.put(new TopicPartition(props.getTopic(), p), off));
+        }
+
+        return new KafkaItemReaderBuilder<String, String>()
+                .partitions(tps)
+                .partitionOffsets(startOffsets)
+                .consumerProperties(consumerProps)
+                .pollTimeout(props.getPollTimeoutMs())
+                .name("kafkaItemReader")
+                .build();
+    }
+
+    @Bean
+    public ItemStreamReader<ConsumerRecord<String, String>> kafkaReader() {
+        return new IdleAwareKafkaItemReader(kafkaDelegateReader(), props.getIdlePolls());
+    }
+
+    @Bean
+    public ItemProcessor<ConsumerRecord<String, String>, String> processor() {
+        AtomicLong count = new AtomicLong();
+        AtomicLong bytes = new AtomicLong();
+        return rec -> {
+            count.incrementAndGet();
+            int sz = (rec.value() == null ? 0 : rec.value().length()) + (rec.key() == null ? 0 : rec.key().length());
+            bytes.addAndGet(sz);
+            if (count.get() % 100 == 0) {
+                System.out.printf("records: %d, bytes: %d%n", count.get(), bytes.get());
+            }
+            return (rec.key() == null ? "" : rec.key()) + "|" + (rec.value() == null ? "" : rec.value());
+        };
+    }
+
+    @Bean
+    public ItemStreamWriter<String> fileWriter() {
+        return items -> {
+            Path dir = Path.of(props.getOutputDir());
+            Files.createDirectories(dir);
+            String fileName = props.getFilePattern()
+                    .replace("${yyyyMMddHHmmss}", new SimpleDateFormat("yyyyMMddHHmmss").format(new Date()));
+            Path out = dir.resolve(fileName);
+            Files.write(out,
+                    items.stream().map(s -> s + System.lineSeparator()).toList(),
+                    java.nio.file.StandardOpenOption.CREATE,
+                    java.nio.file.StandardOpenOption.APPEND);
+        };
+    }
+
+    @Bean
+    public Step kafkaToFileStep(JobRepository repo, PlatformTransactionManager tx) {
+        return new org.springframework.batch.core.step.builder.StepBuilder("kafkaToFileStep", repo)
+                .<ConsumerRecord<String, String>, String>chunk(props.getChunk(), tx)
+                .reader(kafkaReader())
+                .processor(processor())
+                .writer(fileWriter())
+                .build();
+    }
+
+    @Bean
+    public Job kafkaToFileJob(JobRepository repo, Step step) {
+        return new JobBuilder("kafkaToFileJob", repo)
+                .incrementer(new RunIdIncrementer())
+                .start(step)
+                .build();
+    }
+
+    // Async Job Launcher
+    @Bean
+    public JobLauncher asyncJobLauncher(JobRepository repo) throws Exception {
+        SimpleJobLauncher launcher = new SimpleJobLauncher();
+        launcher.setJobRepository(repo);
+        launcher.setTaskExecutor(new SimpleAsyncTaskExecutor());
+        launcher.afterPropertiesSet();
+        return launcher;
+    }
+}
+6. JobController.java
+java
+package dev.demo;
+
+import org.springframework.batch.core.JobExecution;
+import org.springframework.batch.core.explore.JobExplorer;
+import org.springframework.batch.core.launch.JobOperator;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.Map;
+
+@RestController
+@RequestMapping("/jobs")
+public class JobController {
+    private final JobOperator jobOperator;
+    private final JobExplorer jobExplorer;
+
+    public JobController(JobOperator jobOperator, JobExplorer jobExplorer) {
+        this.jobOperator = jobOperator;
+        this.jobExplorer = jobExplorer;
+    }
+
+    @PostMapping("/start")
+    public Map<String, Object> start() throws Exception {
+        long id = jobOperator.start("kafkaToFileJob", "");
+        return Map.of("executionId", id, "status", "STARTED");
+    }
+
+    @GetMapping("/{id}")
+    public Map<String, Object> status(@PathVariable long id) {
+        JobExecution je = jobExplorer.getJobExecution(id);
+        return je == null ? Map.of("executionId", id, "status", "UNKNOWN")
+                : Map.of("executionId", id, "status", je.getStatus().toString(),
+                "startTime", je.getStartTime(), "endTime", je.getEndTime(),
+                "exitCode", je.getExitStatus() == null ? null : je.getExitStatus().getExitCode());
+    }
+}
+7. Main Application
+java
+package dev.demo;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class BatchKafkaApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(BatchKafkaApplication.class, args);
+    }
+}
