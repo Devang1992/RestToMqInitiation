@@ -259,3 +259,77 @@ This reader assigns partitions and manages seeks itself; it doesn’t rely on co
 Offsets are saved in the Step ExecutionContext and commitSync() is called in update() → restarts resume correctly.
 
 If you ever see “duplicate logs”, ensure you’re not logging per item in both processor and writer, and the job isn’t launched twice.
+
+-------------------------------------------------------------------------------------------------------
+
+
+public class ManualKafkaItemReader<K, V>
+    extends AbstractItemCountingItemStreamItemReader<ConsumerRecord<K, V>> {
+
+  // ... fields & ctor unchanged ...
+
+  @Override
+  public void open(ExecutionContext ec) throws ItemStreamException {
+    super.open(ec); // keeps internal counters consistent
+
+    this.consumer = consumerFactory.createConsumer();
+    List<TopicPartition> tps = new ArrayList<>();
+    for (Integer p : partitions) tps.add(new TopicPartition(topic, p));
+    consumer.assign(tps);
+
+    // Try restore from ExecutionContext
+    boolean restored = false;
+    for (TopicPartition tp : tps) {
+      String key = offsetKey(tp);
+      if (ec.containsKey(key)) {
+        consumer.seek(tp, ec.getLong(key));
+        restored = true;
+      }
+    }
+
+    if (!restored) {
+      // Seed from initialOffsets or beginning/end
+      boolean usedInitial = false;
+      for (TopicPartition tp : tps) {
+        Long off = initialOffsets.get(tp.partition());
+        if (off != null) {
+          consumer.seek(tp, off);
+          usedInitial = true;
+        }
+      }
+      if (!usedInitial) {
+        if (startFromEnd) consumer.seekToEnd(tps);
+        else consumer.seekToBeginning(tps);
+      }
+    }
+  }
+
+  @Override
+  protected ConsumerRecord<K, V> doRead() {
+    if (!bufferIt.hasNext()) {
+      ConsumerRecords<K, V> polled = consumer.poll(pollTimeout);
+      bufferIt = polled.iterator();
+      if (!bufferIt.hasNext()) return null;
+    }
+    return bufferIt.next();
+  }
+
+  @Override
+  public void update(ExecutionContext ec) throws ItemStreamException {
+    for (TopicPartition tp : consumer.assignment()) {
+      long pos = consumer.position(tp);
+      ec.putLong(offsetKey(tp), pos);
+    }
+    consumer.commitSync();
+  }
+
+  @Override
+  public void close() throws ItemStreamException {
+    if (consumer != null) consumer.close();
+  }
+
+  private String offsetKey(TopicPartition tp) {
+    return "kafka.offset." + tp.topic() + "." + tp.partition();
+  }
+}
+
