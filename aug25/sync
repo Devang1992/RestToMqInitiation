@@ -1,0 +1,67 @@
+Option C — Manual, chunk-aligned commits (recommended for your use case)
+
+Wrap a manual KafkaConsumer in a custom ItemStreamReader<String> so you can commitSync() after a successful write (chunk-aligned). That guarantees no tail replay.
+
+Here’s the minimal pattern (outline):
+
+class CommittingKafkaReader implements ItemStreamReader<String> {
+  private final KafkaConsumer<String,String> consumer;
+  private final List<TopicPartition> tps;
+  private final long pollMs;
+  private Iterator<ConsumerRecord<String,String>> buf = Collections.emptyIterator();
+  private final Map<TopicPartition, OffsetAndMetadata> last = new HashMap<>();
+
+  CommittingKafkaReader(Properties props, String topic, int partition, long pollMs) {
+    this.consumer = new KafkaConsumer<>(props);
+    this.tps = List.of(new TopicPartition(topic, partition));
+    this.pollMs = pollMs;
+  }
+
+  @Override public void open(ExecutionContext ctx) {
+    consumer.assign(tps);
+    consumer.seekToCommitted(tps.get(0)); // or seekToBeginning / explicit offsets
+  }
+
+  @Override public String read() {
+    while (true) {
+      if (buf.hasNext()) {
+        var rec = buf.next();
+        last.put(new TopicPartition(rec.topic(), rec.partition()), new OffsetAndMetadata(rec.offset() + 1));
+        return rec.value();
+      }
+      var records = consumer.poll(Duration.ofMillis(pollMs));
+      if (records.isEmpty()) return null;
+      buf = records.iterator();
+    }
+  }
+
+  void commitSync() { if (!last.isEmpty()) consumer.commitSync(last); }
+
+  @Override public void close() { commitSync(); consumer.close(); }
+}
+
+
+Then wire chunk-aligned commit:
+
+@Bean
+Step readWriteStep(JobRepository repo, PlatformTransactionManager tx,
+                   CommittingKafkaReader reader,
+                   ItemProcessor<String,String> processor,
+                   ItemStreamWriter<String> writer) {
+
+  return new StepBuilder("readWriteStep", repo)
+      .<String,String>chunk(200, tx)
+      .reader(reader)
+      .processor(processor)
+      .writer(writer)
+      .listener(new ItemWriteListener<>() {
+        @Override public void afterWrite(Chunk<? extends String> items) { reader.commitSync(); }
+      })
+      .build();
+}
+
+
+Consumer props for this approach:
+
+props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");   // we commit manually
+props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest"); // first run reads backlog
