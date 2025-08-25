@@ -1,0 +1,402 @@
+Awesome — let’s stand this up cleanly from scratch on Spring Boot 3.5.3 with a KafkaItemReader → Processor → Writer chunk step, then a Tasklet that prepends a header and atomically finalizes the file. No headers from Kafka; we only use the value.
+
+I’m giving you a minimal-but-productiony skeleton you can drop into a new project.
+
+1) pom.xml
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>kafka-batch</artifactId>
+  <version>0.0.1-SNAPSHOT</version>
+  <properties>
+    <java.version>17</java.version>
+    <spring-boot.version>3.5.3</spring-boot.version>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-dependencies</artifactId>
+        <version>${spring-boot.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <!-- Core -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter</artifactId>
+    </dependency>
+
+    <!-- Spring Batch -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-batch</artifactId>
+    </dependency>
+
+    <!-- Spring for Apache Kafka -->
+    <dependency>
+      <groupId>org.springframework.kafka</groupId>
+      <artifactId>spring-kafka</artifactId>
+    </dependency>
+
+    <!-- Handlebars for templating -->
+    <dependency>
+      <groupId>com.github.jknack</groupId>
+      <artifactId>handlebars</artifactId>
+      <version>4.3.1</version>
+    </dependency>
+
+    <!-- Jackson -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+
+    <!-- Test (optional) -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+
+2) application.yml
+spring:
+  application:
+    name: kafka-batch-demo
+  batch:
+    job:
+      enabled: true
+    jdbc:
+      initialize-schema: always # swap to never if you use a real DB
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: demo-batch-group
+      enable-auto-commit: false         # we let the reader manage position via ExecutionContext
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    properties:
+      isolation.level: read_committed
+
+batch:
+  topic: demo-input
+  poll-timeout-ms: 2000
+  max-poll-records: 500
+  # Where files land
+  output:
+    dir: /tmp/batch/out
+    basename: WIRES_20250825 # or pass via JobParameters
+    temp-suffix: .part
+    final-suffix: .txt
+  template:
+    body: classpath:templates/body.hbs       # per-message
+    header: classpath:templates/header.hbs   # prepended once in tasklet
+
+
+You can override any of these with --batch.output.basename=... as a JobParameter or profile.
+
+3) Templates (resources)
+src/main/resources/templates/header.hbs
+src/main/resources/templates/body.hbs
+
+
+header.hbs (example)
+
+1  BATCH RUN: {{now}} 
+----------------------------------------
+
+
+body.hbs (example per message; one message → one or more lines)
+
+Customer: {{customer.name}}
+Amount: {{amount}}
+Ref: {{ref}}
+----------------------------------------
+
+
+We’ll feed the whole Kafka value JSON to Handlebars; it can address fields directly (e.g., customer.name). If a key is missing, the placeholder renders blank; you can add {{#if amount}}...{{/if}} guards later.
+
+4) Batch configuration
+package com.example.kafkabatch;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.jknack.handlebars.Handlebars;
+import com.github.jknack.handlebars.Template;
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.springframework.batch.core.*;
+import org.springframework.batch.core.configuration.annotation.EnableBatchProcessing;
+import org.springframework.batch.core.job.builder.JobBuilder;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.core.step.builder.StepBuilder;
+import org.springframework.batch.item.*;
+import org.springframework.batch.item.kafka.KafkaItemReader;
+import org.springframework.batch.item.kafka.builder.KafkaItemReaderBuilder;
+import org.springframework.batch.repeat.RepeatStatus;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.Bean;
+import org.springframework.core.io.Resource;
+import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.transaction.PlatformTransactionManager;
+
+import java.io.*;
+import java.nio.channels.FileChannel;
+import java.nio.file.*;
+import java.time.Instant;
+import java.util.*;
+
+@SpringBootApplication
+@EnableBatchProcessing
+public class KafkaBatchApplication {
+
+  public static void main(String[] args) {
+    SpringApplication.run(KafkaBatchApplication.class, args);
+  }
+
+  // ---------------------
+  // Kafka ConsumerFactory
+  // ---------------------
+  @Bean
+  ConsumerFactory<String, String> consumerFactory(
+      @Value("${spring.kafka.bootstrap-servers}") String bootstrap,
+      @Value("${spring.kafka.consumer.group-id}") String groupId,
+      @Value("${spring.kafka.properties.isolation.level:read_committed}") String isolationLevel,
+      @Value("${batch.max-poll-records:500}") Integer maxPoll) {
+
+    Map<String, Object> props = new HashMap<>();
+    props.put(CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG, bootstrap);
+    props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+    props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+    props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+    props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+    props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, maxPoll);
+    props.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, isolationLevel);
+    return new DefaultKafkaConsumerFactory<>(props);
+  }
+
+  // --------------
+  // KafkaItemReader
+  // --------------
+  @Bean
+  KafkaItemReader<String, String> kafkaItemReader(
+      ConsumerFactory<String, String> cf,
+      @Value("${batch.topic}") String topic,
+      @Value("${batch.poll-timeout-ms:2000}") long pollTimeoutMs) {
+
+    // Start at committed offsets for the group; if first run with no commit, start at beginning.
+    // You can also assign explicit offsets via .partitionOffsets(Map<TopicPartition, Long>)
+    return new KafkaItemReaderBuilder<String, String>()
+        .consumerFactory(cf)
+        .partitions(0)          // adjust or discover dynamically if you want
+        .name("kafkaItemReader")
+        .topic(topic)
+        .pollTimeout(pollTimeoutMs)
+        .saveState(true)        // store offsets in Step ExecutionContext for restartability
+        .build();
+  }
+
+  // -----------
+  // Templating
+  // -----------
+  @Bean
+  Handlebars handlebars() {
+    return new Handlebars();
+  }
+
+  @Bean
+  Template bodyTemplate(Handlebars hb, @Value("${batch.template.body}") Resource tpl) throws IOException {
+    try (Reader r = new InputStreamReader(tpl.getInputStream())) {
+      return hb.compileInline(readAll(r));
+    }
+  }
+
+  @Bean
+  Template headerTemplate(Handlebars hb, @Value("${batch.template.header}") Resource tpl) throws IOException {
+    try (Reader r = new InputStreamReader(tpl.getInputStream())) {
+      return hb.compileInline(readAll(r));
+    }
+  }
+
+  private static String readAll(Reader r) throws IOException {
+    StringBuilder sb = new StringBuilder();
+    char[] buf = new char[2048];
+    int n;
+    while ((n = r.read(buf)) != -1) sb.append(buf, 0, n);
+    return sb.toString();
+  }
+
+  // ----------------
+  // ItemProcessor
+  // ----------------
+  @Bean
+  ItemProcessor<org.apache.kafka.clients.consumer.ConsumerRecord<String, String>, String> templateProcessor(
+      Template bodyTemplate) {
+    ObjectMapper mapper = new ObjectMapper();
+    return record -> {
+      String json = record.value();
+      JsonNode node = mapper.readTree(json);
+      Map<String, Object> model = mapper.convertValue(node, Map.class);
+      // Convenience: add a 'now' helper for templates if needed
+      model.putIfAbsent("now", Instant.now().toString());
+      return bodyTemplate.apply(model);
+    };
+  }
+
+  // ----------------
+  // ItemWriter (append-as-is)
+  // ----------------
+  @Bean
+  ItemStreamWriter<String> bodyFileWriter(
+      @Value("${batch.output.dir}") String outDir,
+      @Value("${batch.output.basename}") String base,
+      @Value("${batch.output.temp-suffix:.part}") String tempSuffix) {
+
+    Path dir = Path.of(outDir);
+    Path tmp = dir.resolve(base + tempSuffix);
+    return new AsIsAppendWriter(tmp);
+  }
+
+  // -----------
+  // The Job
+  // -----------
+  @Bean
+  Job kafkaToFileJob(JobRepository repo,
+                     PlatformTransactionManager tx,
+                     Step readWriteStep,
+                     Step finalizeStep) {
+    return new JobBuilder("kafkaToFileJob", repo)
+        .start(readWriteStep)
+        .next(finalizeStep)
+        .build();
+  }
+
+  @Bean
+  Step readWriteStep(JobRepository repo,
+                     PlatformTransactionManager tx,
+                     KafkaItemReader<String, String> reader,
+                     ItemProcessor<org.apache.kafka.clients.consumer.ConsumerRecord<String, String>, String> processor,
+                     ItemStreamWriter<String> writer) {
+
+    return new StepBuilder("readWriteStep", repo)
+        .<org.apache.kafka.clients.consumer.ConsumerRecord<String, String>, String>chunk(200, tx)
+        .reader(reader)
+        .processor(processor)
+        .writer(writer)
+        .build();
+  }
+
+  @Bean
+  Step finalizeStep(JobRepository repo,
+                    PlatformTransactionManager tx,
+                    Template headerTemplate,
+                    @Value("${batch.output.dir}") String outDir,
+                    @Value("${batch.output.basename}") String base,
+                    @Value("${batch.output.temp-suffix:.part}") String tempSuffix,
+                    @Value("${batch.output.final-suffix:.txt}") String finalSuffix) {
+
+    return new StepBuilder("finalizeStep", repo)
+        .tasklet((contribution, chunkContext) -> {
+          Path dir = Path.of(outDir);
+          Files.createDirectories(dir);
+
+          Path part = dir.resolve(base + tempSuffix);
+          Path finalFile = dir.resolve(base + finalSuffix);
+
+          // Generate header content
+          String header = headerTemplate.apply(Map.of("now", Instant.now().toString()));
+          Path tmpOut = Files.createTempFile(dir, base + ".", ".assembling");
+
+          // Stream: header -> body
+          try (OutputStream out = Files.newOutputStream(tmpOut, StandardOpenOption.TRUNCATE_EXISTING);
+               FileChannel outCh = FileChannel.open(tmpOut, StandardOpenOption.WRITE)) {
+
+            out.write(header.getBytes());
+            if (Files.exists(part)) {
+              try (InputStream in = Files.newInputStream(part, StandardOpenOption.READ)) {
+                in.transferTo(out);
+              }
+            }
+            out.flush();
+            outCh.force(true);
+          }
+
+          // Atomic move to final
+          Files.move(tmpOut, finalFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+
+          // Optional: clean the .part file
+          if (Files.exists(part)) Files.delete(part);
+
+          return RepeatStatus.FINISHED;
+        }, tx)
+        .build();
+  }
+
+  // --------------------------
+  // Writer impl (append-as-is)
+  // --------------------------
+  static class AsIsAppendWriter implements ItemStreamWriter<String> {
+    private final Path file;
+    private BufferedWriter writer;
+
+    AsIsAppendWriter(Path file) {
+      this.file = file;
+    }
+
+    @Override
+    public void open(ExecutionContext executionContext) throws ItemStreamException {
+      try {
+        Files.createDirectories(file.getParent());
+        writer = Files.newBufferedWriter(file,
+            StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE);
+      } catch (IOException e) {
+        throw new ItemStreamException("Failed to open writer", e);
+      }
+    }
+
+    @Override
+    public void update(ExecutionContext executionContext) { /* nothing to track here */ }
+
+    @Override
+    public void close() throws ItemStreamException {
+      try {
+        if (writer != null) writer.close();
+      } catch (IOException e) {
+        throw new ItemStreamException("Failed to close writer", e);
+      }
+    }
+
+    @Override
+    public void write(Chunk<? extends String> chunk) throws Exception {
+      for (String s : chunk) {
+        writer.write(s);
+        if (!s.endsWith("\n")) writer.newLine();
+      }
+      writer.flush();
+    }
+  }
+}
