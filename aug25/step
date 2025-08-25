@@ -1,0 +1,118 @@
+Option A (simplest): write header in a beforeJob listener
+
+No extra step; the job writes the header, then your existing step appends messages.
+
+import org.springframework.batch.core.JobExecution;
+import org.springframework.batch.core.JobExecutionListener;
+import org.springframework.context.annotation.Bean;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.Resource;
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.time.Instant;
+
+@Bean
+JobExecutionListener headerWriterListener(KafkaBatchProperties props) {
+  Resource headerTpl = new ClassPathResource("templates/BANNER.txt"); // adjust path/name
+
+  return new JobExecutionListener() {
+    @Override public void beforeJob(JobExecution jobExecution) {
+      try {
+        // Resolve output file (same one your writer appends to)
+        Path dir  = Path.of(props.getOutput().getPath());
+        Files.createDirectories(dir);
+        Path out  = dir.resolve(props.getOutput().getFileNameFormatAuto());
+
+        // Render header (plain text file here; replace tokens if you have any)
+        String header;
+        try (BufferedReader br = new BufferedReader(
+                new InputStreamReader(headerTpl.getInputStream(), StandardCharsets.UTF_8))) {
+          header = br.lines().reduce((a,b) -> a + System.lineSeparator() + b).orElse("");
+        }
+        // Example dynamic token
+        header = header.replace("${now}", Instant.now().toString());
+
+        // Truncate/create and write header; chunk writer will APPEND afterwards
+        try (BufferedWriter bw = Files.newBufferedWriter(
+            out, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+          bw.write(header);
+          if (!header.endsWith("\n")) bw.newLine();
+        }
+      } catch (IOException e) {
+        throw new UncheckedIOException("Failed to write header before job", e);
+      }
+    }
+    @Override public void afterJob(JobExecution jobExecution) { /* noop */ }
+  };
+}
+
+
+Wire it into your job:
+
+@Bean
+public Job kafkaToFileJob(JobRepository repo, Step step, JobExecutionListener headerWriterListener) {
+  return new JobBuilder("kafkaToFileJob", repo)
+      .listener(headerWriterListener)   // <-- header gets written first
+      .start(step)                      // your existing readWriteStep
+      .build();
+}
+
+
+Your AsIsAppendWriter already uses CREATE, APPEND, WRITE, so body lines will append under the header.
+
+Option B: a dedicated “writeHeaderStep” before your chunk step
+
+If you prefer it as a step (shows up clearly in Batch metadata):
+
+@Bean
+Step writeHeaderStep(JobRepository repo,
+                     PlatformTransactionManager tx,
+                     KafkaBatchProperties props) {
+  Resource headerTpl = new ClassPathResource("templates/BANNER.txt");
+
+  return new StepBuilder("writeHeaderStep", repo)
+      .tasklet((contribution, ctx) -> {
+        Path dir = Path.of(props.getOutput().getPath());
+        Files.createDirectories(dir);
+        Path out = dir.resolve(props.getOutput().getFileNameFormatAuto());
+
+        String header;
+        try (BufferedReader br = new BufferedReader(
+            new InputStreamReader(headerTpl.getInputStream(), StandardCharsets.UTF_8))) {
+          header = br.lines().reduce((a,b) -> a + System.lineSeparator() + b).orElse("");
+        }
+        // optional token(s)
+        header = header.replace("${now}", java.time.Instant.now().toString());
+
+        try (BufferedWriter bw = Files.newBufferedWriter(
+            out, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+          bw.write(header);
+          if (!header.endsWith("\n")) bw.newLine();
+        }
+        return RepeatStatus.FINISHED;
+      }, tx)
+      .build();
+}
+
+
+Update the job:
+
+@Bean
+public Job kafkaToFileJob(JobRepository repo, Step writeHeaderStep, Step step) {
+  return new JobBuilder("kafkaToFileJob", repo)
+      .start(writeHeaderStep)  // header first
+      .next(step)              // then your readWriteStep
+      .build();
+}
+
+Quick checks
+
+Ensure your writer opens with no TRUNCATE (only CREATE, APPEND, WRITE).
+
+If you want CRLF line endings: bw.write("\r\n") instead of newLine().
+
+If you plan to finalize/rename at the end, write the header to *.part here and keep your writer appending to that same *.part, then atomically move to the final name in a last step.
+
+If you want me to adapt this to your BatchFileGeneratorImp/TemplateMapper (e.g., to render a dynamic header from BANNER.txt with variables), paste those method signatures and I’ll wire them in.
