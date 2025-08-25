@@ -1,0 +1,213 @@
+Totally get it — that “one last record replays” is the classic auto-commit tail lag. The bullet-proof fix is to commit offsets yourself after each successful chunk write and once again right before the step/job ends.
+
+Here’s a drop-in manual, chunk-aligned reader that solves it. Use this instead of KafkaItemReader. It returns String (the Kafka value), and exposes commitSync() so the step listener can flush offsets immediately after the writer succeeds.
+
+1) A committing reader (no tail replay)
+import org.apache.kafka.clients.consumer.*;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.springframework.batch.item.ExecutionContext;
+import org.springframework.batch.item.ItemStreamException;
+import org.springframework.batch.item.ItemStreamReader;
+
+import java.time.Duration;
+import java.util.*;
+
+public class CommittingKafkaReader implements ItemStreamReader<String> {
+  private final Properties props;
+  private final String topic;
+  private final List<Integer> partitions;
+  private final Duration pollTimeout;
+  private final int maxEmptyPolls;
+
+  private KafkaConsumer<String, String> consumer;
+  private List<TopicPartition> tps;
+  private Iterator<ConsumerRecord<String, String>> buffer = Collections.emptyIterator();
+  private final Map<TopicPartition, OffsetAndMetadata> lastOffsets = new HashMap<>();
+  private int emptyPolls = 0;
+
+  public CommittingKafkaReader(Properties props,
+                               String topic,
+                               List<Integer> partitions,
+                               Duration pollTimeout,
+                               int maxEmptyPolls) {
+    this.props = props;
+    this.topic = topic;
+    this.partitions = partitions == null || partitions.isEmpty() ? List.of(0) : partitions;
+    this.pollTimeout = pollTimeout;
+    this.maxEmptyPolls = Math.max(1, maxEmptyPolls);
+  }
+
+  @Override
+  public void open(ExecutionContext ctx) throws ItemStreamException {
+    try {
+      consumer = new KafkaConsumer<>(props);
+      tps = new ArrayList<>();
+      for (int p : partitions) tps.add(new TopicPartition(topic, p));
+      consumer.assign(tps);
+
+      // Seek to committed if present; otherwise earliest
+      Map<TopicPartition, OffsetAndMetadata> committed = consumer.committed(new HashSet<>(tps));
+      Set<TopicPartition> needEarliest = new HashSet<>(tps);
+      for (var tp : tps) {
+        OffsetAndMetadata om = committed.get(tp);
+        if (om != null) {
+          consumer.seek(tp, om.offset());
+          needEarliest.remove(tp);
+        }
+      }
+      if (!needEarliest.isEmpty()) consumer.seekToBeginning(needEarliest);
+    } catch (Exception e) {
+      throw new ItemStreamException("Failed to open consumer", e);
+    }
+  }
+
+  @Override
+  public String read() {
+    while (true) {
+      if (buffer.hasNext()) {
+        ConsumerRecord<String, String> rec = buffer.next();
+        // remember next position to commit
+        lastOffsets.put(new TopicPartition(rec.topic(), rec.partition()),
+            new OffsetAndMetadata(rec.offset() + 1));
+        return rec.value();
+      }
+      ConsumerRecords<String, String> polled = consumer.poll(pollTimeout);
+      if (polled.isEmpty()) {
+        if (++emptyPolls >= maxEmptyPolls) return null; // end of data for this run
+        continue;
+      }
+      emptyPolls = 0;
+      buffer = polled.iterator();
+    }
+  }
+
+  /** Commit offsets captured up to last successful write. */
+  public void commitSync() {
+    if (!lastOffsets.isEmpty()) {
+      consumer.commitSync(new HashMap<>(lastOffsets));
+    }
+  }
+
+  @Override public void update(ExecutionContext ctx) { /* no-op */ }
+
+  @Override
+  public void close() {
+    try {
+      commitSync(); // final flush
+    } catch (Exception ignore) {}
+    try {
+      if (consumer != null) consumer.close();
+    } catch (Exception ignore) {}
+  }
+}
+
+2) Wire it in (Boot 3.5.3 / Batch 5.2)
+Reader bean (step-scoped so you can pass params from your controller)
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.springframework.batch.core.configuration.annotation.StepScope;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Properties;
+import java.util.stream.Collectors;
+
+@Bean
+@StepScope
+CommittingKafkaReader committingKafkaReader(
+    @Value("${spring.kafka.bootstrap-servers}") String bootstrap,
+    @Value("${spring.kafka.consumer.group-id}") String groupId,
+    @Value("#{jobParameters['topic']}") String topicParam,
+    @Value("${batch.topic}") String defaultTopic,
+    @Value("#{jobParameters['partitions']}") String partitionsCsv, // e.g. "0,1,2"
+    @Value("#{jobParameters['pollTimeoutMs']}") Long pollTimeoutMsParam,
+    @Value("${batch.poll-timeout-ms:2000}") long defaultPollTimeoutMs
+) {
+  Properties props = new Properties();
+  props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap);
+  props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);              // keep stable across runs
+  props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+  props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+  props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");    // WE commit manually
+  props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");  // first ever run reads backlog
+  props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, "500");
+  props.put(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, "600000"); // 10min
+  props.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");
+
+  String topic = (topicParam != null && !topicParam.isBlank()) ? topicParam : defaultTopic;
+  List<Integer> parts = (partitionsCsv == null || partitionsCsv.isBlank())
+      ? List.of(0)
+      : Arrays.stream(partitionsCsv.split(",")).map(String::trim).map(Integer::parseInt).collect(Collectors.toList());
+
+  long pollMs = (pollTimeoutMsParam != null ? pollTimeoutMsParam : defaultPollTimeoutMs);
+  return new CommittingKafkaReader(props, topic, parts, Duration.ofMillis(pollMs), /*maxEmptyPolls*/ 2);
+}
+
+Step: commit right after each successful write + log totals
+import org.springframework.batch.core.*;
+import org.springframework.batch.core.job.builder.JobBuilder;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.core.step.builder.StepBuilder;
+import org.springframework.batch.item.*;
+import org.springframework.context.annotation.Bean;
+import org.springframework.transaction.PlatformTransactionManager;
+
+@Bean
+Step readWriteStep(JobRepository repo,
+                   PlatformTransactionManager tx,
+                   CommittingKafkaReader reader,
+                   ItemProcessor<String,String> processor,
+                   ItemStreamWriter<String> writer) {
+
+  return new StepBuilder("readWriteStep", repo)
+      .<String,String>chunk(200, tx)
+      .reader(reader)
+      .processor(processor)
+      .writer(writer)
+      .listener(new ItemWriteListener<String>() {
+        @Override public void afterWrite(Chunk<? extends String> items) {
+          // CHUNK-ALIGNED COMMIT — no tail replay
+          reader.commitSync();
+        }
+      })
+      .listener(new StepExecutionListener() {
+        @Override public void afterStep(StepExecution se) {
+          // final defensive commit + totals
+          reader.commitSync();
+          org.slf4j.LoggerFactory.getLogger("Batch").info(
+              "Step '{}' → read={}, written={}, filtered={}",
+              se.getStepName(), se.getReadCount(), se.getWriteCount(), se.getFilterCount());
+        }
+      })
+      .build();
+}
+
+
+Keep your existing header pre-write (listener or step) and your append-only writer unchanged — this commit logic is independent of file I/O.
+
+3) Controller call (unchanged)
+
+Still POST /jobs/kafka-to-file?basename=RUN1&topic=...&partitions=0 etc.
+Just make sure the group.id stays the same between runs so you resume after the last committed offset.
+
+4) Why this fixes your “1 duplicate” forever
+
+Auto-commit commits on a timer during poll(), so the final item often isn’t committed when the step ends → you re-read one on the next run.
+
+Here we explicitly commitSync() after each successful chunk write, and once more at step end. So your last processed offset is always durably committed before the job exits. Next run starts strictly after it → no duplicates.
+
+5) Quick sanity checklist
+
+Writer opens with CREATE, APPEND, WRITE (no TRUNCATE_EXISTING).
+
+Processor returns null only when you intentionally skip (that increments filterCount).
+
+group.id is stable across runs.
+
+If you pass partitions, make sure they match your topic’s partitions.
+
+If you want, paste your current Step method and I’ll splice this in exactly where it belongs.
