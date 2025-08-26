@@ -1,0 +1,96 @@
+Yep! Use Spring Batch’s ExecutionContext to stash anything (like your final file name) during the job, and read it back in an end-of-job listener.
+
+You’ve got three clean patterns—pick one.
+
+1) Write straight to the JobExecutionContext (quick + simple)
+
+Put the value anywhere (tasklet/processor/writer), then log it in afterJob.
+
+In your finalize step (where you know the final file path):
+
+.tasklet((contrib, ctx) -> {
+  Path finalFile = /* ... resolve/move file ... */;
+
+  // Stash for end-of-job logging
+  var jobCtx = ctx.getStepContext().getStepExecution()
+                  .getJobExecution().getExecutionContext();
+  jobCtx.putString("finalFile", finalFile.toString());
+
+  return RepeatStatus.FINISHED;
+}, tx)
+
+
+Job listener:
+
+@Bean
+JobExecutionListener jobSummaryLogger() {
+  return new JobExecutionListener() {
+    @Override public void afterJob(JobExecution je) {
+      String finalFile = je.getExecutionContext().getString("finalFile", "(unknown)");
+      int read=0, written=0, filtered=0;
+      for (var se : je.getStepExecutions()) {
+        read += se.getReadCount();
+        written += se.getWriteCount();
+        filtered += se.getFilterCount();
+      }
+      org.slf4j.LoggerFactory.getLogger("Batch")
+        .info("JOB '{}' done → file={}, read={}, written={}, filtered={}",
+              je.getJobInstance().getJobName(), finalFile, read, written, filtered);
+    }
+  };
+}
+
+2) (Best-practice) Write to StepExecutionContext and promote to job
+
+Good if you want to keep step/job boundaries clean.
+
+Set in the step (tasklet/processor/writer):
+
+var stepCtx = ctx.getStepContext().getStepExecution().getExecutionContext();
+stepCtx.putString("finalFile", finalFile.toString());
+
+
+Promote after step completes:
+
+@Bean
+ExecutionContextPromotionListener promoteFileMeta() {
+  var l = new ExecutionContextPromotionListener();
+  l.setKeys(new String[]{"finalFile"});
+  return l;
+}
+
+
+Register it on the step that sets the value:
+
+new StepBuilder("finalizeStep", repo)
+  .listener(promoteFileMeta())
+  .tasklet(...).build();
+
+
+Then read it in the same afterJob as above (from je.getExecutionContext()).
+
+3) Use JobParameters if the name is known up front
+
+If your filename comes from basename param, just log that (no context needed):
+
+String base = je.getJobParameters().getString("basename", "(no-basename)");
+
+
+You can still set finalFile later if the extension/path is decided at finalize time.
+
+Where can you set these values?
+
+Tasklet body (easy, you already have ChunkContext).
+
+Item components*: implement StepExecutionListener and keep a field:
+
+class MyWriter implements ItemStreamWriter<String>, StepExecutionListener {
+  private StepExecution stepExecution;
+  @Override public void beforeStep(StepExecution se) { this.stepExecution = se; }
+  // later: stepExecution.getExecutionContext().putString("finalFile", ...)
+}
+
+
+Or (less pretty) use StepSynchronizationManager.getContext() to reach the current StepExecution.
+
+That’s it—drop in one of the snippets, and your end-of-job log can always include the generated file name (and any other custom metrics you stash).
