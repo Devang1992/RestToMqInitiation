@@ -94,3 +94,49 @@ class MyWriter implements ItemStreamWriter<String>, StepExecutionListener {
 Or (less pretty) use StepSynchronizationManager.getContext() to reach the current StepExecution.
 
 That’s it—drop in one of the snippets, and your end-of-job log can always include the generated file name (and any other custom metrics you stash).
+
+
+------------------------------------------------------------------------------------------------------------------------
+
+Great question—these four counters mean different things in Spring Batch:
+
+filtered (filterCount)
+Count of items your processor returned null for. That’s an intentional business-rule drop (not an error). They were read successfully but never sent to the writer.
+
+readSkips (readSkipCount)
+Items the reader failed to read due to an exception that you allowed to be skipped via a skip policy (e.g., .faultTolerant().skip(IOException.class).skipLimit(…)). Without a skip rule, the step would fail instead.
+
+processSkips (processSkipCount)
+Items where your processor threw (e.g., bad JSON) and the exception was skipped by your skip policy (e.g., .skip(JsonProcessingException.class)). These are different from filtered: filtered = returned null (no error), processSkip = threw exception (error, but tolerated).
+
+writeSkips (writeSkipCount)
+Items that failed during write and were skipped per your skip policy (e.g., DB constraint violation on one row in the chunk). If not configured to skip that exception, the step would fail.
+
+Quick mental model:
+
+Stage	Normal path	“Filtered”	“Skipped” (error tolerated)
+Read	read() returns item	—	readSkips (reader threw + skipped)
+Process	process() returns transformed item	filtered (returns null)	processSkips (processor threw + skipped)
+Write	write() succeeds	—	writeSkips (writer threw + skipped)
+
+Tip: To see these in action, make your step fault-tolerant and specify what to skip:
+
+new StepBuilder("readWriteStep", repo)
+  .<String,String>chunk(200, tx)
+  .reader(reader).processor(processor).writer(writer)
+  .faultTolerant()
+  .skip(JsonProcessingException.class)   // processor errors → processSkips++
+  .skip(IOException.class)               // reader/writer I/O → readSkips++ / writeSkips++
+  .skipLimit(100)
+  .build();
+
+
+And your end-of-step log will show:
+
+readCount (items successfully read),
+
+writeCount (items actually written),
+
+filterCount (intentional drops),
+
+readSkipCount / processSkipCount / writeSkipCount (errors you tolerated).
