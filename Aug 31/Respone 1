@@ -1,0 +1,221 @@
+Response 1
+Thought for 10s
+
+Great next step. In Spring Batch you’ll add a third step after your Kafka→file steps: an SFTP transfer step that uploads the finished file with 3 retries and then fails the job if all retries fail.
+
+Here’s a solid, YAML-driven pattern that plugs right into your existing flow.
+
+1) Put the final file path in the JobExecutionContext
+
+At the end of your existing “finalize file” step, stash the absolute path so the SFTP step can find it:
+
+// inside your finalize step (writer/tasklet) when you know the final path
+ExecutionContext ec = stepExecution.getJobExecution().getExecutionContext();
+ec.putString("finalFilePath", finalPath.toAbsolutePath().toString());
+
+2) SFTP properties (application.yml)
+transfer:
+  sftp:
+    host: sftp.example.com
+    port: 22
+    username: tibco_user
+    # choose one:
+    password: changeme
+    # or keyPath: /home/app/.ssh/id_rsa
+    remoteDir: /mailbox/inbound
+    tempSuffix: .part
+    connectTimeoutMs: 10000
+    # retry/backoff
+    maxAttempts: 3
+    backoffMs: 2000
+
+3) Config class: RetryTemplate + SFTP Tasklet (JSch)
+import com.jcraft.jsch.*;
+import org.springframework.batch.core.StepContribution;
+import org.springframework.batch.core.configuration.annotation.StepScope;
+import org.springframework.batch.core.scope.context.ChunkContext;
+import org.springframework.batch.core.step.tasklet.Tasklet;
+import org.springframework.batch.repeat.RepeatStatus;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.retry.RetryCallback;
+import org.springframework.retry.RetryPolicy;
+import org.springframework.retry.backoff.FixedBackOffPolicy;
+import org.springframework.retry.policy.SimpleRetryPolicy;
+import org.springframework.retry.support.RetryTemplate;
+
+import java.io.FileInputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Map;
+
+@Configuration
+public class SftpTransferConfig {
+
+  @Bean
+  public RetryTemplate transferRetryTemplate(TransferProps props) {
+    RetryTemplate tpl = new RetryTemplate();
+
+    RetryPolicy policy = new SimpleRetryPolicy(
+        props.getSftp().getMaxAttempts(), // e.g., 3
+        Map.of(Exception.class, true)     // retry on any Exception (narrow if you like)
+    );
+    tpl.setRetryPolicy(policy);
+
+    FixedBackOffPolicy backoff = new FixedBackOffPolicy();
+    backoff.setBackOffPeriod(props.getSftp().getBackoffMs()); // e.g., 2000ms
+    tpl.setBackOffPolicy(backoff);
+
+    return tpl;
+  }
+
+  @Bean
+  @StepScope
+  public Tasklet sftpTransferTasklet(TransferProps props, RetryTemplate transferRetryTemplate) {
+    return new Tasklet() {
+      @Override
+      public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) throws Exception {
+        String finalFilePath = (String) chunkContext.getStepContext()
+            .getStepExecution().getJobExecution().getExecutionContext()
+            .get("finalFilePath");
+
+        if (finalFilePath == null) {
+          throw new IllegalStateException("finalFilePath not found in ExecutionContext");
+        }
+
+        Path local = Path.of(finalFilePath);
+        if (!Files.exists(local)) {
+          throw new IllegalStateException("Local file not found: " + local);
+        }
+
+        transferRetryTemplate.execute((RetryCallback<Void, Exception>) context -> {
+          uploadViaSftp(local, props.getSftp());
+          return null;
+        });
+
+        return RepeatStatus.FINISHED;
+      }
+
+      private void uploadViaSftp(Path localFile, TransferProps.Sftp s) throws Exception {
+        JSch jsch = new JSch();
+        if (s.getKeyPath() != null && !s.getKeyPath().isBlank()) {
+          jsch.addIdentity(s.getKeyPath());
+        }
+
+        Session session = jsch.getSession(s.getUsername(), s.getHost(), s.getPort());
+        if (s.getPassword() != null && !s.getPassword().isBlank()) {
+          session.setPassword(s.getPassword());
+        }
+        java.util.Properties cfg = new java.util.Properties();
+        cfg.put("StrictHostKeyChecking", "no"); // Consider managing known_hosts properly in prod
+        session.setConfig(cfg);
+        session.connect(s.getConnectTimeoutMs());
+
+        ChannelSftp sftp = (ChannelSftp) session.openChannel("sftp");
+        sftp.connect(s.getConnectTimeoutMs());
+
+        try (FileInputStream in = new FileInputStream(localFile.toFile())) {
+          String fileName = localFile.getFileName().toString();
+          String remoteTmp = s.getRemoteDir() + "/" + fileName + s.getTempSuffix();
+          String remoteFinal = s.getRemoteDir() + "/" + fileName;
+
+          // ensure remote dir exists (best effort)
+          try { sftp.cd(s.getRemoteDir()); } 
+          catch (SftpException e) { sftp.mkdir(s.getRemoteDir()); sftp.cd(s.getRemoteDir()); }
+
+          // upload to temp name, then atomic rename
+          sftp.put(in, remoteTmp);
+          sftp.rename(remoteTmp, remoteFinal);
+        } finally {
+          sftp.disconnect();
+          session.disconnect();
+        }
+      }
+    };
+  }
+}
+
+
+Notes
+
+Uploads to name.part and then renames to the final name for atomicity (mailboxes love that).
+
+RetryTemplate does the 3 attempts with fixed backoff.
+
+If all retries fail, the exception escapes → step FAILED → job FAILED.
+
+4) Wire the step into your Job flow
+import org.springframework.batch.core.Job;
+import org.springframework.batch.core.Step;
+import org.springframework.batch.core.configuration.annotation.EnableBatchProcessing;
+import org.springframework.batch.core.job.builder.FlowBuilder;
+import org.springframework.batch.core.job.flow.Flow;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+@EnableBatchProcessing
+public class JobFlowConfig {
+
+  @Bean
+  public Step sftpTransferStep(StepBuilderFactory sbf, Tasklet sftpTransferTasklet) {
+    return sbf.get("sftpTransferStep")
+        .tasklet(sftpTransferTasklet)
+        .build();
+  }
+
+  @Bean
+  public Job kafkaToFileToSftpJob(JobBuilderFactory jbf,
+                                  Step ingestStep,        // your KafkaItemReader step
+                                  Step finalizeStep,      // your file finalize step
+                                  Step sftpTransferStep) {// the new step above
+    return jbf.get("kafkaToFileToSftpJob")
+        .start(ingestStep)
+        .next(finalizeStep)
+        .next(sftpTransferStep)     // <-- run AFTER finalize
+        .build();
+  }
+}
+
+
+If you prefer explicit transitions:
+
+.start(ingestStep).on("*").to(finalizeStep)
+.from(finalizeStep).on("*").to(sftpTransferStep)
+.end()
+
+5) Optional: restrict retry to specific exceptions
+
+Instead of retrying on any Exception, target SFTP errors only:
+
+RetryPolicy policy = new SimpleRetryPolicy(
+  props.getSftp().getMaxAttempts(),
+  Map.of(
+    JSchException.class, true,
+    SftpException.class, true,
+    java.net.SocketTimeoutException.class, true
+  )
+);
+
+6) Optional: Exponential backoff
+ExponentialBackOffPolicy backoff = new ExponentialBackOffPolicy();
+backoff.setInitialInterval(1000);
+backoff.setMultiplier(2.0);
+backoff.setMaxInterval(10000);
+tpl.setBackOffPolicy(backoff);
+
+7) Optional: use Spring Integration SFTP
+
+If you’re already on Spring Integration, you can swap the JSch code for an SFTP outbound gateway/adapter, and call it inside the tasklet; you can still wrap it in RetryTemplate. The job/step wiring remains the same.
+
+TL;DR
+
+Add sftpTransferStep after your finalize step.
+
+Implement it as a Tasklet that uploads with RetryTemplate (3 tries + backoff).
+
+Put the final file path in ExecutionContext so the SFTP step knows what to send.
+
+If all retries fail → throw → step FAILS → job FAILS (exactly what you want).
+
+If you paste me your current Job/Step class names and your YAML keys for the file location and mailbox, I’ll tailor the snippet to slot straight into your project.
