@@ -1,0 +1,180 @@
+Response 2
+
+Great next step. Do this as a separate Spring Batch step that runs after your Kafka processing step. Make it a Tasklet so it’s restartable and so retries are scoped just to the upload. Here’s a tidy, production-ready pattern using Spring Integration SFTP + Spring Retry.
+
+1) Properties (application.yaml)
+sftp:
+  host: sftp.example.com
+  port: 22
+  user: tibco_user
+  privateKey: /etc/keys/tibco_id_rsa        # or use password
+  passphrase: ""                             # if key is encrypted
+  remoteDir: /MAILBOX/IN                     # TIBCO mailbox drop
+  tempSuffix: .part                          # for atomic rename
+  connectTimeoutMillis: 15000
+
+batch:
+  outputDir: /var/app/out
+  # the previous step should have put this filename into JobExecutionContext
+  # but we keep default here as a fallback:
+  defaultOutputFile: WIRES_0012345678.TST
+
+2) SFTP config (SessionFactory + RemoteFileTemplate + Retry)
+@Configuration
+@EnableBatchProcessing
+public class SftpConfig {
+
+  @Bean
+  public DefaultSftpSessionFactory sftpSessionFactory(
+      @Value("${sftp.host}") String host,
+      @Value("${sftp.port}") int port,
+      @Value("${sftp.user}") String user,
+      @Value("${sftp.privateKey}") String privateKey,
+      @Value("${sftp.passphrase:}") String passphrase,
+      @Value("${sftp.connectTimeoutMillis:15000}") int timeout) {
+
+    DefaultSftpSessionFactory f = new DefaultSftpSessionFactory(true);
+    f.setHost(host);
+    f.setPort(port);
+    f.setUser(user);
+    f.setPrivateKey(new FileSystemResource(privateKey));
+    if (!passphrase.isEmpty()) f.setPrivateKeyPassphrase(passphrase);
+    f.setAllowUnknownKeys(true); // or manage known_hosts properly
+    f.setTimeout(timeout);
+    return f;
+  }
+
+  @Bean
+  public SftpRemoteFileTemplate sftpRemoteFileTemplate(DefaultSftpSessionFactory factory) {
+    return new SftpRemoteFileTemplate(factory);
+  }
+
+  @Bean
+  public RetryTemplate sftpRetryTemplate() {
+    RetryTemplate tpl = new RetryTemplate();
+
+    SimpleRetryPolicy policy = new SimpleRetryPolicy(
+        3, // total attempts = 3 (1 try + 2 retries)
+        Map.of(Exception.class, true), true
+    );
+    ExponentialBackOffPolicy backoff = new ExponentialBackOffPolicy();
+    backoff.setInitialInterval(1000);  // 1s
+    backoff.setMultiplier(2.0);        // 1s -> 2s -> 4s
+    backoff.setMaxInterval(5000);
+
+    tpl.setRetryPolicy(policy);
+    tpl.setBackOffPolicy(backoff);
+    return tpl;
+  }
+}
+
+3) Upload Tasklet (atomic upload + 3 retries)
+@Component
+@RequiredArgsConstructor
+public class SftpUploadTasklet implements Tasklet {
+
+  private final SftpRemoteFileTemplate template;
+  private final RetryTemplate retryTemplate;
+
+  @Value("${sftp.remoteDir}")
+  private String remoteDir;
+
+  @Value("${sftp.tempSuffix:.part}")
+  private String tempSuffix;
+
+  @Value("${batch.outputDir}")
+  private String outputDir;
+
+  @Value("${batch.defaultOutputFile:output.txt}")
+  private String defaultOutputFile;
+
+  @Override
+  public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) {
+    JobExecution jobExecution = chunkContext.getStepContext().getStepExecution().getJobExecution();
+    ExecutionContext ctx = jobExecution.getExecutionContext();
+
+    // The previous step should store the final file name here:
+    String fileName = ctx.containsKey("finalFileName")
+        ? ctx.getString("finalFileName")
+        : defaultOutputFile;
+
+    File localFile = Path.of(outputDir, fileName).toFile();
+    if (!localFile.exists() || localFile.length() == 0) {
+      throw new IllegalStateException("Output file missing or empty: " + localFile);
+    }
+
+    String remoteTemp = remoteDir.endsWith("/") ? remoteDir + fileName + tempSuffix
+                                                : remoteDir + "/" + fileName + tempSuffix;
+    String remoteFinal = remoteTemp.substring(0, remoteTemp.length() - tempSuffix.length());
+
+    try {
+      retryTemplate.execute(ctxRetry -> {
+        template.execute(session -> {
+          // 1) upload to temp name
+          try (InputStream in = new BufferedInputStream(new FileInputStream(localFile))) {
+            // ensure dir exists (no-op if it does)
+            try { session.mkdir(remoteDir); } catch (Exception ignore) {}
+            session.write(in, remoteTemp);
+          }
+          // 2) atomic rename to final
+          session.rename(remoteTemp, remoteFinal);
+          return null;
+        });
+        return null;
+      });
+    } catch (Exception e) {
+      // after 3 attempts, fail the step/job
+      throw new RuntimeException("SFTP upload failed after retries for " + localFile, e);
+    }
+
+    contribution.incrementWriteCount(1);
+    return RepeatStatus.FINISHED;
+  }
+}
+
+4) Wire it into your Job (run AFTER your Kafka processing step)
+@Configuration
+@RequiredArgsConstructor
+public class BatchJobConfig {
+
+  private final JobRepository jobRepository;
+  private final PlatformTransactionManager txManager;
+  private final Step kafkaProcessingStep; // your existing step
+  private final SftpUploadTasklet sftpUploadTasklet;
+
+  @Bean
+  public Step sftpUploadStep() {
+    return new StepBuilder("sftpUploadStep", jobRepository)
+        .tasklet(sftpUploadTasklet, txManager)
+        .allowStartIfComplete(true) // re-run if needed
+        .build();
+  }
+
+  @Bean
+  public Job wiresJob() {
+    return new JobBuilder("wiresJob", jobRepository)
+        .start(kafkaProcessingStep)   // produces the final file + puts fileName into JobExecutionContext
+        .next(sftpUploadStep())       // THEN upload to TIBCO mailbox via SFTP
+        .build();
+  }
+}
+
+
+Where do retries live? In the SftpUploadTasklet via RetryTemplate. That limits retries to the upload only (not the whole job), exactly as you asked: “pattern should be three retries; if still failing, throw error.”
+
+Recommended details
+
+Put the final filename into JobExecutionContext at the end of your processing step:
+
+stepExecution.getJobExecution().getExecutionContext().putString("finalFileName", computedName);
+
+
+Atomicity: Upload to *.part then rename → mailbox sees either complete file or nothing.
+
+Restartability: If upload fails after 3 tries, the step (and job) fails; on restart it will retry the upload.
+
+Permissions: If the SFTP server requires a specific group/perm, adjust on the TIBCO side or add a post-upload chmod/chgrp if supported by your SFTP (some servers expose chmod over SFTP; if not, the mailbox daemon will handle it).
+
+If you want this to run only when the prior step succeeded, the .next(sftpUploadStep()) flow already enforces that. If you prefer “always run” (even on failure) to ship partials for debugging (usually not), you’d use a JobExecutionDecider or a Flow with on("*") routing.
+
+Want me to adapt this to password auth instead of key, or wrap the SFTP client in a service for easier unit tests? I can drop in those variations too.
