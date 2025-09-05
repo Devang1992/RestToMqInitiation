@@ -1,0 +1,291 @@
+package com.td.payments.pants.mailservice.config;
+
+import lombok.extern.slf4j.Slf4j;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import org.springframework.batch.item.ExecutionContext;
+import org.springframework.batch.item.ItemStreamException;
+import org.springframework.batch.item.ItemStreamReader;
+
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.CommitFailedException;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.PartitionInfo;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.OffsetOutOfRangeException;
+import org.apache.kafka.common.errors.WakeupException;
+
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
+
+/**
+ * BatchKafkaReader (single-topic)
+ *
+ * Behavior:
+ *  - If manualOffset >= 0: seek every assigned partition to that exact offset.
+ *      • If the given offset is out-of-range for any partition, we seek that partition to END safely.
+ *  - Else: seek to COMMITTED offset if present; otherwise seek to BEGINNING.
+ *  - read(): drains any buffered records; otherwise performs ONE long poll up to pollTimeout (e.g., 40s).
+ *      • If records arrive within the window, returns the first immediately.
+ *      • If no records within the window, returns null (signals end-of-input to Spring Batch).
+ *  - commitSync(): best-effort commit at chunk/close boundaries; never throws from close().
+ *
+ * Requirements:
+ *  - Configure consumer with enable.auto.commit = false.
+ *  - Spring Batch will call read() repeatedly until it returns null.
+ *
+ * Observability:
+ *  - Tracks last polled offset per partition and the highest offset seen overall.
+ */
+@Slf4j
+public final class BatchKafkaReader implements ItemStreamReader<ConsumerRecord<String, String>> {
+
+    private final Properties props;
+    private final String topic;
+    private final List<Integer> partitions; // optional; null/empty => discover all partitions
+    private final Duration pollTimeout;     // e.g., Duration.ofSeconds(40)
+    private final long manualOffset;        // >=0 => explicit seek; <0 => committed/earliest
+
+    private final AtomicBoolean opened = new AtomicBoolean(false);
+
+    private KafkaConsumer<String, String> consumer;
+    private Iterator<ConsumerRecord<String, String>> buffer = Collections.emptyIterator();
+
+    // Next offset to commit per partition (thread-safe defensively)
+    private final ConcurrentMap<TopicPartition, OffsetAndMetadata> lastOffsets = new ConcurrentHashMap<>();
+
+    // Observability
+    private final ConcurrentMap<TopicPartition, Long> lastPolledOffsets = new ConcurrentHashMap<>();
+    private final AtomicLong highestOffsetSeen = new AtomicLong(-1L);
+
+    public BatchKafkaReader(
+            @NotNull Properties props,
+            @NotNull String topic,
+            List<Integer> partitions,
+            @NotNull Duration pollTimeout,
+            long manualOffset
+    ) {
+        this.props = Objects.requireNonNull(props, "props");
+        this.topic = Objects.requireNonNull(topic, "topic");
+        this.partitions = (partitions == null || partitions.isEmpty()) ? null : List.copyOf(partitions);
+        this.pollTimeout = Objects.requireNonNull(pollTimeout, "pollTimeout");
+        this.manualOffset = manualOffset;
+    }
+
+    @Override
+    public void open(@NotNull ExecutionContext context) throws ItemStreamException {
+        if (!opened.compareAndSet(false, true)) {
+            log.debug("BatchKafkaReader already opened; ignoring subsequent open()");
+            return;
+        }
+
+        try {
+            // Guardrail: enforce manual commit mode
+            Object v = props.get(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG);
+            boolean autoCommit = (v == null) ? true : Boolean.parseBoolean(String.valueOf(v));
+            if (autoCommit) {
+                throw new IllegalStateException("enable.auto.commit must be false for BatchKafkaReader");
+            }
+
+            consumer = new KafkaConsumer<>(props);
+            final List<TopicPartition> tps = resolveTopicPartitions(consumer);
+            consumer.assign(tps);
+
+            if (manualOffset >= 0) {
+                // Manual seek takes precedence
+                for (TopicPartition tp : tps) {
+                    try {
+                        log.info("Seeking {} to manual offset {}", tp, manualOffset);
+                        consumer.seek(tp, manualOffset);
+                    } catch (OffsetOutOfRangeException oore) {
+                        // Harden: fall back to END for partitions where offset is invalid
+                        log.warn("Manual offset {} out of range for {}; seeking to end.", manualOffset, tp);
+                        consumer.seekToEnd(Collections.singleton(tp));
+                    }
+                }
+                return;
+            }
+
+            // Seek to committed if present, else beginning
+            Map<TopicPartition, OffsetAndMetadata> committed =
+                    Optional.ofNullable(consumer.committed(new HashSet<>(tps)))
+                            .orElse(Collections.emptyMap());
+
+            Set<TopicPartition> needEarliest = new HashSet<>(tps);
+            for (TopicPartition tp : tps) {
+                OffsetAndMetadata om = committed.get(tp);
+                if (om != null && om.offset() >= 0) {
+                    log.info("Seeking {} to committed offset {}", tp, om.offset());
+                    consumer.seek(tp, om.offset());
+                    needEarliest.remove(tp);
+                }
+            }
+            if (!needEarliest.isEmpty()) {
+                log.info("Seeking to beginning for uncommitted partitions {}", needEarliest);
+                consumer.seekToBeginning(needEarliest);
+            }
+        } catch (KafkaException ke) {
+            safeCloseConsumer();
+            opened.set(false);
+            throw new ItemStreamException("Failed to open Kafka consumer", ke);
+        }
+    }
+
+    @Nullable
+    @Override
+    public ConsumerRecord<String, String> read() {
+        if (consumer == null) {
+            log.debug("read() called but consumer is null (closed/not opened). Returning end-of-input.");
+            return null;
+        }
+
+        // 1) Drain any buffered records first (no waiting)
+        if (buffer.hasNext()) {
+            ConsumerRecord<String, String> rec = buffer.next();
+            trackForCommit(rec);
+            return rec;
+        }
+
+        // 2) Single long poll up to pollTimeout (e.g., 40s). If nothing arrives, end-of-input.
+        try {
+            ConsumerRecords<String, String> polled = consumer.poll(pollTimeout);
+
+            if (polled.isEmpty()) {
+                log.info("No data within ~{} seconds; ending input. lastPolledOffsets={}, highestOffsetSeen={}",
+                        Math.max(1, pollTimeout.getSeconds()), lastPolledOffsets, highestOffsetSeen.get());
+                return null;
+            }
+
+            updateOffsetsObserved(polled);
+            buffer = polled.iterator();
+
+            ConsumerRecord<String, String> rec = buffer.next();
+            trackForCommit(rec);
+            return rec;
+
+        } catch (WakeupException we) {
+            // Typical during shutdowns; treat as graceful end
+            log.warn("Consumer wakeup during poll; treating as end-of-input.", we);
+            return null;
+        } catch (KafkaException ke) {
+            // Hard poll failure -> end the stream; let the step decide next actions
+            log.error("Poll failed; ending input. Consumer metrics: {}", consumerSafeMetrics(), ke);
+            return null;
+        }
+    }
+
+    // Spring Batch calls update() between reads; we commit explicitly at chunk/close boundaries.
+    @Override
+    @SuppressWarnings("java:S1186") // method intentionally empty; commit cadence controlled externally via commitSync()
+    public void update(@NotNull ExecutionContext ctx) { }
+
+    /**
+     * Best-effort synchronous commit of offsets tracked so far.
+     * Safe to call multiple times; becomes a no-op if nothing to commit.
+     */
+    public void commitSync() {
+        if (consumer == null || lastOffsets.isEmpty()) return;
+
+        try {
+            consumer.commitSync(new HashMap<>(lastOffsets));
+            log.debug("Committed offsets: {}", lastOffsets);
+        } catch (CommitFailedException cfe) {
+            // Rebalance/concurrency; warn and move on
+            log.warn("Commit failed (likely rebalance). Will retry on next commit/close. Details: {}", cfe.toString());
+        } catch (KafkaException ke) {
+            log.warn("Kafka exception during commitSync; offsets may be uncommitted. Details: {}", ke.toString());
+        }
+    }
+
+    @Override
+    public void close() {
+        try {
+            // Best-effort; never throw from close()
+            commitSync();
+        } catch (Exception e) {
+            log.debug("Suppressing commit exception during close: {}", e.toString());
+        } finally {
+            safeCloseConsumer();
+            opened.set(false);
+        }
+    }
+
+    /* ---------------------- helpers ---------------------- */
+
+    private List<TopicPartition> resolveTopicPartitions(KafkaConsumer<String, String> c) {
+        if (this.partitions != null) {
+            return this.partitions.stream()
+                    .map(p -> new TopicPartition(topic, p))
+                    .collect(Collectors.toList());
+        }
+        List<PartitionInfo> infos = c.partitionsFor(topic);
+        if (infos == null || infos.isEmpty()) {
+            throw new IllegalStateException("No partitions found for topic: " + topic);
+        }
+        List<TopicPartition> tps = infos.stream()
+                .map(pi -> new TopicPartition(pi.topic(), pi.partition()))
+                .collect(Collectors.toList());
+        log.info("Auto-discovered partitions for {} -> {}", topic, tps);
+        return tps;
+    }
+
+    private void trackForCommit(ConsumerRecord<String, String> rec) {
+        lastOffsets.put(
+                new TopicPartition(rec.topic(), rec.partition()),
+                new OffsetAndMetadata(rec.offset() + 1) // commit the "next" offset
+        );
+    }
+
+    private void updateOffsetsObserved(ConsumerRecords<String, String> polled) {
+        for (TopicPartition tp : polled.partitions()) {
+            List<ConsumerRecord<String, String>> recs = polled.records(tp);
+            if (!recs.isEmpty()) {
+                long lastOffsetInBatch = recs.get(recs.size() - 1).offset();
+                lastPolledOffsets.put(tp, lastOffsetInBatch);
+                highestOffsetSeen.accumulateAndGet(lastOffsetInBatch, Math::max);
+            }
+        }
+    }
+
+    private String consumerSafeMetrics() {
+        try {
+            return String.valueOf(consumer.metrics());
+        } catch (Exception ignore) {
+            return "<unavailable>";
+        }
+    }
+
+    private void safeCloseConsumer() {
+        if (consumer == null) return;
+        try {
+            consumer.close();
+        } catch (KafkaException e) {
+            log.warn("Failed to close consumer cleanly: {}", e.toString());
+        } finally {
+            consumer = null;
+        }
+    }
+
+    /* -------- Optional getters for tests/logging -------- */
+
+    public Map<TopicPartition, OffsetAndMetadata> getLastOffsetsSnapshot() {
+        return new HashMap<>(lastOffsets);
+    }
+
+    public Map<TopicPartition, Long> getLastPolledOffsetsSnapshot() {
+        return new HashMap<>(lastPolledOffsets);
+    }
+
+    public long getHighestOffsetSeen() {
+        return highestOffsetSeen.get();
+    }
+}
