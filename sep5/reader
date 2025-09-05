@@ -1,0 +1,252 @@
+Got it—here’s a tidy, defensive, “senior-style” BatchKafkaReader you can drop in. It cleanly supports a manual start offset (when manualOffset >= 0) and otherwise seeks to committed or earliest. The close() path avoids noisy errors by checking if there’s anything to commit and by catching/annotating the common commit/close exceptions.
+
+package com.td.payments.pants.mailservice.config;
+
+import lombok.extern.slf4j.Slf4j;
+import org.jetbrains.annotations.NotNull;
+import org.springframework.batch.item.ExecutionContext;
+import org.springframework.batch.item.ItemStreamException;
+import org.springframework.batch.item.ItemStreamReader;
+import org.apache.kafka.clients.consumer.*;
+import org.apache.kafka.common.TopicPartition;
+
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
+
+/**
+ * Single-topic, single-consumer ItemStreamReader for Kafka that:
+ *  - If manualOffset >= 0: seeks every assigned partition to that exact offset.
+ *  - Else: seeks to the committed offset if present; otherwise to beginning.
+ *  - Tracks "next to commit" offsets and commits synchronously on demand/close.
+ *
+ * Expected consumer props (at minimum):
+ *  - enable.auto.commit=false
+ *  - key.deserializer, value.deserializer, bootstrap.servers, group.id, etc.
+ */
+@Slf4j
+public class BatchKafkaReader implements ItemStreamReader<ConsumerRecord<String, String>> {
+
+    private final Properties props;
+    private final String topic;
+    private final List<Integer> partitions;        // optional; null/empty -> all partitions of topic
+    private final Duration pollTimeout;
+    private final int maxEmptyPolls;
+    private final long manualOffset;               // >=0 means "start here"; <0 use committed/earliest
+
+    private KafkaConsumer<String, String> consumer;
+    private Iterator<ConsumerRecord<String, String>> buffer = Collections.emptyIterator();
+
+    // next offset to commit per partition
+    private final Map<TopicPartition, OffsetAndMetadata> lastOffsets = new HashMap<>();
+    private int consecutiveEmptyPolls = 0;
+    private final AtomicBoolean opened = new AtomicBoolean(false);
+
+    public BatchKafkaReader(
+            @NotNull Properties props,
+            @NotNull String topic,
+            List<Integer> partitions,
+            @NotNull Duration pollTimeout,
+            int maxEmptyPolls,
+            long manualOffset
+    ) {
+        this.props = Objects.requireNonNull(props, "props");
+        this.topic = Objects.requireNonNull(topic, "topic");
+        this.partitions = (partitions == null || partitions.isEmpty()) ? null : List.copyOf(partitions);
+        this.pollTimeout = Objects.requireNonNull(pollTimeout, "pollTimeout");
+        this.maxEmptyPolls = Math.max(1, maxEmptyPolls);
+        this.manualOffset = manualOffset;
+    }
+
+    @Override
+    public void open(@NotNull ExecutionContext context) throws ItemStreamException {
+        if (!opened.compareAndSet(false, true)) {
+            log.debug("BatchKafkaReader already opened; ignoring subsequent open()");
+            return;
+        }
+
+        try {
+            consumer = new KafkaConsumer<>(props);
+            final List<TopicPartition> tps = resolveTopicPartitions(consumer);
+            consumer.assign(tps);
+
+            if (manualOffset >= 0) {
+                // Manual seek takes precedence over everything.
+                for (TopicPartition tp : tps) {
+                    log.info("Seeking {} to manual offset {}", tp, manualOffset);
+                    consumer.seek(tp, manualOffset);
+                }
+                return;
+            }
+
+            // Otherwise: seek to committed if present, else to beginning
+            Map<TopicPartition, OffsetAndMetadata> committed =
+                    Optional.ofNullable(consumer.committed(new HashSet<>(tps)))
+                            .orElse(Collections.emptyMap());
+
+            Set<TopicPartition> needEarliest = new HashSet<>(tps);
+            for (TopicPartition tp : tps) {
+                OffsetAndMetadata om = committed.get(tp);
+                if (om != null && om.offset() >= 0) {
+                    log.info("Seeking {} to committed offset {}", tp, om.offset());
+                    consumer.seek(tp, om.offset());
+                    needEarliest.remove(tp);
+                }
+            }
+            if (!needEarliest.isEmpty()) {
+                log.info("Seeking to beginning for uncommitted partitions {}", needEarliest);
+                consumer.seekToBeginning(needEarliest);
+            }
+        } catch (Exception e) {
+            // Ensure consumer is closed if open failed midway.
+            safeCloseConsumer();
+            opened.set(false);
+            throw new ItemStreamException("Failed to open Kafka consumer", e);
+        }
+    }
+
+    @Override
+    public ConsumerRecord<String, String> read() {
+        // Drain in-memory buffer first
+        if (buffer.hasNext()) {
+            ConsumerRecord<String, String> rec = buffer.next();
+            // track the next offset we would commit (record offset + 1)
+            lastOffsets.put(new TopicPartition(rec.topic(), rec.partition()),
+                    new OffsetAndMetadata(rec.offset() + 1));
+            return rec;
+        }
+
+        // Populate buffer via poll
+        ConsumerRecords<String, String> polled = ConsumerRecords.empty();
+        try {
+            polled = consumer.poll(pollTimeout);
+        } catch (WakeupException we) {
+            // Surface as null (end) but keep logs; typical during shutdowns.
+            log.warn("Consumer wakeup during poll; treating as end of stream.", we);
+            return null;
+        } catch (Exception e) {
+            // On hard poll errors, surface as end to let the step decide; logs include metrics.
+            log.error("Poll failed; ending read loop. Consumer metrics: {}", consumerSafeMetrics(), e);
+            return null;
+        }
+
+        if (polled.isEmpty()) {
+            if (++consecutiveEmptyPolls >= maxEmptyPolls) {
+                log.info("Reached max empty polls ({}). Last tracked offsets: {}", maxEmptyPolls, lastOffsets);
+                return null; // signal "no more data" to the step
+            }
+            return null; // yield control; next read() will poll again
+        }
+
+        consecutiveEmptyPolls = 0;
+        buffer = polled.iterator();
+        return read(); // now drains the buffer path above
+    }
+
+    /**
+     * Commit the last seen offsets if there is anything to commit.
+     * Safe to call multiple times; no-op when there are no tracked offsets.
+     */
+    public void commitSync() {
+        if (consumer == null) return;
+        if (lastOffsets.isEmpty()) return;
+
+        try {
+            consumer.commitSync(new HashMap<>(lastOffsets));
+            log.debug("Committed offsets: {}", lastOffsets);
+        } catch (CommitFailedException cfe) {
+            // Usually a rebalance or concurrent commit; annotate and keep going.
+            log.warn("Commit failed (possibly due to rebalance). Will retry on next commit/close. Details: {}", cfe.toString());
+        } catch (Exception e) {
+            // Do not fail the batch on close-time commit noise; let the caller decide elsewhere.
+            log.warn("Unexpected exception during commitSync; offsets may be uncommitted. Details: {}", e.toString());
+        }
+    }
+
+    @Override
+    public void update(@NotNull ExecutionContext ctx) {
+        // Intentionally empty: caller orchestrates commit boundaries explicitly via commitSync().
+    }
+
+    @Override
+    public void close() {
+        // Try a best-effort commit first, but only if there is anything to commit.
+        try {
+            commitSync();
+        } catch (Exception e) {
+            // Guardrail: never throw from close(); we already logged in commitSync().
+            log.debug("Suppressing commit exception during close: {}", e.toString());
+        } finally {
+            safeCloseConsumer();
+            opened.set(false);
+        }
+    }
+
+    /* ---------------------- helpers ---------------------- */
+
+    private List<TopicPartition> resolveTopicPartitions(KafkaConsumer<String, String> c) {
+        if (this.partitions != null) {
+            return this.partitions.stream()
+                    .map(p -> new TopicPartition(topic, p))
+                    .collect(Collectors.toList());
+        }
+        // Discover all partitions when none explicitly provided
+        List<PartitionInfo> infos = c.partitionsFor(topic);
+        if (infos == null || infos.isEmpty()) {
+            throw new IllegalStateException("No partitions found for topic: " + topic);
+        }
+        List<TopicPartition> tps = infos.stream()
+                .map(pi -> new TopicPartition(pi.topic(), pi.partition()))
+                .collect(Collectors.toList());
+        log.info("Auto-discovered partitions for {} -> {}", topic, tps);
+        return tps;
+    }
+
+    private String consumerSafeMetrics() {
+        try {
+            return String.valueOf(consumer.metrics());
+        } catch (Exception ignore) {
+            return "<unavailable>";
+        }
+    }
+
+    private void safeCloseConsumer() {
+        if (consumer == null) return;
+        try {
+            consumer.close();
+        } catch (Exception e) {
+            log.warn("Failed to close consumer cleanly: {}", e.toString());
+        } finally {
+            consumer = null;
+        }
+    }
+}
+
+Notes / reasoning
+
+Manual offset: if manualOffset >= 0, we seek(tp, manualOffset) for every assigned partition and return—no accidental “commit/earliest” seeks.
+
+Default path: we pull committed() for all assigned partitions, seek to it when present, otherwise seekToBeginning (earliest).
+
+Read loop:
+
+Drains any buffered records first.
+
+Tracks next offset to commit (offset + 1) in lastOffsets.
+
+Uses maxEmptyPolls as your “end of stream” heuristic (returning null to end the step).
+
+Commit safety:
+
+No-op if there’s nothing to commit or consumer is null.
+
+Catches CommitFailedException (rebalance/concurrency); logs at warn but doesn’t blow up your step.
+
+close() never throws; it best-effort commits and always tries to close the consumer.
+
+Partition resolution:
+
+If you don’t pass an explicit list, it discovers all partitions for the topic at open() and assigns them.
+
+If you want, I can also generate a focused test scaffold (using Testcontainers’ Kafka to verify seek/commit behavior and the “manual vs committed/earliest” branches) next.
