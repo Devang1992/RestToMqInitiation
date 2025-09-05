@@ -250,3 +250,72 @@ Partition resolution:
 If you don’t pass an explicit list, it discovers all partitions for the topic at open() and assigns them.
 
 If you want, I can also generate a focused test scaffold (using Testcontainers’ Kafka to verify seek/commit behavior and the “manual vs committed/earliest” branches) next.
+
+
+-------------------------------------------------------------------------------------------
+
+
+for (;;) is just an infinite loop (same as while (true)).
+Here’s the same logic rewritten with a bounded while so it’s clearer—no infinite loop:
+
+@Override
+public ConsumerRecord<String, String> read() {
+    if (consumer == null) {
+        log.debug("read() called after consumer closed; returning end-of-input.");
+        return null;
+    }
+
+    // Drain any buffered records first
+    if (buffer.hasNext()) {
+        ConsumerRecord<String, String> rec = buffer.next();
+        lastOffsets.put(
+            new TopicPartition(rec.topic(), rec.partition()),
+            new OffsetAndMetadata(rec.offset() + 1)
+        );
+        return rec;
+    }
+
+    // Wait budget = maxEmptyPolls * pollTimeout
+    consecutiveEmptyPolls = 0;
+    while (consecutiveEmptyPolls < maxEmptyPolls) {
+        ConsumerRecords<String, String> polled;
+        try {
+            polled = consumer.poll(pollTimeout);
+        } catch (WakeupException we) {
+            log.warn("Consumer wakeup during poll; treating as end-of-input.", we);
+            return null;
+        } catch (Exception e) {
+            log.error("Poll failed; ending read loop. Consumer metrics: {}", consumerSafeMetrics(), e);
+            return null;
+        }
+
+        if (polled.isEmpty()) {
+            consecutiveEmptyPolls++;
+            // continue polling until the budget is exhausted
+            continue;
+        }
+
+        // Got data: reset counter, buffer, return first record
+        consecutiveEmptyPolls = 0;
+        buffer = polled.iterator();
+
+        ConsumerRecord<String, String> rec = buffer.next();
+        lastOffsets.put(
+            new TopicPartition(rec.topic(), rec.partition()),
+            new OffsetAndMetadata(rec.offset() + 1)
+        );
+        return rec;
+    }
+
+    // Budget exhausted (~ maxEmptyPolls * pollTimeout seconds)
+    long waitedSec = (long) (maxEmptyPolls * Math.max(1, pollTimeout.getSeconds()));
+    log.info("No data after {} empty polls (~{}s). Ending input.", maxEmptyPolls, waitedSec);
+    return null;
+}
+
+
+If you prefer a counter right in the loop header, this equivalent form is fine too:
+
+for (int tries = 0; tries < maxEmptyPolls; tries++) {
+    // poll; if data -> return record; if empty -> loop; handle exceptions as above
+}
