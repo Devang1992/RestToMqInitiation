@@ -1,0 +1,108 @@
+Short answer: yes—you can guarantee the header logic runs before your @StepScope ItemStreamReader/writer. You have two solid, production-safe patterns:
+
+Option A — Keep JobExecutionListener (simplest)
+
+Make sure the listener is registered on the Job (not just a bean in the context). beforeJob() fires before any step starts, so your step-scoped beans will see values you put in the JobExecutionContext.
+
+@Configuration
+@RequiredArgsConstructor
+public class BatchJobConfig {
+
+  private final Step readWriteStep;
+  private final HeaderWriter headerWriter; // implements JobExecutionListener
+
+  @Bean
+  public Job mailJob(JobRepository repo) {
+    return new JobBuilder("mailJob", repo)
+        .listener(headerWriter)          // <-- ensures beforeJob() runs first
+        .start(readWriteStep)
+        .build();
+  }
+}
+
+
+Your step-scoped writer/reader should then bind to the key set by beforeJob():
+
+@Bean
+@StepScope
+public ItemStreamWriter<String> bodyFileWriter(
+    @Value("#{jobExecutionContext['FILE_PATH']}") String filePath
+) {
+  if (filePath == null || filePath.isBlank()) {
+    throw new IllegalStateException("FILE_PATH missing; header listener may not have run.");
+  }
+  return new FileAppendWriter(Path.of(filePath));
+}
+
+
+Gotchas to avoid
+
+Don’t make the listener @StepScope.
+
+Register it on the Job as above; simply declaring @Component isn’t enough unless you also wire it onto the job.
+
+Keep any side-effects (like file creation) out of step-scoped bean constructors; do them in open() or in the listener.
+
+Option B — Deterministic step ordering (bulletproof)
+
+Move header creation into a small Tasklet step that runs before the chunk step, then promote the file path into the Job context.
+
+@Component
+@RequiredArgsConstructor
+public class HeaderInitTasklet implements Tasklet {
+  private final PantsBatchProperties properties;
+  private final TemplateMapper templateMapper;
+
+  @Override
+  public RepeatStatus execute(StepContribution c, ChunkContext cc) throws Exception {
+    var jobCtx = cc.getStepContext().getStepExecution().getJobExecution().getExecutionContext();
+
+    // ...build fileName + path, write header...
+    jobCtx.putString("FILE_PATH", file.toString());
+    jobCtx.putString("FILE_NAME", fileName);
+    return RepeatStatus.FINISHED;
+  }
+}
+
+@Configuration
+public class BatchJobConfig2 {
+
+  @Bean
+  public ExecutionContextPromotionListener promoteFileKeys() {
+    var l = new ExecutionContextPromotionListener();
+    l.setKeys(new String[]{"FILE_PATH","FILE_NAME"});
+    return l;
+  }
+
+  @Bean
+  public Step initHeaderStep(JobRepository repo, PlatformTransactionManager tx,
+                             HeaderInitTasklet tasklet, ExecutionContextPromotionListener promote) {
+    return new StepBuilder("initHeader", repo)
+        .tasklet(tasklet, tx)
+        .listener(promote)            // promote FILE_PATH -> JobExecutionContext
+        .build();
+  }
+
+  @Bean
+  public Job mailJob(JobRepository repo, Step initHeaderStep, Step readWriteStep) {
+    return new JobBuilder("mailJob", repo)
+        .start(initHeaderStep)        // <-- runs first
+        .next(readWriteStep)          // uses @StepScope beans bound to jobExecutionContext['FILE_PATH']
+        .build();
+  }
+}
+
+
+This makes the ordering explicit: initHeader runs, sets FILE_PATH, promotes it, then your chunk step’s @StepScope beans see it.
+
+Why your reader looked like it “ran first”
+
+Step-scoped beans are proxied; logs from bean creation can appear early, but the actual target (and open()) is instantiated right when the step starts—after beforeJob() if you registered the listener on the job. If you saw nulls, it usually means the listener wasn’t actually attached to the job, or you read from jobExecutionContext before setting/promoting the key.
+
+Recommendation
+
+If you’re happy with a listener: Option A (make sure it’s added via .listener(headerWriter)).
+
+If you want deterministic sequencing visible in your Job graph: Option B (tasklet + promotion). It’s my go-to for multi-step pipelines.
+
+If you paste your Job/Step builder code, I’ll wire it precisely to your current setup.
