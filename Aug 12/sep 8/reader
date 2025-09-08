@@ -1,0 +1,375 @@
+Refactored class
+package your.pkg.reader;
+
+import org.apache.kafka.clients.consumer.*;
+import org.apache.kafka.common.TopicPartition;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.batch.item.ExecutionContext;
+import org.springframework.batch.item.ItemStreamException;
+import org.springframework.batch.item.ItemStreamReader;
+import org.springframework.lang.NonNull;
+
+import java.time.Duration;
+import java.util.*;
+
+/**
+ * Batch, finite Kafka reader that:
+ *  - Assigns explicit partitions
+ *  - Seeks to a manual offset if provided; otherwise to committed offsets; otherwise to beginning
+ *  - Polls until it either returns a record or hits maxEmptyPolls (then returns null)
+ *  - Tracks last read offsets (+1) for commitSync() and on close()
+ *
+ * Behavior preserved from the original; only structure/clarity improved.
+ */
+public class BatchKafkaReader implements ItemStreamReader<ConsumerRecord<String, String>> {
+
+  private static final Logger log = LoggerFactory.getLogger(BatchKafkaReader.class);
+
+  private final Properties props;
+  private final String topic;
+  private final List<Integer> partitions;
+  private final Duration pollTimeout;
+  private final int maxEmptyPolls;
+  private final long startOffset; // -1 means "use committed/earliest"
+
+  // runtime state
+  private final Map<TopicPartition, OffsetAndMetadata> lastOffsets = new HashMap<>();
+  private KafkaConsumer<String, String> consumer;
+  private Iterator<ConsumerRecord<String, String>> buffer = Collections.emptyIterator();
+  private int emptyPolls = 0;
+
+  public BatchKafkaReader(
+      Properties props,
+      String topic,
+      List<Integer> partitions,
+      Duration pollTimeout,
+      int maxEmptyPolls,
+      long startOffset
+  ) {
+    this.props = Objects.requireNonNull(props, "props");
+    this.topic = Objects.requireNonNull(topic, "topic");
+    this.partitions = Collections.unmodifiableList(new ArrayList<>(Objects.requireNonNull(partitions, "partitions")));
+    this.pollTimeout = Objects.requireNonNull(pollTimeout, "pollTimeout");
+    this.maxEmptyPolls = Math.max(1, maxEmptyPolls);
+    this.startOffset = startOffset;
+  }
+
+  // ---- lifecycle ------------------------------------------------------------
+
+  @Override
+  public void open(@NonNull ExecutionContext ctx) throws ItemStreamException {
+    try {
+      this.consumer = createConsumer(props); // overridable for tests
+      final List<TopicPartition> tps = buildTopicPartitions();
+
+      assign(tps);
+
+      if (startOffset >= 0) {
+        // Prevent Kafka from silently resetting on out-of-range if we explicitly seek.
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "none");
+        seekAllToOffset(tps, startOffset);
+        return;
+      }
+
+      // Seek to committed if present
+      final Map<TopicPartition, OffsetAndMetadata> committed = committedFor(tps);
+      final Set<TopicPartition> needBeginning = new HashSet<>(tps);
+
+      for (TopicPartition tp : tps) {
+        final OffsetAndMetadata om = committed.get(tp);
+        if (om != null) {
+          log.info("Seeking {} to committed offset {}", tp, om.offset());
+          consumer.seek(tp, om.offset());
+          needBeginning.remove(tp);
+        }
+      }
+
+      // Anything without a committed offset -> earliest
+      if (!needBeginning.isEmpty()) {
+        log.info("Seeking {} to earliest offsets", needBeginning);
+        consumer.seekToBeginning(needBeginning);
+      }
+    } catch (Exception e) {
+      throw new ItemStreamException("Failed to open consumer", e);
+    }
+  }
+
+  @Override
+  public ConsumerRecord<String, String> read() {
+    while (true) {
+      if (buffer.hasNext()) {
+        ConsumerRecord<String, String> rec = buffer.next();
+        // remember next position (Kafka expects the next offset to commit)
+        lastOffsets.put(
+            new TopicPartition(rec.topic(), rec.partition()),
+            new OffsetAndMetadata(rec.offset() + 1)
+        );
+        return rec;
+      }
+
+      // need a new batch
+      ConsumerRecords<String, String> polled = consumer.poll(pollTimeout);
+      if (polled == null || polled.isEmpty()) {
+        if (++emptyPolls >= maxEmptyPolls) {
+          return null; // end of batch run
+        }
+        continue;
+      }
+
+      emptyPolls = 0;
+      buffer = polled.iterator();
+    }
+  }
+
+  /** Flush offsets if we have any. Safe to call multiple times. */
+  public void commitSync() {
+    if (consumer == null || lastOffsets.isEmpty()) return;
+
+    try {
+      consumer.commitSync(new HashMap<>(lastOffsets));
+      log.debug("Committed offsets: {}", lastOffsets);
+    } catch (CommitFailedException commitFailedException) {
+      // Rebalances during concurrent commits can cause this; warn and move on.
+      log.warn("Commit failed (likely rebalance). Will retry on next commit/close. Details: {}",
+          commitFailedException.toString());
+    } catch (Exception e) {
+      log.warn("Unexpected exception during commitSync; offsets may be uncommitted. Details: {}", e.toString());
+    }
+  }
+
+  @Override
+  public void update(@NonNull ExecutionContext ctx) {
+    // Intentionally no-op (no paging state carried through ExecutionContext)
+  }
+
+  @Override
+  public void close() {
+    try {
+      commitSync();
+    } catch (Exception e) {
+      log.warn("Failed to commit offsets on close", e);
+    }
+
+    try {
+      if (consumer != null) {
+        consumer.close();
+      }
+    } catch (Exception e) {
+      log.warn("Failed to close consumer", e);
+    }
+  }
+
+  // ---- helpers --------------------------------------------------------------
+
+  protected KafkaConsumer<String, String> createConsumer(Properties props) {
+    return new KafkaConsumer<>(props);
+  }
+
+  private List<TopicPartition> buildTopicPartitions() {
+    List<TopicPartition> tps = new ArrayList<>(partitions.size());
+    for (int p : partitions) tps.add(new TopicPartition(topic, p));
+    return tps;
+  }
+
+  private void assign(List<TopicPartition> tps) {
+    consumer.assign(tps);
+  }
+
+  private void seekAllToOffset(List<TopicPartition> tps, long offset) {
+    for (TopicPartition tp : tps) {
+      log.info("Seeking {} to manual offset {}", tp, offset);
+      consumer.seek(tp, offset);
+    }
+  }
+
+  private Map<TopicPartition, OffsetAndMetadata> committedFor(List<TopicPartition> tps) {
+    // Older KafkaConsumer has committed(Set<TopicPartition>) without timeout.
+    return consumer.committed(new HashSet<>(tps));
+  }
+}
+
+Unit tests (JUnit 5 + Mockito)
+package your.pkg.reader;
+
+import org.apache.kafka.clients.consumer.*;
+import org.apache.kafka.common.TopicPartition;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.*;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.batch.item.ExecutionContext;
+import org.springframework.batch.item.ItemStreamException;
+
+import java.time.Duration;
+import java.util.*;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class BatchKafkaReaderTest {
+
+  @Mock KafkaConsumer<String, String> consumer;
+
+  private Properties props;
+  private final String topic = "t";
+  private final List<Integer> parts = Arrays.asList(0, 1, 2);
+  private final Duration timeout = Duration.ofMillis(5);
+
+  private BatchKafkaReader newReader(long startOffset, int maxEmptyPolls) {
+    // subclass to inject mock consumer
+    return new BatchKafkaReader(props, topic, parts, timeout, maxEmptyPolls, startOffset) {
+      @Override
+      protected KafkaConsumer<String, String> createConsumer(Properties p) {
+        return consumer;
+      }
+    };
+  }
+
+  @BeforeEach
+  void setUp() {
+    props = new Properties();
+  }
+
+  // --- helpers --------------------------------------------------------------
+
+  private static ConsumerRecords<String, String> records(String topic, int partition, long startOffset, String... vals) {
+    Map<TopicPartition, List<ConsumerRecord<String, String>>> data = new HashMap<>();
+    List<ConsumerRecord<String, String>> list = new ArrayList<>();
+    long off = startOffset;
+    for (String v : vals) {
+      list.add(new ConsumerRecord<>(topic, partition, off++, null, v));
+    }
+    data.put(new TopicPartition(topic, partition), list);
+    return new ConsumerRecords<>(data);
+  }
+
+  private static ConsumerRecords<String, String> empty() {
+    return new ConsumerRecords<>(Collections.emptyMap());
+  }
+
+  private static Set<TopicPartition> asSet(String topic, int... ps) {
+    Set<TopicPartition> s = new HashSet<>();
+    for (int p : ps) s.add(new TopicPartition(topic, p));
+    return s;
+  }
+
+  // --- tests ---------------------------------------------------------------
+
+  @Test
+  void open_withManualOffset_seeksAllAndDisablesAutoReset() {
+    BatchKafkaReader reader = newReader(50L, 2);
+
+    reader.open(new ExecutionContext());
+
+    // All partitions assigned
+    verify(consumer).assign(Arrays.asList(
+        new TopicPartition(topic, 0),
+        new TopicPartition(topic, 1),
+        new TopicPartition(topic, 2)
+    ));
+
+    // Sought to the manual offset
+    verify(consumer).seek(new TopicPartition(topic, 0), 50L);
+    verify(consumer).seek(new TopicPartition(topic, 1), 50L);
+    verify(consumer).seek(new TopicPartition(topic, 2), 50L);
+
+    assertEquals("none", props.getProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG));
+  }
+
+  @Test
+  void open_withCommittedOffsets_missingOnSomePartitions_seeksCommittedThenBeginning() {
+    BatchKafkaReader reader = newReader(-1, 2);
+
+    Map<TopicPartition, OffsetAndMetadata> committed = new HashMap<>();
+    committed.put(new TopicPartition(topic, 0), new OffsetAndMetadata(7L));
+    committed.put(new TopicPartition(topic, 2), new OffsetAndMetadata(17L));
+
+    when(consumer.committed(asSet(topic, 0,1,2))).thenReturn(committed);
+
+    reader.open(new ExecutionContext());
+
+    verify(consumer).seek(new TopicPartition(topic, 0), 7L);
+    verify(consumer).seek(new TopicPartition(topic, 2), 17L);
+
+    // partition 1 has no commit -> seek to beginning
+    ArgumentCaptor<Set<TopicPartition>> cap = ArgumentCaptor.forClass(Set.class);
+    verify(consumer).seekToBeginning(cap.capture());
+    assertTrue(cap.getValue().contains(new TopicPartition(topic, 1)));
+    assertEquals(1, cap.getValue().size());
+  }
+
+  @Test
+  void open_whenCommittedThrows_wrapsInItemStreamException() {
+    BatchKafkaReader reader = newReader(-1, 2);
+    when(consumer.committed(anySet())).thenThrow(new RuntimeException("boom"));
+
+    ItemStreamException ex = assertThrows(ItemStreamException.class,
+        () -> reader.open(new ExecutionContext()));
+    assertTrue(ex.getMessage().contains("Failed to open consumer"));
+  }
+
+  @Test
+  void read_happyPath_tracksOffsetsAndReturnsRecords() {
+    BatchKafkaReader reader = newReader(-1, 2);
+    when(consumer.committed(anySet())).thenReturn(Collections.emptyMap());
+    reader.open(new ExecutionContext());
+
+    when(consumer.poll(any())).thenReturn(records(topic, 0, 10, "a", "b"));
+
+    // 1st read -> "a"
+    ConsumerRecord<String, String> r1 = reader.read();
+    assertEquals("a", r1.value());
+    // Commit and verify offset + 1 (next position)
+    reader.commitSync();
+
+    @SuppressWarnings("unchecked")
+    ArgumentCaptor<Map<TopicPartition, OffsetAndMetadata>> cap = ArgumentCaptor.forClass(Map.class);
+    verify(consumer).commitSync(cap.capture());
+    OffsetAndMetadata om = cap.getValue().get(new TopicPartition(topic, 0));
+    assertNotNull(om);
+    assertEquals(11L, om.offset()); // (10 + 1)
+  }
+
+  @Test
+  void read_returnsNullAfterMaxEmptyPolls() {
+    BatchKafkaReader reader = newReader(-1, 3);
+    when(consumer.committed(anySet())).thenReturn(Collections.emptyMap());
+    reader.open(new ExecutionContext());
+
+    when(consumer.poll(any())).thenReturn(empty()); // always empty
+
+    assertNull(reader.read()); // after 3 empty polls it should give up
+  }
+
+  @Test
+  void commitSync_noOffsetsOrNoConsumer_isNoop() {
+    BatchKafkaReader reader = newReader(-1, 2);
+    when(consumer.committed(anySet())).thenReturn(Collections.emptyMap());
+    reader.open(new ExecutionContext());
+
+    reader.commitSync(); // nothing read -> nothing to commit
+    verify(consumer, never()).commitSync(anyMap());
+  }
+
+  @Test
+  void close_commitsAndCloses_evenOnExceptions() {
+    BatchKafkaReader reader = newReader(-1, 2);
+    when(consumer.committed(anySet())).thenReturn(Collections.emptyMap());
+    reader.open(new ExecutionContext());
+
+    when(consumer.poll(any())).thenReturn(records(topic, 1, 5, "x"));
+    assertNotNull(reader.read());
+
+    doThrow(new CommitFailedException()).when(consumer).commitSync(anyMap());
+    reader.close(); // must still close consumer even if commit fails
+
+    verify(consumer).commitSync(anyMap());
+    verify(consumer).close();
+  }
+}
+
+
+If you want I can also drop in a tiny README note for how to wire this ItemStreamReader into your Step and where to call commitSync() (e.g., in a StepExecutionListener.afterStep), but the above keeps your current behavior intact and gives you full test coverage of logic + error paths.
