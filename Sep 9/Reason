@@ -1,0 +1,9 @@
+Why your earlier run complained “consumer not open”
+
+You ran the tests without overriding createConsumer(..), so open() built a real KafkaConsumer which wasn’t assigned/subscribed to a real topic. A real consumer enforces that, a mock doesn’t.
+
+Or open() set AUTO_OFFSET_RESET_CONFIG or called committed() in a way that threw, causing open() to bail out before assign().
+
+Using the test above, consumer is a Mockito mock; no broker is needed; open() succeeds; reads/polls/commits are all stubbed and verified.
+
+If you want me to line this up with your exact package/class names, paste the current BatchKafkaReader signature (just header + open/read/commitSync/close methods), and I’ll tailor the imports and stubbing precisely.
