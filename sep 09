@@ -1,0 +1,221 @@
+A tiny Kafka test utils (like your screenshot)
+// test/java/.../KafkaTestUtilsEx.java
+package it;
+
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.serialization.StringSerializer;
+import org.springframework.kafka.core.*;
+import org.springframework.kafka.test.EmbeddedKafkaBroker;
+
+import java.util.HashMap;
+import java.util.Map;
+
+public final class KafkaTestUtilsEx {
+  private KafkaTestUtilsEx() {}
+
+  public static ProducerFactory<String,String> producerFactory(EmbeddedKafkaBroker broker) {
+    Map<String,Object> cfg = new HashMap<>();
+    cfg.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, broker.getBrokersAsString());
+    cfg.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+    cfg.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+    cfg.put(ProducerConfig.ACKS_CONFIG, "all");
+    return new DefaultKafkaProducerFactory<>(cfg);
+  }
+
+  public static KafkaTemplate<String,String> template(EmbeddedKafkaBroker broker) {
+    return new KafkaTemplate<>(producerFactory(broker));
+  }
+
+  public static ConsumerFactory<String,String> consumerFactory(EmbeddedKafkaBroker broker, String groupId) {
+    Map<String,Object> cfg = new HashMap<>();
+    cfg.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, broker.getBrokersAsString());
+    cfg.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+    cfg.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+    cfg.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+    cfg.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+    return new DefaultKafkaConsumerFactory<>(cfg);
+  }
+}
+
+End-to-end integration test for your batch job
+
+This assumes:
+
+your job reads from ${app.kafka.topic} using group ${app.kafka.group},
+
+your custom BatchKafkaReader is YAML/props-driven,
+
+your writer outputs a single file under ${app.output.dir} (or similar),
+
+job name is batchJob and completes when the reader returns null.
+
+Adjust property keys to your project.
+
+// test/java/.../BatchJobIT.java
+package it;
+
+import org.apache.kafka.clients.consumer.*;
+import org.apache.kafka.common.TopicPartition;
+import org.junit.jupiter.api.*;
+import org.junit.jupiter.api.io.TempDir;
+import org.springframework.batch.core.*;
+import org.springframework.batch.core.launch.support.RunIdIncrementer;
+import org.springframework.batch.test.JobLauncherTestUtils;
+import org.springframework.batch.test.context.SpringBatchTest;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.kafka.test.EmbeddedKafkaBroker;
+import org.springframework.kafka.test.context.EmbeddedKafka;
+import org.springframework.test.annotation.DirtiesContext;
+import org.springframework.test.context.TestPropertySource;
+
+import java.io.IOException;
+import java.nio.file.*;
+import java.time.Duration;
+import java.util.*;
+
+import static it.KafkaTestUtilsEx.*;
+import static org.assertj.core.api.Assertions.assertThat;
+
+@SpringBatchTest
+@SpringBootTest // loads your full Spring context (job, reader, writer, YAML, etc.)
+@EmbeddedKafka(partitions = 3, topics = { "batch.input" })
+@TestPropertySource(properties = {
+    // wire your app to the embedded broker and test topic/group
+    "app.kafka.bootstrap=${spring.embedded.kafka.brokers}",
+    "app.kafka.topic=batch.input",
+    "app.kafka.group=batch-it",
+    // tune the reader to make tests fast/deterministic
+    "app.batch.poll-timeout=50ms",
+    "app.batch.max-empty-polls=3"
+})
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_EACH_TEST_METHOD)
+class BatchJobIT {
+
+  @Autowired EmbeddedKafkaBroker embeddedKafka;
+  @Autowired JobLauncherTestUtils jobLauncherTestUtils;
+
+  @TempDir Path tmp;
+
+  private static final String TOPIC = "batch.input";
+  private static final String GROUP = "batch-it";
+
+  @BeforeEach
+  void configureJobLauncher() {
+    // If your Job doesn't already use a RunIdIncrementer, adding one avoids "job instance already complete".
+    jobLauncherTestUtils.setJobParameters(new JobParametersBuilder()
+        .addLong("run.id", System.currentTimeMillis())
+        .toJobParameters());
+  }
+
+  @Test
+  void job_readsFromKafka_and_writesFile_and_commitsOffsets() throws Exception {
+    // 1) Produce test records
+    var template = template(embeddedKafka);
+    // send to a single partition for deterministic order
+    template.send(TOPIC, 0, "k1", "{\"msg\":\"hello\"}");
+    template.send(TOPIC, 0, "k2", "{\"msg\":\"world\"}");
+    template.flush();
+
+    // 2) Launch the job with an output directory param
+    Path outDir = Files.createDirectories(tmp.resolve("out"));
+    JobParameters params = new JobParametersBuilder(jobLauncherTestUtils.getUniqueJobParameters())
+        .addString("app.output.dir", outDir.toString())
+        .toJobParameters();
+
+    JobExecution exec = jobLauncherTestUtils.launchJob(params);
+    assertThat(exec.getExitStatus()).isEqualTo(ExitStatus.COMPLETED);
+
+    // 3) Assert file side-effect (adapt to your naming pattern)
+    Path produced = findLatestFile(outDir);
+    String content = Files.readString(produced);
+    assertThat(content).contains("hello").contains("world");
+    // If you need CRLF check on Linux:
+    assertThat(content).contains("\r\n");
+
+    // 4) Assert committed offsets for the consumer group
+    var cf = consumerFactory(embeddedKafka, GROUP);
+    try (Consumer<String,String> c = cf.createConsumer(GROUP, "offset-checker")) {
+      List<TopicPartition> tps = List.of(new TopicPartition(TOPIC, 0));
+      Map<TopicPartition, OffsetAndMetadata> committed = c.committed(new HashSet<>(tps));
+      OffsetAndMetadata om = committed.get(new TopicPartition(TOPIC, 0));
+      assertThat(om).isNotNull();
+      // we produced 2 records on partition 0; the next offset to read should be 2
+      assertThat(om.offset()).isEqualTo(2L);
+    }
+  }
+
+  @Test
+  void job_withManualStartOffset_onlyProcessesFromThatOffset() throws Exception {
+    // Produce 5 messages on partition 0
+    var t = template(embeddedKafka);
+    for (int i = 0; i < 5; i++) t.send(TOPIC, 0, "k"+i, "{\"idx\":"+i+"}");
+    t.flush();
+
+    // Start job configured to seek to offset 3 (i.e., should process offsets 3 and 4)
+    Path outDir = Files.createDirectories(tmp.resolve("manual"));
+    JobParameters params = new JobParametersBuilder(jobLauncherTestUtils.getUniqueJobParameters())
+        .addString("app.output.dir", outDir.toString())
+        .addLong("app.reader.start-offset", 3L) // map to your reader's property
+        .toJobParameters();
+
+    JobExecution exec = jobLauncherTestUtils.launchJob(params);
+    assertThat(exec.getExitStatus()).isEqualTo(ExitStatus.COMPLETED);
+
+    Path produced = findLatestFile(outDir);
+    String body = Files.readString(produced);
+    assertThat(body).contains("\"idx\":3").contains("\"idx\":4");
+    assertThat(body).doesNotContain("\"idx\":0").doesNotContain("\"idx\":1").doesNotContain("\"idx\":2");
+  }
+
+  @Test
+  void job_finishes_when_noMoreData_afterMaxEmptyPolls() throws Exception {
+    Path outDir = Files.createDirectories(tmp.resolve("empty"));
+    JobParameters params = new JobParametersBuilder(jobLauncherTestUtils.getUniqueJobParameters())
+        .addString("app.output.dir", outDir.toString())
+        .toJobParameters();
+
+    JobExecution exec = jobLauncherTestUtils.launchJob(params);
+    assertThat(exec.getExitStatus()).isEqualTo(ExitStatus.COMPLETED);
+
+    // No file should be produced (or an empty file depending on your writer)
+    assertThat(Files.list(outDir)).isEmpty();
+  }
+
+  // ---- helpers -------------------------------------------------------------
+
+  private static Path findLatestFile(Path dir) throws IOException {
+    try (var s = Files.list(dir)) {
+      return s.max(Comparator.comparingLong(p -> p.toFile().lastModified()))
+          .orElseThrow(() -> new AssertionError("No output file created in " + dir));
+    }
+  }
+
+  // Provide JobLauncherTestUtils bean if your test context doesn’t already have one
+  @org.springframework.boot.test.context.TestConfiguration
+  static class BatchTestCfg {
+    @org.springframework.context.annotation.Bean
+    JobLauncherTestUtils jobLauncherTestUtils() {
+      var utils = new JobLauncherTestUtils();
+      // optional: ensure a RunIdIncrementer if your job doesn't define one
+      utils.setJob(new Job() {
+        @Override public String getName() { return "batchJob"; } // must match your job bean name
+        @Override public boolean isRestartable() { return true; }
+        @Override public void close() {}
+        @Override public void execute(JobExecution execution) {} // overridden by Spring, placeholder here
+      });
+      return new JobLauncherTestUtils();
+    }
+  }
+}
+
+
+Notes you might need to align:
+
+Replace "batchJob" with your actual job bean name (or simply @Autowired Job job and call utils.setJob(job) in the @TestConfiguration).
+
+Map app.* properties to your reader/writer config (your YAML likely already binds them).
+
+If your writer picks the output directory from YAML, you can override it via @TestPropertySource instead of a job parameter.
