@@ -1,0 +1,111 @@
+public final class WordWrap {
+  private static final String CRLF = "\r\n";
+
+  private WordWrap() {}
+
+  /** Wrap with width=35 and continuation lines starting at column 39. */
+  public static String wrap(String text) {
+    return wrap(text, 35, 39);
+  }
+
+  /**
+   * @param text input text; preserves existing paragraph breaks.
+   * @param maxWidth max characters of CONTENT per visual line (not counting indent).
+   * @param hangingIndentColumn 1-based column where continuation lines start (>=2 → indent applied).
+   */
+  public static String wrap(String text, int maxWidth, int hangingIndentColumn) {
+    if (text == null || text.isEmpty()) return "";
+    if (maxWidth <= 0) throw new IllegalArgumentException("maxWidth must be > 0");
+
+    // Normalize newlines; treat tabs as spaces.
+    String normalized = text.replace("\r\n", "\n").replace("\r", "\n").replace('\t', ' ');
+    String[] paragraphs = normalized.split("\n", -1); // keep empty lines
+
+    int indentSpaces = Math.max(0, hangingIndentColumn - 1); // column → space count
+    String indent = " ".repeat(indentSpaces);
+
+    StringBuilder out = new StringBuilder();
+    for (int p = 0; p < paragraphs.length; p++) {
+      wrapParagraph(paragraphs[p], maxWidth, indent, out);
+      if (p < paragraphs.length - 1) out.append(CRLF);
+    }
+    return out.toString();
+  }
+
+  private static void wrapParagraph(String line, int maxWidth, String indent, StringBuilder out) {
+    int i = 0, n = line.length();
+    boolean firstSegment = true;
+
+    while (i < n) {
+      // Skip leading spaces at the start of each segment to avoid empty/whitespace-only lines
+      while (i < n && line.charAt(i) == ' ') i++;
+
+      if (i >= n) {
+        // paragraph becomes blank after trimming—emit nothing more
+        break;
+      }
+
+      int remaining = n - i;
+      if (remaining <= maxWidth) {
+        // Fits on one segment
+        if (!firstSegment) out.append(indent);
+        out.append(line, i, n);
+        break;
+      }
+
+      // Candidate window [i, i+maxWidth)
+      int windowEnd = i + maxWidth;
+
+      // If no space within the window, hard split (long word or no spaces)
+      int spaceInWindow = indexOfSpace(line, i, windowEnd);
+      if (spaceInWindow == -1) {
+        if (!firstSegment) out.append(indent);
+        out.append(line, i, windowEnd).append(CRLF);
+        i = windowEnd;
+        firstSegment = false;
+        continue;
+      }
+
+      // Break at last space within the window
+      int breakAt = lastIndexOfSpace(line, i, windowEnd - 1);
+      if (breakAt <= i) {
+        // Degenerate (space at start or repeated spaces)—hard split to avoid zero-length lines
+        if (!firstSegment) out.append(indent);
+        out.append(line, i, windowEnd).append(CRLF);
+        i = windowEnd;
+        firstSegment = false;
+        continue;
+      }
+
+      // Emit up to the last space (exclude the space)
+      if (!firstSegment) out.append(indent);
+      out.append(line, i, breakAt).append(CRLF);
+
+      // Advance past all spaces after the break
+      i = breakAt;
+      while (i < n && line.charAt(i) == ' ') i++;
+
+      firstSegment = false;
+    }
+  }
+
+  private static int indexOfSpace(String s, int from, int toExclusive) {
+    for (int k = from; k < toExclusive && k < s.length(); k++) {
+      if (s.charAt(k) == ' ') return k;
+    }
+    return -1;
+  }
+
+  private static int lastIndexOfSpace(String s, int from, int toInclusive) {
+    for (int k = Math.min(toInclusive, s.length() - 1); k >= from; k--) {
+      if (s.charAt(k) == ' ') return k;
+    }
+    return -1;
+  }
+
+  // Quick demo
+  public static void main(String[] args) {
+    String s = "Header text that may wrap because it is fairly long and includes aSuperLongWordThatExceedsThirtyFiveCharactersStraight.";
+    System.out.println(wrap(s, 35, 39));
+  }
+}
