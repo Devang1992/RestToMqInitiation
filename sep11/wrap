@@ -1,0 +1,108 @@
+public final class WordWrap {
+
+  private static final String CRLF = "\r\n";
+
+  private WordWrap() {}
+
+  public static String wrap(String text) {
+    return wrap(text, 35);
+  }
+
+  public static String wrap(String text, int maxWidth) {
+    if (text == null || text.isEmpty()) return "";
+    if (maxWidth <= 0) throw new IllegalArgumentException("maxWidth must be > 0");
+
+    // Normalize line breaks to '\n' for processing; treat tabs as spaces
+    String normalized = text.replace("\r\n", "\n").replace("\r", "\n").replace('\t', ' ');
+
+    StringBuilder out = new StringBuilder();
+    String[] paragraphs = normalized.split("\n", -1); // keep empty lines
+
+    for (int p = 0; p < paragraphs.length; p++) {
+      wrapOneLine(paragraphs[p], maxWidth, out);
+      if (p < paragraphs.length - 1) out.append(CRLF); // preserve original blank/new lines
+    }
+
+    return out.toString();
+  }
+
+  private static void wrapOneLine(String line, int maxWidth, StringBuilder out) {
+    int i = 0;
+    final int n = line.length();
+
+    while (i < n) {
+      // Skip leading spaces for the next visual line
+      while (i < n && line.charAt(i) == ' ') i++;
+
+      if (i >= n) {
+        // If the source line had only spaces left, emit an empty wrapped line
+        break;
+      }
+
+      int remaining = n - i;
+      if (remaining <= maxWidth) {
+        // Fits as-is
+        out.append(line, i, n);
+        break;
+      }
+
+      // Candidate window [i, i+maxWidth)
+      int windowEndExclusive = i + maxWidth;
+
+      // If the first token itself is longer than maxWidth, hard-split mid-word
+      // Detect by checking if there is any space within the window and whether the first char is not space
+      int firstSpace = indexOfSpace(line, i, windowEndExclusive);
+      if (firstSpace == -1) {
+        // No space in the window -> the leading token is >= maxWidth; hard break
+        out.append(line, i, windowEndExclusive);
+        out.append(CRLF);
+        i = windowEndExclusive;
+        continue;
+      }
+
+      // There is at least one space in window. We want to break at the last space within the window.
+      int breakAt = lastIndexOfSpace(line, i, windowEndExclusive - 1);
+      if (breakAt <= i) {
+        // Space is at the very beginning (multiple spaces). Hard-split to avoid zero-length lines.
+        out.append(line, i, windowEndExclusive);
+        out.append(CRLF);
+        i = windowEndExclusive;
+        continue;
+      }
+
+      // Emit up to the last space (exclude the space itself)
+      out.append(line, i, breakAt);
+      out.append(CRLF);
+
+      // Advance i to the first non-space after the break
+      i = breakAt;
+      while (i < n && line.charAt(i) == ' ') i++;
+    }
+  }
+
+  private static int indexOfSpace(String s, int from, int toExclusive) {
+    for (int k = from; k < toExclusive && k < s.length(); k++) {
+      char c = s.charAt(k);
+      if (c == ' ') return k;
+    }
+    return -1;
+  }
+
+  private static int lastIndexOfSpace(String s, int from, int toInclusive) {
+    for (int k = Math.min(toInclusive, s.length() - 1); k >= from; k--) {
+      char c = s.charAt(k);
+      if (c == ' ') return k;
+    }
+    return -1;
+  }
+
+  // ---------- quick demo ----------
+  public static void main(String[] args) {
+    String sample =
+        "This is a short paragraph with aSuperLongWordThatExceedsThirtyFiveCharactersStraight which should wrap nicely.\n" +
+        "Next line    has   multiple   spaces.\n\n" +
+        "ExactlyThirtyFiveCharacters------XXXXXYYYYYZZZZZ";
+
+    System.out.println(wrap(sample, 35));
+  }
+}
