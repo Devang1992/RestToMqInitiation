@@ -1,0 +1,280 @@
+Option A (Recommended): Spring Integration SFTP + a final “transfer” Step
+
+Why: First-class Spring support, streaming upload, temp file then atomic rename, retries, metrics.
+
+Maven
+
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-integration</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.springframework.integration</groupId>
+  <artifactId>spring-integration-sftp</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.springframework.retry</groupId>
+  <artifactId>spring-retry</artifactId>
+</dependency>
+
+
+application.yml
+
+sftp:
+  host: sftp.example.com
+  port: 22
+  user: myuser
+  privateKey: /opt/app/keys/id_rsa
+  passphrase: ""           # or omit
+  knownHosts: /opt/app/keys/known_hosts   # pin host key; don't skip this in prod
+  remoteDir: /inbox/myjob
+  tmpSuffix: .part
+  chmod: "0644"
+  retry:
+    maxAttempts: 3
+    backoffMs: 2000
+batch:
+  output:
+    file: /opt/app/out/WIRES_00120250912.TST
+
+
+Config (session factory + IntegrationFlow + gateway)
+
+import com.jcraft.jsch.ChannelSftp.LsEntry;
+import org.springframework.context.annotation.*;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.integration.annotation.MessagingGateway;
+import org.springframework.integration.channel.DirectChannel;
+import org.springframework.integration.file.remote.session.CachingSessionFactory;
+import org.springframework.integration.file.remote.session.SessionFactory;
+import org.springframework.integration.sftp.session.DefaultSftpSessionFactory;
+import org.springframework.integration.sftp.session.SftpRemoteFileTemplate;
+import org.springframework.integration.sftp.dsl.Sftp;
+import org.springframework.integration.dsl.IntegrationFlow;
+import org.springframework.integration.dsl.MessageChannels;
+import org.springframework.messaging.MessageChannel;
+
+@Configuration
+public class SftpConfig {
+
+  @Bean
+  public SessionFactory<LsEntry> sftpSessionFactory(SftpProps p) {
+    DefaultSftpSessionFactory f = new DefaultSftpSessionFactory(true);
+    f.setHost(p.getHost());
+    f.setPort(p.getPort());
+    f.setUser(p.getUser());
+    f.setPrivateKey(new FileSystemResource(p.getPrivateKey()));
+    if (p.getPassphrase() != null && !p.getPassphrase().isEmpty()) {
+      f.setPrivateKeyPassphrase(p.getPassphrase());
+    }
+    f.setAllowUnknownKeys(false);
+    f.setKnownHostsResource(new FileSystemResource(p.getKnownHosts()));
+    return new CachingSessionFactory<>(f);
+  }
+
+  @Bean
+  public SftpRemoteFileTemplate sftpTemplate(SessionFactory<LsEntry> sf) {
+    return new SftpRemoteFileTemplate(sf);
+  }
+
+  @Bean
+  public MessageChannel sftpUploadChannel() {
+    return MessageChannels.direct().getObject();
+  }
+
+  @Bean
+  public IntegrationFlow sftpUploadFlow(SftpRemoteFileTemplate tpl, SftpProps p) {
+    return IntegrationFlow
+        .from(sftpUploadChannel())
+        .handle(Sftp.outboundAdapter(tpl)
+            .remoteDirectory(p.getRemoteDir())
+            .autoCreateDirectory(true)
+            .useTemporaryFileName(true)
+            .temporaryFileSuffix(p.getTmpSuffix())
+            .fileExistsMode(org.springframework.integration.file.support.FileExistsMode.REPLACE)
+            .chmod(p.getChmod() != null ? Integer.parseInt(p.getChmod(), 8) : null)
+        )
+        .get();
+  }
+
+  @MessagingGateway(defaultRequestChannel = "sftpUploadChannel")
+  public interface SftpUploadGateway {
+    void upload(java.io.File file);
+  }
+}
+
+
+Batch tasklet step (upload then verify/rename happens inside adapter)
+
+import org.springframework.batch.core.step.tasklet.Tasklet;
+import org.springframework.batch.repeat.RepeatStatus;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class SftpTransferStepConfig {
+
+  @Bean
+  Tasklet sftpTransferTasklet(SftpConfig.SftpUploadGateway gw,
+                              BatchOutputProps outProps) {
+    return (contribution, chunkCtx) -> {
+      java.io.File f = new java.io.File(outProps.getFile());
+      if (!f.exists() || f.length() == 0) {
+        throw new IllegalStateException("Output file missing or empty: " + f);
+      }
+      gw.upload(f); // uploads as *.part then atomically renames to final
+      return RepeatStatus.FINISHED;
+    };
+  }
+
+  // Add this as the final step in your Job flow: ... -> finalizeStep -> sftpTransferStep
+}
+
+
+Resilience tips
+
+Wrap the tasklet body with a RetryTemplate if you want app-level retries beyond the adapter’s reconnects.
+
+The adapter already uploads to *.part and renames → downstream never sees partials.
+
+If you need a checksum, generate a .sha256 locally and upload it too (same channel).
+
+Option B: Plain SSHJ in a Tasklet (few deps, total control)
+
+Why: Minimal magic; works in FIPS/governed environments where JSch can be tricky.
+
+Maven
+
+<dependency>
+  <groupId>com.hierynomus</groupId>
+  <artifactId>sshj</artifactId>
+  <version>0.37.0</version>
+</dependency>
+<dependency>
+  <groupId>org.springframework.retry</groupId>
+  <artifactId>spring-retry</artifactId>
+</dependency>
+
+
+Tasklet
+
+import net.schmizz.sshj.SSHClient;
+import net.schmizz.sshj.sftp.SFTPClient;
+import net.schmizz.sshj.transport.verification.OpenSSHKnownHosts;
+import net.schmizz.sshj.userauth.keyprovider.KeyProvider;
+import org.springframework.batch.core.step.tasklet.Tasklet;
+import org.springframework.batch.repeat.RepeatStatus;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.nio.file.Path;
+
+public class SshjSftpTasklet implements Tasklet {
+
+  private final SftpProps props;
+  private final Path localFile;
+
+  public SshjSftpTasklet(SftpProps props, Path localFile) {
+    this.props = props;
+    this.localFile = localFile;
+  }
+
+  @Override
+  public RepeatStatus execute(org.springframework.batch.core.StepContribution contribution,
+                              org.springframework.batch.core.scope.context.ChunkContext chunkContext) throws Exception {
+    File lf = localFile.toFile();
+    if (!lf.exists() || lf.length() == 0) throw new IllegalStateException("No output file: " + lf);
+
+    try (SSHClient ssh = new SSHClient()) {
+      ssh.addHostKeyVerifier(new OpenSSHKnownHosts(new File(props.getKnownHosts())));
+      ssh.connect(props.getHost(), props.getPort());
+      KeyProvider kp = (props.getPassphrase() == null || props.getPassphrase().isEmpty())
+          ? ssh.loadKeys(props.getPrivateKey())
+          : ssh.loadKeys(props.getPrivateKey(), props.getPassphrase());
+      ssh.authPublickey(props.getUser(), kp);
+
+      try (SFTPClient sftp = ssh.newSFTPClient();
+           FileInputStream in = new FileInputStream(lf)) {
+        String remoteTmp = props.getRemoteDir() + "/" + lf.getName() + props.getTmpSuffix();
+        String remoteFinal = props.getRemoteDir() + "/" + lf.getName();
+
+        sftp.mkdirs(props.getRemoteDir());                      // idempotent
+        sftp.put(in, remoteTmp);                                // stream upload
+        // Optional: verify sizes match before rename
+        long remoteSize = sftp.stat(remoteTmp).getSize();
+        if (remoteSize != lf.length()) throw new IllegalStateException("Size mismatch");
+        sftp.rename(remoteTmp, remoteFinal);                    // atomic
+        // Optional: chmod
+        if (props.getChmod() != null) {
+          int mode = Integer.parseInt(props.getChmod(), 8);
+          sftp.chmod(remoteFinal, mode);
+        }
+      } finally {
+        ssh.disconnect();
+      }
+    }
+    return RepeatStatus.FINISHED;
+  }
+}
+
+
+Add a RetryTemplate around the execute(...) if you want exponential backoff (3 tries, 2s→4s→8s).
+
+Option C: Apache Camel SFTP route triggered after the job
+
+Why: If you already use Camel or want its rich routing/retry/observation.
+
+Define a Camel route: file:/opt/app/out?fileName=... -> sftp://user@host:22/inbox?privateKeyFile=...&knownHostsFile=...&tempFileName=${file:name}.part&useUserKnownHostsFile=false&binary=true&autoCreate=true
+
+Kick it from a final Step or a JobExecutionListener (e.g., send a direct endpoint message with the path).
+
+Camel handles reconnects, temp filename, idempotent writes, and can emit Micrometer metrics.
+
+Option D (Pragmatic): Shell out to sftp/scp via ProcessBuilder
+
+Why: Zero Java deps, aligns with ops standards (OpenSSH), easy to audit.
+Trade-off: You must manage exit codes, stdout/stderr parsing, and credentials/known_hosts provisioning.
+
+Example:
+
+String cmd = String.join(" ",
+  "sftp", "-b", "-", "-i", "/opt/app/keys/id_rsa",
+  "-o", "StrictHostKeyChecking=yes",
+  "-o", "UserKnownHostsFile=/opt/app/keys/known_hosts",
+  "myuser@sftp.example.com");
+Process p = new ProcessBuilder("bash", "-lc", cmd).start();
+try (var w = p.getOutputStream()) {
+  w.write(("put /opt/app/out/WIRES_....TST /inbox/myjob/WIRES_....TST.part\n" +
+           "rename /inbox/myjob/WIRES_....TST.part /inbox/myjob/WIRES_....TST\n" +
+           "quit\n").getBytes());
+}
+int exit = p.waitFor();
+if (exit != 0) throw new IllegalStateException("sftp failed: " + exit);
+
+Where to hook it in your Batch flow
+
+Best: Add a dedicated final Step: finalizeStep → verifyStep (optional) → sftpTransferStep.
+
+Alternate: Use a JobExecutionListener.afterJob() and only fire when status == COMPLETED. (Step is nicer for visibility and retries.)
+
+Hardening checklist (works for all options)
+
+Auth: Use key-based auth. Pin host key via known_hosts (don’t disable host checking).
+
+Atomicity: Always upload to *.part then rename to final.
+
+Retries: 3 attempts with exponential backoff; fail the step if still unsuccessful.
+
+Observability: Log remote path, bytes transferred, duration; emit Micrometer timers/counters.
+
+Permissions: Set 0644 on remote; ensure remote dir ownership/umask.
+
+Checksum (optional): Write a local .sha256 and upload it alongside; downstream validates.
+
+Line endings: SFTP is binary; it won’t change \r\n. If you see ^M in vi on Linux, that’s expected for CRLF files—your generator must consistently write \r\n for every line (including the last line) before transfer.
+
+Quick recommendation for your case
+
+You’re already in Spring Batch → Option A is the smoothest: add the SFTP step at the end, keep your atomic rename, and wire retries via Spring Retry. If your environment has JSch constraints/FIPS, switch to Option B (SSHJ Tasklet)—same behavior, fewer surprises.
+
+If you want, tell me your current Spring Boot/Batch version and I’ll paste the exact Step/Job builder code wired into your existing flow (Boot 3.2+/Batch 5 style).
