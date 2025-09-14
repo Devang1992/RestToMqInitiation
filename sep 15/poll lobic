@@ -1,0 +1,97 @@
+public final class PollGuardingReader<K,V> {
+  private final KafkaConsumer<K,V> consumer;
+
+  // ---- TUNEABLES ----
+  private static final long POLL_TIMEOUT_MS = 2000;       // your normal poll timeout
+  private static final long QUICK_POLL_MS   = 15;         // if poll returns faster than this, call it "quick"
+  private static final int  QUICK_POLL_LIMIT = 30;        // ~"30ish" quick polls → close
+  private static final long MAX_IDLE_MS     = 30_000;     // absolute cap: 30s without records → close
+  private static final long BACKOFF_MS      = 200;        // sleep between empty polls
+  private static final int  TXN_CHECK_EVERY = 5;          // check lag every 5 empty polls (endOffsets vs position)
+
+  // state
+  private int consecutiveQuickEmpties = 0;
+  private int consecutiveEmptyPolls   = 0;
+  private int blockedByTxnHits        = 0;
+  private long idleSinceMs            = -1L;
+
+  // a small buffer so read() can return one record at a time if you're using Spring Batch ItemReader<T>
+  private final ArrayDeque<ConsumerRecord<K,V>> buffer = new ArrayDeque<>();
+
+  public PollGuardingReader(KafkaConsumer<K,V> consumer) {
+    this.consumer = consumer;
+  }
+
+  /** Call this from your ItemReader.read(): returns null to signal "no more data now". */
+  public ConsumerRecord<K,V> readOne() {
+    if (!buffer.isEmpty()) return buffer.poll();
+
+    while (true) {
+      long t0 = System.nanoTime();
+      ConsumerRecords<K,V> records = consumer.poll(java.time.Duration.ofMillis(POLL_TIMEOUT_MS));
+      long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+
+      if (!records.isEmpty()) {
+        // reset starvation counters
+        consecutiveQuickEmpties = 0;
+        consecutiveEmptyPolls   = 0;
+        blockedByTxnHits        = 0;
+        idleSinceMs             = -1L;
+
+        // fill buffer (max.poll.records governs how many you get; e.g., 500)
+        records.forEach(buffer::add);
+        return buffer.poll();
+      }
+
+      // empty poll
+      if (idleSinceMs < 0) idleSinceMs = System.currentTimeMillis();
+      consecutiveEmptyPolls++;
+
+      boolean quick = elapsedMs < QUICK_POLL_MS;
+      if (quick) consecutiveQuickEmpties++; else consecutiveQuickEmpties = 0;
+
+      // periodically check if we're "blocked by txn": lag > 0 but we still see no records
+      if (consecutiveEmptyPolls % TXN_CHECK_EVERY == 0) {
+        long lag = totalLag(consumer);
+        if (lag > 0) {
+          blockedByTxnHits++;
+          // optional: log a one-liner so SIT sees what's happening
+          org.slf4j.LoggerFactory.getLogger(getClass()).warn(
+              "Empty poll with positive lag ({}). Likely read_committed blocked by open transaction.", lag);
+        } else {
+          blockedByTxnHits = 0; // no lag → nothing to read; normal idle
+        }
+      }
+
+      long idleMs = System.currentTimeMillis() - idleSinceMs;
+
+      // ---- close conditions ----
+      if (consecutiveQuickEmpties >= QUICK_POLL_LIMIT
+          || idleMs >= MAX_IDLE_MS
+          || blockedByTxnHits >= (QUICK_POLL_LIMIT / TXN_CHECK_EVERY)) {
+        // Signal end for this run. In Spring Batch ItemReader, returning null ends the step.
+        return null;
+      }
+
+      // small backoff to avoid hot spin
+      try { Thread.sleep(BACKOFF_MS); } catch (InterruptedException ie) {
+        Thread.currentThread().interrupt();
+        return null;
+      }
+    }
+  }
+
+  /** Sum of endOffsets - current position across assigned partitions (approx HW lag). */
+  private static long totalLag(KafkaConsumer<?,?> c) {
+    var assigned = c.assignment();
+    if (assigned.isEmpty()) return 0L;
+    var end = c.endOffsets(assigned);
+    long lag = 0L;
+    for (org.apache.kafka.common.TopicPartition tp : assigned) {
+      long pos = c.position(tp);              // current consumer position (LSO-bound under read_committed)
+      Long hi  = end.get(tp);                 // broker high-watermark
+      if (hi != null && hi > pos) lag += (hi - pos);
+    }
+    return lag;
+  }
+}
