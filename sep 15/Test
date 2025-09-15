@@ -1,3 +1,11 @@
+"auto.create.topics.enable=true",
+    "offsets.topic.replication.factor=1",
+    "offsets.topic.num.partitions=1",
+    "group.initial.rebalance.delay.ms=0",
+    "transaction.state.log.replication.factor=1",
+    "transaction.state.log.min.isr=1"
+
+
 Love the test harness you already have. Here’s a clean, embedded-Kafka end-to-end pattern that matches your flow:
 
 POST controller → starts Spring Batch job
