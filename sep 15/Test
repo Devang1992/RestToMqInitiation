@@ -1,0 +1,248 @@
+Love the test harness you already have. Here’s a clean, embedded-Kafka end-to-end pattern that matches your flow:
+
+POST controller → starts Spring Batch job
+
+Job reads from Kafka (your KafkaItemReader)
+
+Writer prints/flushes to output
+
+Test asserts on file/job status
+
+I’m keeping this close to your screenshots (utils/base), just filling in the missing glue and the transactional producer bits so you can simulate the uncommitted (LSO-pinned) scenario.
+
+1) Test deps (if not already)
+<dependency>
+  <groupId>org.springframework.kafka</groupId>
+  <artifactId>spring-kafka-test</artifactId>
+  <scope>test</scope>
+</dependency>
+<dependency>
+  <groupId>org.awaitility</groupId>
+  <artifactId>awaitility</artifactId>
+  <version>4.2.0</version>
+  <scope>test</scope>
+</dependency>
+
+2) Test properties (point your app at the embedded broker + speed up quick-poll exit)
+# src/test/resources/application-test.yaml
+spring:
+  kafka:
+    bootstrap-servers: ${spring.embedded.kafka.brokers}
+    consumer:
+      isolation-level: read_committed
+      auto-offset-reset: earliest
+      # keep same key/value deserializers as prod
+  # Your job’s output dir, if configurable:
+  batch:
+    output-dir: ${java.io.tmpdir}/mail-job-it
+
+# make quick-poll detect fast in tests
+reader:
+  poll-timeout-ms: 500
+  quick-poll-threshold-ms: 25
+  maximum-quick-polls: 6
+  quick-backoff-ms: 50
+  max-empty-polls: 6
+  normal-backoff-ms: 50
+
+3) Test utility (extend what you already have)
+// test/java/.../util/E2eTestUtils.java
+@Slf4j
+@RequiredArgsConstructor
+public class E2eTestUtils {
+
+  private final EmbeddedKafkaBroker embeddedKafkaBroker;
+
+  public <K,V> DefaultKafkaConsumerFactory<K,V> getConsumerFactory(String groupId,
+                                                                  Class<? extends Deserializer<K>> keyDeser,
+                                                                  Class<? extends Deserializer<V>> valDeser) {
+    Map<String,Object> props = KafkaTestUtils.consumerProps(groupId, "true", embeddedKafkaBroker);
+    props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+    props.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");
+    return new DefaultKafkaConsumerFactory<>(props, keyDeser, valDeser);
+  }
+
+  public <K,V> Consumer<K,V> configureConsumer(String groupId, String topic,
+                                               Class<? extends Deserializer<K>> keyDeser,
+                                               Class<? extends Deserializer<V>> valDeser) {
+    Consumer<K,V> c = getConsumerFactory(groupId, keyDeser, valDeser).createConsumer();
+    embeddedKafkaBroker.consumeFromAnEmbeddedTopic(c, topic);
+    return c;
+  }
+
+  /** Non-transactional producer (committed immediately). */
+  public <K,V> DefaultKafkaProducerFactory<K,V> getProducerFactory(Class<? extends Serializer<K>> keySer,
+                                                                   Class<? extends Serializer<V>> valSer) {
+    Map<String,Object> props = KafkaTestUtils.producerProps(embeddedKafkaBroker);
+    props.put(ProducerConfig.ACKS_CONFIG, "all");
+    props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+    return new DefaultKafkaProducerFactory<>(props, keySer, valSer);
+  }
+
+  /** Transactional producer for simulating open/aborted transactions. */
+  public <K,V> DefaultKafkaProducerFactory<K,V> getTxnProducerFactory(String txnId,
+      Class<? extends Serializer<K>> keySer, Class<? extends Serializer<V>> valSer) {
+    Map<String,Object> props = KafkaTestUtils.producerProps(embeddedKafkaBroker);
+    props.put(ProducerConfig.ACKS_CONFIG, "all");
+    props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+    props.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, txnId);
+    // keep short for tests
+    props.put(ProducerConfig.TRANSACTION_TIMEOUT_CONFIG, 15000);
+    return new DefaultKafkaProducerFactory<>(props, keySer, valSer);
+  }
+}
+
+4) Base test class (very close to your E2eTestBase)
+// test/java/.../integration/E2eTestBase.java
+@SpringBootConfiguration
+@EnableAutoConfiguration
+@ComponentScan(basePackages = "com.td.payments.pants")
+@ConfigurationPropertiesScan(basePackages = "com.td.payments.pants")
+@EmbeddedKafka(partitions = 1,
+  brokerProperties = {
+    "transaction.state.log.replication.factor=1",
+    "transaction.state.log.min.isr=1"
+  })
+@AutoConfigureMockMvc
+@DirtiesContext
+public class E2eTestBase {
+
+  public static final Duration TIMEOUT = Duration.ofSeconds(30);
+
+  @Autowired protected EmbeddedKafkaBroker embeddedKafkaBroker;
+  protected E2eTestUtils utils;
+
+  @Autowired protected MockMvc mockMvc;              // for calling the controller
+  @Autowired protected ApplicationContext ctx;
+
+  @Value("${spring.kafka.consumer.topic:test-topic}")
+  protected String topic;
+
+  @BeforeEach
+  void setupBase() {
+    this.utils = new E2eTestUtils(embeddedKafkaBroker);
+  }
+
+  protected void postStartJob() throws Exception {
+    // Adjust path to your controller mapping
+    mockMvc.perform(post("/batch/start")).andExpect(status().isAccepted());
+  }
+
+  protected Path outputPath() {
+    String dir = ctx.getEnvironment().getProperty("spring.batch.output-dir");
+    return Paths.get(dir == null ? System.getProperty("java.io.tmpdir") : dir);
+  }
+}
+
+5) The tests
+A) Happy path — committed messages are consumed & written
+// test/java/.../integration/E2eKafkaJobIT.java
+@Slf4j
+@SpringBootTest(classes = E2eTestBase.class,
+  webEnvironment = SpringBootTest.WebEnvironment.MOCK)
+@TestPropertySource("classpath:application-test.yaml")
+public class E2eKafkaJobIT extends E2eTestBase {
+
+  @Test
+  void happyPath_committedMessages_consumed_and_written() throws Exception {
+    // 1) produce committed messages
+    var pf = utils.getProducerFactory(StringSerializer.class, StringSerializer.class);
+    try (var producer = pf.createProducer()) {
+      producer.send(new ProducerRecord<>(topic, "k1", "{\"a\":1}"));
+      producer.send(new ProducerRecord<>(topic, "k2", "{\"a\":2}"));
+      producer.flush();
+    }
+
+    // 2) start job via controller
+    postStartJob();
+
+    // 3) await file output or any other observable side effect
+    Path outDir = outputPath();
+    Awaitility.await().atMost(TIMEOUT).until(() -> Files.list(outDir)
+        .anyMatch(p -> p.getFileName().toString().endsWith(".TST"))); // adapt to your naming
+
+    // 4) simple content smoke-check
+    Path file = Files.list(outDir)
+        .filter(p -> p.getFileName().toString().endsWith(".TST"))
+        .findFirst().orElseThrow();
+    String raw = Files.readString(file);
+    assertTrue(raw.contains("1") && raw.contains("2"), "Expected processed payloads in output");
+  }
+}
+
+B) Uncommitted stall — quick-poll detection ends run; after abort, job sees new data
+@Test
+void uncommitted_txn_stalls_then_abort_allows_progress() throws Exception {
+  // 1) open txn and send messages (do NOT commit)
+  var tpf = utils.getTxnProducerFactory("txn-it-1", StringSerializer.class, StringSerializer.class);
+  Producer<String,String> txnProducer = tpf.createProducer();
+  txnProducer.initTransactions();
+  txnProducer.beginTransaction();
+  txnProducer.send(new ProducerRecord<>(topic, "kX", "{\"bad\":true}"));
+  txnProducer.send(new ProducerRecord<>(topic, "kY", "{\"bad\":true}"));
+  txnProducer.flush();
+  // leave the transaction open to pin LSO
+
+  // 2) also produce valid committed messages AFTER the open txn
+  var pf = utils.getProducerFactory(StringSerializer.class, StringSerializer.class);
+  try (var producer = pf.createProducer()) {
+    producer.send(new ProducerRecord<>(topic, "k3", "{\"a\":3}"));
+    producer.flush();
+  }
+
+  // 3) start job (read_committed): it should quick-poll a few times and exit with no output
+  postStartJob();
+
+  Path outDir = outputPath();
+  // With small quick-poll limits (see application-test.yaml), the job should end fast without output
+  Thread.sleep(1500);
+  boolean anyOutput = Files.exists(outDir) && Files.list(outDir).anyMatch(p -> p.toString().endsWith(".TST"));
+  assertFalse(anyOutput, "Expected no output while LSO pinned by open txn");
+
+  // 4) Abort the open txn to release LSO
+  txnProducer.abortTransaction();
+  txnProducer.close();
+
+  // 5) Start job again → now it can see post-txn data
+  postStartJob();
+
+  Awaitility.await().atMost(TIMEOUT).until(() ->
+      Files.exists(outDir) && Files.list(outDir).anyMatch(p -> p.toString().endsWith(".TST")));
+
+  Path file = Files.list(outDir).filter(p -> p.toString().endsWith(".TST")).findFirst().orElseThrow();
+  String raw = Files.readString(file);
+  assertTrue(raw.contains("3"), "Expected committed message after txn abort to be processed");
+}
+
+C) (Optional) CRLF assertion (since you care about \r\n)
+@Test
+void output_uses_CRLF() throws Exception {
+  // produce one record that creates multi-line output
+  var pf = utils.getProducerFactory(StringSerializer.class, StringSerializer.class);
+  try (var p = pf.createProducer()) {
+    p.send(new ProducerRecord<>(topic, "k", "{\"text\":\"line1 line2 line3\"}"));
+    p.flush();
+  }
+  postStartJob();
+
+  Path file = Awaitility.await().atMost(TIMEOUT).until(() ->
+      Files.list(outputPath()).filter(f -> f.toString().endsWith(".TST")).findFirst().orElse(null),
+      Objects::nonNull);
+
+  // Read raw bytes to avoid platform newline normalization
+  byte[] bytes = Files.readAllBytes(file);
+  String raw = new String(bytes, StandardCharsets.UTF_8);
+  assertTrue(raw.contains("\r\n"), "Expected CRLF line endings in output");
+}
+
+Notes & gotchas
+
+Transactions on a single-broker embedded cluster: set transaction.state.log.* broker props (done in @EmbeddedKafka) so the transaction coordinator works with RF=1.
+
+Point your app to the embedded broker with spring.kafka.bootstrap-servers=${spring.embedded.kafka.brokers} (done in test YAML).
+
+Make quick-poll thresholds small in tests so the “stalled” run ends quickly (done in test YAML).
+
+If your controller returns 202 Accepted, assert that; otherwise use 200.
+
+If your job writes a new file per run, clear the output dir in @BeforeEach to avoid picking up leftovers.
