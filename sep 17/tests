@@ -1,0 +1,327 @@
+Nice—your reader is clear now. Below is a focused unit-test suite that hits every branch in open(), read(), commitSync(), update(), and close().
+
+Add Mockito’s inline mock maker so we can intercept new KafkaConsumer<>(…):
+
+// build.gradle (test deps)
+testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+testImplementation 'org.mockito:mockito-junit-jupiter:5.12.0'
+testImplementation 'org.mockito:mockito-inline:5.2.0'
+testImplementation 'org.springframework.batch:spring-batch-core'
+testImplementation 'org.apache.kafka:kafka-clients:3.7.0'
+
+BatchKafkaReaderTest.java
+package com.td.payments.pants.mailservice.job.reader;
+
+import org.apache.kafka.clients.consumer.*;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.junit.jupiter.api.*;
+import org.mockito.ArgumentCaptor;
+import org.mockito.MockedConstruction;
+
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.apache.kafka.clients.consumer.ConsumerConfig.AUTO_OFFSET_RESET_CONFIG;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
+
+/**
+ * Covers:
+ * - open(): explicit startOffset path (assign+seek) & subscribe path; exception wrapping
+ * - read(): buffer-first branch; quick-empty exit; slow-empty exit; records path (+ lastOffsets)
+ * - commitSync(): early-return, success, CommitFailedException, generic exception
+ * - close(): normal, and commitSync throws but consumer still closes
+ * - update(): no-op
+ */
+class BatchKafkaReaderTest {
+
+  // ---- minimal KafkaProps stub interface (adapt to your real class names) ----
+  interface KafkaProps {
+    String getTopic();
+    int getPollTimeoutSec();
+    int getMaxEmptyPolls();
+    int getMaxQuickPolls();
+  }
+
+  private Properties props;
+  private KafkaProps kafkaProps;
+
+  @BeforeEach
+  void init() {
+    props = new Properties();
+    // harmless defaults
+    props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "dummy:9092");
+    props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+    props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+    props.put(ConsumerConfig.GROUP_ID_CONFIG, "test");
+
+    kafkaProps = mock(KafkaProps.class);
+    when(kafkaProps.getTopic()).thenReturn("topicA");
+    when(kafkaProps.getPollTimeoutSec()).thenReturn(1);  // small for tests
+    when(kafkaProps.getMaxEmptyPolls()).thenReturn(3);
+    when(kafkaProps.getMaxQuickPolls()).thenReturn(2);
+  }
+
+  private BatchKafkaReader newReader(long startOffset, int partition) {
+    return new BatchKafkaReader(props, kafkaProps, startOffset, partition);
+  }
+
+  // --------------------- open() ---------------------
+
+  @Test
+  void open_withExplicitStartOffset_assignsAndSeeks_andSetsResetNone() {
+    try (MockedConstruction<KafkaConsumer> mocked =
+             mockConstruction(KafkaConsumer.class, (mock, ctx) -> {})) {
+
+      BatchKafkaReader reader = newReader(42L, 0);
+      reader.open(new org.springframework.batch.item.ExecutionContext());
+
+      KafkaConsumer<String,String> cons = (KafkaConsumer<String,String>) mocked.constructed().get(0);
+      // AUTO_OFFSET_RESET should be "none" when explicit seek is used
+      assertEquals("none", props.getProperty(AUTO_OFFSET_RESET_CONFIG));
+
+      // verify assign/seek to (topicA,0) offset 42
+      ArgumentCaptor<Collection<TopicPartition>> cap = ArgumentCaptor.forClass(Collection.class);
+      verify(cons).assign(cap.capture());
+      List<TopicPartition> assigned = new ArrayList<>(cap.getValue());
+      assertEquals(1, assigned.size());
+      assertEquals(new TopicPartition("topicA", 0), assigned.get(0));
+      verify(cons).seek(new TopicPartition("topicA", 0), 42L);
+    }
+  }
+
+  @Test
+  void open_withoutStartOffset_subscribesToTopic() {
+    when(kafkaProps.getMaxQuickPolls()).thenReturn(1);
+    try (MockedConstruction<KafkaConsumer> mocked =
+             mockConstruction(KafkaConsumer.class, (mock, ctx) -> {})) {
+
+      BatchKafkaReader reader = newReader(-1L, 0);
+      reader.open(new org.springframework.batch.item.ExecutionContext());
+
+      KafkaConsumer<String,String> cons = (KafkaConsumer<String,String>) mocked.constructed().get(0);
+      verify(cons).subscribe(eq(List.of("topicA")));
+      // AUTO_OFFSET_RESET not forced to "none" in this branch
+      assertNull(props.getProperty(AUTO_OFFSET_RESET_CONFIG));
+    }
+  }
+
+  @Test
+  void open_wrapsExceptionsIntoItemStreamException() {
+    try (MockedConstruction<KafkaConsumer> mocked =
+             mockConstruction(KafkaConsumer.class, (mock, ctx) -> {
+               // trigger failure during subscribe
+               doThrow(new RuntimeException("boom")).when(mock).subscribe(anyList());
+             })) {
+      BatchKafkaReader reader = newReader(-1L, 0);
+      assertThrows(org.springframework.batch.item.ItemStreamException.class,
+          () -> reader.open(new org.springframework.batch.item.ExecutionContext()));
+    }
+  }
+
+  // --------------------- read() ---------------------
+
+  @Test
+  void read_returnsRecord_andUpdatesLastOffsets_whenPollHasRecords() {
+    TopicPartition tp = new TopicPartition("topicA", 0);
+    ConsumerRecord<String,String> r = new ConsumerRecord<>("topicA", 0, 100L, "k", "v");
+    ConsumerRecords<String,String> batch =
+        new ConsumerRecords<>(Map.of(tp, List.of(r)));
+
+    try (MockedConstruction<KafkaConsumer> mocked =
+             mockConstruction(KafkaConsumer.class, (mock, ctx) -> {
+               when(mock.poll(any(Duration.class))).thenReturn(batch);
+             })) {
+
+      BatchKafkaReader reader = newReader(-1L, 0);
+      reader.open(new org.springframework.batch.item.ExecutionContext());
+
+      ConsumerRecord<String,String> out = reader.read();
+      assertEquals(r, out);
+
+      // Now call commitSync and verify offset+1 is sent
+      KafkaConsumer<String,String> cons = (KafkaConsumer<String,String>) mocked.constructed().get(0);
+      reader.commitSync();
+      ArgumentCaptor<Map<TopicPartition, OffsetAndMetadata>> mcap = ArgumentCaptor.forClass(Map.class);
+      verify(cons).commitSync(mcap.capture());
+      OffsetAndMetadata om = mcap.getValue().get(tp);
+      assertNotNull(om);
+      assertEquals(101L, om.offset());
+    }
+  }
+
+  @Test
+  void read_exitsAfterQuickEmptyPolls() {
+    // quick empty returns (<3s)
+    ConsumerRecords<String,String> empty = ConsumerRecords.empty();
+    when(kafkaProps.getMaxQuickPolls()).thenReturn(1); // so 2 swift empties -> exit
+    when(kafkaProps.getMaxEmptyPolls()).thenReturn(100); // don't hit normal idle exit
+
+    try (MockedConstruction<KafkaConsumer> mocked =
+             mockConstruction(KafkaConsumer.class, (mock, ctx) -> {
+               when(mock.poll(any(Duration.class))).thenReturn(empty);
+             })) {
+
+      BatchKafkaReader reader = newReader(-1L, 0);
+      reader.open(new org.springframework.batch.item.ExecutionContext());
+
+      assertNull(reader.read()); // should bail via quick-empty threshold
+    }
+  }
+
+  @Test
+  void read_exitsAfterSlowEmptyPolls() {
+    // slow empty (>=3s) → counts toward emptyPolls, not quickPoll
+    ConsumerRecords<String,String> empty = ConsumerRecords.empty();
+
+    when(kafkaProps.getMaxQuickPolls()).thenReturn(100);
+    when(kafkaProps.getMaxEmptyPolls()).thenReturn(1); // first slow empty → exit
+
+    try (MockedConstruction<KafkaConsumer> mocked =
+             mockConstruction(KafkaConsumer.class, (mock, ctx) -> {
+               when(mock.poll(any(Duration.class))).thenAnswer(inv -> {
+                 Thread.sleep(3100);  // exceed quick threshold
+                 return empty;
+               });
+             })) {
+
+      BatchKafkaReader reader = newReader(-1L, 0);
+      reader.open(new org.springframework.batch.item.ExecutionContext());
+
+      assertNull(reader.read());
+    }
+  }
+
+  // --------------------- commitSync() ---------------------
+
+  @Test
+  void commitSync_earlyReturn_whenNoConsumerOrNoOffsets() {
+    // no consumer created -> early return path
+    BatchKafkaReader reader = newReader(-1L, 0);
+    assertDoesNotThrow(reader::commitSync);
+
+    // with consumer but lastOffsets empty -> still early return (no commit call)
+    try (MockedConstruction<KafkaConsumer> mocked =
+             mockConstruction(KafkaConsumer.class, (mock, ctx) -> {})) {
+      reader.open(new org.springframework.batch.item.ExecutionContext());
+      KafkaConsumer<String,String> cons = (KafkaConsumer<String,String>) mocked.constructed().get(0);
+      reader.commitSync();
+      verify(cons, never()).commitSync(anyMap());
+    }
+  }
+
+  @Test
+  void commitSync_handlesCommitFailedException() {
+    TopicPartition tp = new TopicPartition("topicA", 0);
+    ConsumerRecord<String,String> r = new ConsumerRecord<>("topicA", 0, 5L, "k", "v");
+    ConsumerRecords<String,String> batch =
+        new ConsumerRecords<>(Map.of(tp, List.of(r)));
+
+    try (MockedConstruction<KafkaConsumer> mocked =
+             mockConstruction(KafkaConsumer.class, (mock, ctx) -> {
+               when(mock.poll(any(Duration.class))).thenReturn(batch);
+               doThrow(new org.apache.kafka.clients.consumer.CommitFailedException())
+                   .when(mock).commitSync(anyMap());
+             })) {
+
+      BatchKafkaReader reader = newReader(-1L, 0);
+      reader.open(new org.springframework.batch.item.ExecutionContext());
+      assertNotNull(reader.read());
+      assertDoesNotThrow(reader::commitSync); // swallowed and logged
+    }
+  }
+
+  @Test
+  void commitSync_handlesGenericException() {
+    TopicPartition tp = new TopicPartition("topicA", 0);
+    ConsumerRecord<String,String> r = new ConsumerRecord<>("topicA", 0, 7L, "k", "v");
+    ConsumerRecords<String,String> batch =
+        new ConsumerRecords<>(Map.of(tp, List.of(r)));
+
+    try (MockedConstruction<KafkaConsumer> mocked =
+             mockConstruction(KafkaConsumer.class, (mock, ctx) -> {
+               when(mock.poll(any(Duration.class))).thenReturn(batch);
+               doThrow(new RuntimeException("boom")).when(mock).commitSync(anyMap());
+             })) {
+
+      BatchKafkaReader reader = newReader(-1L, 0);
+      reader.open(new org.springframework.batch.item.ExecutionContext());
+      assertNotNull(reader.read());
+      assertDoesNotThrow(reader::commitSync); // swallowed and logged
+    }
+  }
+
+  // --------------------- close() ---------------------
+
+  @Test
+  void close_commitsThenClosesConsumer() {
+    TopicPartition tp = new TopicPartition("topicA", 0);
+    ConsumerRecord<String,String> r = new ConsumerRecord<>("topicA", 0, 9L, "k", "v");
+    ConsumerRecords<String,String> batch =
+        new ConsumerRecords<>(Map.of(tp, List.of(r)));
+
+    try (MockedConstruction<KafkaConsumer> mocked =
+             mockConstruction(KafkaConsumer.class, (mock, ctx) -> {
+               when(mock.poll(any(Duration.class))).thenReturn(batch);
+             })) {
+
+      BatchKafkaReader reader = newReader(-1L, 0);
+      reader.open(new org.springframework.batch.item.ExecutionContext());
+      assertNotNull(reader.read());
+
+      KafkaConsumer<String,String> cons = (KafkaConsumer<String,String>) mocked.constructed().get(0);
+
+      reader.close();
+
+      // commit was attempted and consumer closed
+      verify(cons).commitSync(anyMap());
+      verify(cons).close();
+    }
+  }
+
+  @Test
+  void close_stillClosesConsumer_ifCommitSyncMethodThrows() {
+    try (MockedConstruction<KafkaConsumer> mocked =
+             mockConstruction(KafkaConsumer.class, (mock, ctx) -> {})) {
+
+      BatchKafkaReader real = newReader(-1L, 0);
+      real.open(new org.springframework.batch.item.ExecutionContext());
+      KafkaConsumer<String,String> cons = (KafkaConsumer<String,String>) mocked.constructed().get(0);
+
+      // Spy to make reader.commitSync() itself throw, to cover the outer try/catch in close()
+      BatchKafkaReader spyReader = spy(real);
+      doThrow(new RuntimeException("boom")).when(spyReader).commitSync();
+
+      spyReader.close();
+
+      verify(cons).close(); // still closes
+    }
+  }
+
+  // --------------------- update() (no-op) ---------------------
+
+  @Test
+  void update_isNoOp() {
+    BatchKafkaReader reader = newReader(-1L, 0);
+    assertDoesNotThrow(() ->
+        reader.update(new org.springframework.batch.item.ExecutionContext()));
+  }
+}
+
+Notes / rationale
+
+MockedConstruction lets us intercept new KafkaConsumer<>(props) in open() and verify assign/seek/subscribe without changing your code.
+
+The quick vs slow empty-poll branches are triggered by controlling elapsed time around poll():
+
+quick: return immediately
+
+slow: Thread.sleep(3100) inside the stub → elapsed >= 3s
+
+commitSync() tests cover: early-return, success path (via read() populating lastOffsets), CommitFailedException, and generic exception.
+
+close() tests validate both the normal path and the “commit throws but still close the consumer” path (via spying the reader).
+
+Drop this in src/test/java/.../BatchKafkaReaderTest.java, adjust the package if needed, and you’ll get comprehensive line/branch coverage for the reader.
