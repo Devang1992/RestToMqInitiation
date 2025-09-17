@@ -1,0 +1,21 @@
+private static final String CRLF = "\r\n";
+
+private static String toCRLF(String s) {
+  if (s == null) return "";
+  return s.replace("\r\n", "\n")
+          .replace("\r", "\n")
+          .replace("\n", CRLF);
+}
+
+// ...
+String header = templateMapper.getBannerPage(); // loads BANNER.txt (8 lines)
+String normalized = toCRLF(header);
+
+try (BufferedWriter bw = Files.newBufferedWriter(
+        out, StandardCharsets.UTF_8,
+        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+  bw.write(normalized);
+  if (!normalized.endsWith(CRLF)) {
+    bw.write(CRLF); // ensure last line ends with CRLF too
+  }
+}
