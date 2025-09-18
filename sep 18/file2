@@ -1,0 +1,178 @@
+SFTP: no local files, same step wiring
+
+Since your files are ~120 MB, in-memory is fine if your heap has headroom (≥512 MB). Below is a drop-in writer that buffers in memory and uploads once at the end. (If you later want true streaming, I can give you that variant too.)
+
+1) Add JSch dependency
+<dependency>
+  <groupId>com.jcraft</groupId>
+  <artifactId>jsch</artifactId>
+  <version>0.1.55</version>
+</dependency>
+
+2) SFTP properties
+sftp:
+  host: sftp.example.com
+  port: 22
+  user: svc-user
+  # choose ONE auth method:
+  password: ${SFTP_PASSWORD:}           # or omit if using a key
+  privateKey: file:/etc/keys/id_rsa     # optional
+  passphrase: ${SFTP_PASSPHRASE:}       # optional
+  knownHosts: file:/etc/ssh/ssh_known_hosts
+  remoteDir: /drop/mail
+
+// Bind props
+@ConfigurationProperties(prefix = "sftp")
+public record SftpProps(
+  String host, int port, String user, String password,
+  String privateKey, String passphrase, String knownHosts,
+  String remoteDir) {}
+
+
+Register it:
+
+@EnableConfigurationProperties(SftpProps.class)
+@Configuration
+class SftpCfg {}
+
+3) Let the HeaderWriter stop writing to disk and stash header + file name
+
+In your HeaderWriter.beforeJob(...), keep your current logic that builds fileName and the 8-line banner, but don’t open a local file. Instead, put both into the execution context:
+
+execution.getExecutionContext().putString("FILE_NAME", fileName);
+execution.getExecutionContext().putString("HEADER_CONTENT", header); // your banner text
+
+
+(Everything else in HeaderWriter can stay.)
+
+4) The in-memory SFTP writer (CRLF enforced)
+@Slf4j
+public class InMemorySftpWriter implements ItemStreamWriter<String> {
+
+  private static final String CRLF = "\r\n";
+
+  private final SftpProps props;
+  private final String remoteFileName;  // from ExecutionContext
+  private final String header;          // from ExecutionContext
+
+  private ByteArrayOutputStream baos;
+  private BufferedWriter bw;
+
+  public InMemorySftpWriter(SftpProps props, String remoteFileName, String header) {
+    this.props = props;
+    this.remoteFileName = remoteFileName;
+    this.header = header == null ? "" : header;
+  }
+
+  private static String toCRLF(String s) {
+    if (s == null) return "";
+    return s.replace("\r\n", "\n").replace("\r", "\n").replace("\n", CRLF);
+  }
+
+  @Override public void open(ExecutionContext ctx) throws ItemStreamException {
+    try {
+      // pre-size ~128 MB to avoid many resizes; tweak if needed
+      baos = new ByteArrayOutputStream(128 * 1024 * 1024);
+      bw = new BufferedWriter(new OutputStreamWriter(baos, StandardCharsets.UTF_8));
+
+      String h = toCRLF(header);
+      bw.write(h);
+      if (!h.endsWith(CRLF)) bw.write(CRLF); // ensure trailing CRLF
+    } catch (Exception e) {
+      throw new ItemStreamException("Failed to open in-memory writer", e);
+    }
+  }
+
+  @Override public void write(Chunk<? extends String> chunk) throws Exception {
+    for (String line : chunk) {
+      String s = toCRLF(line);
+      bw.write(s);
+      if (!s.endsWith(CRLF)) bw.write(CRLF);
+    }
+    // no flush() here; we keep everything in memory until close()
+  }
+
+  @Override public void update(ExecutionContext ctx) { /* no-op */ }
+
+  @Override public void close() throws ItemStreamException {
+    try {
+      if (bw != null) bw.flush();
+      byte[] payload = baos.toByteArray();
+      upload(payload);
+    } catch (Exception e) {
+      throw new ItemStreamException("Failed to upload file over SFTP", e);
+    } finally {
+      try { if (bw != null) bw.close(); } catch (IOException ignored) {}
+    }
+  }
+
+  // ---- SFTP upload with atomic rename ----
+  private void upload(byte[] payload) throws Exception {
+    JSch jsch = new JSch();
+    if (props.knownHosts() != null) jsch.setKnownHosts(URI.create(props.knownHosts()).getPath());
+    if (props.privateKey() != null) {
+      if (props.passphrase() != null) jsch.addIdentity(URI.create(props.privateKey()).getPath(), props.passphrase());
+      else jsch.addIdentity(URI.create(props.privateKey()).getPath());
+    }
+
+    Session session = jsch.getSession(props.user(), props.host(), props.port());
+    var config = new java.util.Properties();
+    config.put("StrictHostKeyChecking", "yes");
+    session.setConfig(config);
+    if (props.password() != null) session.setPassword(props.password());
+
+    session.connect(10_000);
+    ChannelSftp sftp = (ChannelSftp) session.openChannel("sftp");
+    sftp.connect(10_000);
+    try {
+      // ensure dir
+      try { sftp.stat(props.remoteDir()); } catch (SftpException e) { sftp.mkdir(props.remoteDir()); }
+      sftp.cd(props.remoteDir());
+
+      String tmp = remoteFileName + ".uploading";
+      try (InputStream in = new ByteArrayInputStream(payload)) {
+        sftp.put(in, tmp, ChannelSftp.OVERWRITE);
+      }
+      sftp.rename(tmp, remoteFileName); // atomic finalize
+      log.info("Uploaded {} bytes to {}/{}", payload.length, props.remoteDir(), remoteFileName);
+    } finally {
+      sftp.disconnect();
+      session.disconnect();
+    }
+  }
+}
+
+5) Wire it into your existing config (replace the FileAppendWriter bean)
+
+In your Configurations class, replace the current bodyFileWriter(...) with this step-scoped bean:
+
+@StepScope
+@Bean
+public ItemStreamWriter<String> bodySftpWriter(
+    SftpProps sftpProps,
+    @Value("#{jobExecutionContext['FILE_NAME']}") String fileName,
+    @Value("#{jobExecutionContext['HEADER_CONTENT']}") String header) {
+
+  log.info("SFTP destination file: {}", fileName);
+  return new InMemorySftpWriter(sftpProps, fileName, header);
+}
+
+
+…and make sure your readWriteStep(...) still takes an ItemStreamWriter<String> writer (it already does in your screenshots), so nothing else changes:
+
+return new StepBuilder("readWriteStep", repo)
+    .<ConsumerRecord<String,String>, String>chunk(properties.getChunkSize(), tx)
+    .reader(reader)
+    .processor(processor)
+    .writer(writer)                // <-- now SFTP writer
+    .faultTolerant()
+    .build();
+
+
+That’s it. The HeaderWriter still runs as a job listener (builds file name + banner), the writer no longer touches disk, and your file lands on the SFTP server with CRLF line endings and an atomic finalize.
+
+Is 120 MB safe in memory?
+
+Yes, with a reasonable heap (e.g., -Xmx512m+). If your heap is tighter or files might grow, switch to the streaming writer later; it keeps memory usage tiny and uploads as you write. The rest of the wiring stays identical.
+
+If you want me to flip this to the streaming version now, say the word and I’ll drop in that class with the same bean signature so you can swap with one line.
