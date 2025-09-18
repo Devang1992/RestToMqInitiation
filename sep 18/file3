@@ -1,0 +1,170 @@
+Minimal checklist
+
+One dependency (pick JSch for the smallest change):
+
+<dependency>
+  <groupId>com.jcraft</groupId>
+  <artifactId>jsch</artifactId>
+  <version>0.1.55</version>
+</dependency>
+
+
+Four properties (password or key—use one):
+
+sftp:
+  host: sftp.example.com
+  port: 22
+  user: svc-user
+  password: ${SFTP_PASSWORD}        # or omit and use key
+  remoteDir: /drop/mail
+
+
+(For quick dev you can run without knownHosts; for prod add it and turn on strict checking.)
+
+One new writer bean to replace your FileAppendWriter bean.
+You don’t have to touch the rest of your step—just swap the writer.
+
+Drop-in in-memory SFTP writer (smallest code change)
+
+Buffers in memory as the step runs
+
+Adds your 8-line header itself (so you can remove the HeaderWriter listener)
+
+Uploads once on close(), using a temp name → atomic rename
+
+Forces CRLF line endings
+
+// put this in your writer package
+@Slf4j
+public class InMemorySftpWriter implements ItemStreamWriter<String> {
+  private static final String CRLF = "\r\n";
+
+  private final String remoteFileName;      // e.g. "WIRES_yyyyMMdd.TST"
+  private final String remoteDir;
+  private final String host; private final int port;
+  private final String user; private final String password;
+
+  private final String header;              // 8-line banner from TemplateMapper
+  private ByteArrayOutputStream baos;
+  private BufferedWriter bw;
+
+  public InMemorySftpWriter(
+      String remoteFileName, String remoteDir,
+      String host, int port, String user, String password,
+      String header) {
+    this.remoteFileName = remoteFileName;
+    this.remoteDir = remoteDir;
+    this.host = host; this.port = port; this.user = user; this.password = password;
+    this.header = header == null ? "" : header;
+  }
+
+  private static String toCRLF(String s) {
+    if (s == null) return "";
+    return s.replace("\r\n","\n").replace("\r","\n").replace("\n", CRLF);
+  }
+
+  @Override public void open(ExecutionContext ctx) throws ItemStreamException {
+    try {
+      baos = new ByteArrayOutputStream(128 * 1024 * 1024); // ~120MB pre-size
+      bw = new BufferedWriter(new OutputStreamWriter(baos, StandardCharsets.UTF_8));
+      String h = toCRLF(header);
+      bw.write(h);
+      if (!h.endsWith(CRLF)) bw.write(CRLF);
+    } catch (Exception e) {
+      throw new ItemStreamException("Failed to open in-memory writer", e);
+    }
+  }
+
+  @Override public void write(Chunk<? extends String> chunk) throws Exception {
+    for (String line : chunk) {
+      String s = toCRLF(line);
+      bw.write(s);
+      if (!s.endsWith(CRLF)) bw.write(CRLF);
+    }
+  }
+
+  @Override public void update(ExecutionContext ctx) { }
+
+  @Override public void close() throws ItemStreamException {
+    try {
+      if (bw != null) bw.flush();
+      upload(baos.toByteArray());
+    } catch (Exception e) {
+      throw new ItemStreamException("SFTP upload failed", e);
+    } finally {
+      try { if (bw != null) bw.close(); } catch (IOException ignored) {}
+    }
+  }
+
+  private void upload(byte[] payload) throws Exception {
+    JSch jsch = new JSch();
+    Session session = jsch.getSession(user, host, port);
+    // Dev-only: don't enforce host key checking. For prod, set "yes" and configure known_hosts.
+    var cfg = new java.util.Properties(); cfg.put("StrictHostKeyChecking","no");
+    session.setConfig(cfg);
+    if (password != null) session.setPassword(password);
+    session.connect(10_000);
+
+    ChannelSftp sftp = (ChannelSftp) session.openChannel("sftp");
+    sftp.connect(10_000);
+    try {
+      try { sftp.stat(remoteDir); } catch (SftpException e) { sftp.mkdir(remoteDir); }
+      sftp.cd(remoteDir);
+      String tmp = remoteFileName + ".uploading";
+      try (InputStream in = new ByteArrayInputStream(payload)) {
+        sftp.put(in, tmp, ChannelSftp.OVERWRITE);
+      }
+      sftp.rename(tmp, remoteFileName);
+      log.info("Uploaded {} bytes to {}/{}", payload.length, remoteDir, remoteFileName);
+    } finally {
+      sftp.disconnect(); session.disconnect();
+    }
+  }
+}
+
+Wire it into your existing config (tiny diffs)
+
+Remove the header listener from your job builder (since the writer now writes the header):
+
+// .listener(headerWriterListener)  <-- comment this out
+
+
+Replace your FileAppendWriter bean with this step-scoped SFTP writer:
+
+@StepScope
+@Bean
+public ItemStreamWriter<String> bodyWriter(
+    TemplateMapper templateMapper, PantsBatchProperties props,
+    @Value("${sftp.host}") String host,
+    @Value("${sftp.port}") int port,
+    @Value("${sftp.user}") String user,
+    @Value("${sftp.password}") String password,
+    @Value("${sftp.remoteDir}") String remoteDir) {
+
+  // build the same filename you were using before
+  String date = java.time.LocalDate.now().format(
+      java.time.format.DateTimeFormatter.ofPattern(props.getOutput().getDatePattern()));
+  String remoteFile = String.format(props.getOutput().getFileNameFormatAuto(), date);
+  String header = templateMapper.getBannerPage();
+
+  return new InMemorySftpWriter(remoteFile, remoteDir, host, port, user, password, header);
+}
+
+
+Your step already takes an ItemStreamWriter<String> writer, so no other changes:
+
+return new StepBuilder("readWriteStep", repo)
+    .<ConsumerRecord<String,String>, String>chunk(properties.getChunkSize(), tx)
+    .reader(reader)
+    .processor(processor)
+    .writer(writer)          // now SFTP
+    .faultTolerant()
+    .build();
+
+About 120 MB
+
+In-memory approach is fine if your JVM has enough heap (-Xmx512m+ recommended).
+
+If memory is tight or file sizes grow, we can switch you to a streaming writer (no buffering) with one class swap later.
+
+If you want, I can also show the streaming version next—but to answer your question: the items above are the only things strictly required to get you off local disk and onto SFTP.
