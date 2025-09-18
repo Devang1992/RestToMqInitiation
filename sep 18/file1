@@ -1,0 +1,367 @@
+Yes—you can avoid writing to local disk entirely.
+
+You’ve got two solid patterns:
+
+1) Small/medium files → buffer in memory, then one-shot SFTP
+
+Keep everything in a ByteArrayOutputStream (CRLF-normalized as you go). When the step finishes, upload that byte array via ChannelSftp.put(InputStream, ...).
+
+// CRLF helper
+private static final String CRLF = "\r\n";
+private static String toCRLF(String s) {
+  if (s == null) return "";
+  return s.replace("\r\n", "\n").replace("\r", "\n").replace("\n", CRLF);
+}
+
+// --- an ItemStreamWriter that buffers in memory then SFTPs ---
+public final class InMemorySftpWriter implements ItemStreamWriter<String>, JobExecutionListener {
+  private final SftpConfig cfg; // host, port, user, key/knownHosts, remoteDir, fileName pattern
+  private ByteArrayOutputStream baos;
+  private BufferedWriter bw;
+
+  public InMemorySftpWriter(SftpConfig cfg) {
+    this.cfg = cfg;
+  }
+
+  @Override public void beforeJob(JobExecution job) {
+    baos = new ByteArrayOutputStream(64 * 1024);
+    bw = new BufferedWriter(new OutputStreamWriter(baos, StandardCharsets.UTF_8));
+    // header (from your mapper)
+    String header = toCRLF(templateMapper.getBannerPage());
+    writeSilently(header);
+    if (!header.endsWith(CRLF)) writeSilently(CRLF);
+  }
+
+  @Override public void open(ExecutionContext ctx) { /* no-op */ }
+
+  @Override public void write(List<? extends String> items) throws Exception {
+    for (String line : items) {
+      String s = toCRLF(line);
+      bw.write(s);
+      if (!s.endsWith(CRLF)) bw.write(CRLF);
+    }
+  }
+
+  @Override public void update(ExecutionContext ctx) { /* no-op */ }
+
+  @Override public void close() {
+    try { if (bw != null) bw.flush(); } catch (IOException ignored) {}
+    byte[] payload = baos.toByteArray();
+    upload(payload); // SFTP (temp name → atomic rename)
+  }
+
+  private void upload(byte[] payload) {
+    String fileName = cfg.renderFileName();                           // e.g. WIRES_yyyyMMdd.TST
+    String tmpName  = fileName + ".uploading";
+    JSch jsch = new JSch();
+    jsch.setKnownHosts(cfg.knownHostsPath());
+    if (cfg.privateKeyPath() != null) jsch.addIdentity(cfg.privateKeyPath(), cfg.passphrase());
+    Session session = null; ChannelSftp sftp = null;
+    try {
+      session = jsch.getSession(cfg.user(), cfg.host(), cfg.port());
+      session.setConfig("StrictHostKeyChecking", "yes");
+      if (cfg.password() != null) session.setPassword(cfg.password());
+      session.connect(10_000);
+
+      sftp = (ChannelSftp) session.openChannel("sftp");
+      sftp.connect(10_000);
+
+      // ensure dir exists
+      try { sftp.stat(cfg.remoteDir()); } catch (SftpException e) { sftp.mkdir(cfg.remoteDir()); }
+      sftp.cd(cfg.remoteDir());
+
+      // upload to temp, then rename atomically
+      try (InputStream in = new ByteArrayInputStream(payload)) {
+        sftp.put(in, tmpName, ChannelSftp.OVERWRITE);
+      }
+      sftp.rename(tmpName, fileName);
+    } catch (Exception e) {
+      throw new RuntimeException("SFTP upload failed", e);
+    } finally {
+      if (sftp != null) sftp.disconnect();
+      if (session != null) session.disconnect();
+    }
+  }
+
+  private void writeSilently(String s) {
+    try { bw.write(s); } catch (IOException e) { throw new UncheckedIOException(e); }
+  }
+}
+
+
+Pros: simplest.
+Watch-outs: you keep the whole file in memory—fine if it’s, say, tens of MB; reconsider if it could be hundreds.
+
+2) Large files / truly streaming → pipe directly to SFTP (no big buffers)
+
+Use a PipedOutputStream/PipedInputStream. Your writer writes to the pipe; a background thread feeds the pipe into ChannelSftp.put(...). Nothing hits disk and memory stays bounded by the pipe buffer.
+
+public final class StreamingSftpWriter implements ItemStreamWriter<String>, JobExecutionListener {
+  private final SftpConfig cfg;
+  private PipedOutputStream pout;
+  private BufferedWriter bw;
+  private Thread uploader;
+  private final AtomicReference<Throwable> uploadError = new AtomicReference<>();
+
+  public StreamingSftpWriter(SftpConfig cfg) { this.cfg = cfg; }
+
+  @Override public void beforeJob(JobExecution job) {
+    try {
+      PipedInputStream pin = new PipedInputStream(64 * 1024);
+      pout = new PipedOutputStream(pin);
+      bw = new BufferedWriter(new OutputStreamWriter(pout, StandardCharsets.UTF_8));
+
+      // start uploader thread that reads from pin and uploads
+      uploader = new Thread(() -> {
+        JSch jsch = new JSch();
+        jsch.setKnownHosts(cfg.knownHostsPath());
+        if (cfg.privateKeyPath() != null) jsch.addIdentity(cfg.privateKeyPath(), cfg.passphrase());
+        try (InputStream in = pin) {
+          Session sess = jsch.getSession(cfg.user(), cfg.host(), cfg.port());
+          sess.setConfig("StrictHostKeyChecking", "yes");
+          if (cfg.password() != null) sess.setPassword(cfg.password());
+          sess.connect(10_000);
+          ChannelSftp sftp = (ChannelSftp) sess.openChannel("sftp");
+          sftp.connect(10_000);
+          try {
+            try { sftp.stat(cfg.remoteDir()); } catch (SftpException e) { sftp.mkdir(cfg.remoteDir()); }
+            sftp.cd(cfg.remoteDir());
+            String file = cfg.renderFileName();
+            String tmp  = file + ".uploading";
+            sftp.put(in, tmp, ChannelSftp.OVERWRITE); // blocks until writer closes
+            sftp.rename(tmp, file);
+          } finally {
+            sftp.disconnect();
+            sess.disconnect();
+          }
+        } catch (Throwable t) {
+          uploadError.set(t);
+        }
+      }, "sftp-uploader");
+      uploader.start();
+
+      // header
+      String header = toCRLF(templateMapper.getBannerPage());
+      bw.write(header);
+      if (!header.endsWith(CRLF)) bw.write(CRLF);
+
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
+  @Override public void write(List<? extends String> items) throws Exception {
+    for (String line : items) {
+      String s = toCRLF(line);
+      bw.write(s);
+      if (!s.endsWith(CRLF)) bw.write(CRLF);
+    }
+  }
+
+  @Override public void close() {
+    try { bw.flush(); } catch (IOException ignored) {}
+    try { pout.close(); } catch (IOException ignored) {}
+    try { uploader.join(60_000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+    if (uploadError.get() != null) throw new RuntimeException("SFTP upload failed", uploadError.get());
+  }
+
+  @Override public void open(ExecutionContext ctx) { }
+  @Override public void update(ExecutionContext ctx) { }
+}
+
+
+Pros: no local file, no large in-memory copy, upload happens as you write.
+Watch-outs: if the SFTP server is slow, your writer will naturally back-pressure (which is usually desirable).
+
+Security notes
+
+Never disable host key checking in prod; use known_hosts and StrictHostKeyChecking=yes.
+
+Prefer key-based auth (encrypted private key + passphrase). Pull secrets from your vault.
+
+Upload to a temp name and rename on the server when done (prevents other systems reading a partial file).
+
+If you need a checksum, compute while writing (e.g., wrap pout with DigestOutputStream) and upload a sidecar .md5 after rename.
+
+How to wire into your job
+
+Replace your FileAppendWriter bean with one of the writers above. Everything else (header in beforeJob, records in write, footer if any in close) stays the same—only the sink changes.
+
+If you tell me roughly how big these files can get, I’ll point you to the better option (buffer vs streaming) and tailor the bean wiring to your current Spring config.
+
+You said:
+so I don't have anything setup for sftp, so how it will setup and what configs we need and where this two approaches will go?
+
+also 120 mb should not be a problem right? 
+
+before answering those questions, the image i gave am I using the job running completed statuses correclty? 
+ChatGPT said:
+Thought for 1m 18s
+
+Great questions—let’s do this in two parts.
+
+1) Your controller “job status” endpoint
+
+From the screenshot, you do:
+
+404 if jobExplorer.getJobExecution(id) returns null ✅
+
+COMPLETED → 200 "COMPLETED" ✅
+
+STARTING/STARTED → 200 "RUNNING" (you’re mapping both to “RUNNING”) ✅
+
+I’d tighten it a bit to cover the rest of Spring Batch statuses explicitly:
+
+@GetMapping("/executions/{jobExecutionId}")
+public ResponseEntity<String> getExecution(@PathVariable long jobExecutionId) {
+  JobExecution e = jobExplorer.getJobExecution(jobExecutionId);
+  if (e == null) return ResponseEntity.notFound().build();
+
+  return switch (e.getStatus()) {
+    case COMPLETED -> ResponseEntity.ok("COMPLETED");
+    case STARTING, STARTED, STOPPING -> ResponseEntity.ok("RUNNING");
+    case STOPPED -> ResponseEntity.ok("STOPPED");
+    case ABANDONED -> ResponseEntity.status(HttpStatus.CONFLICT).body("ABANDONED");
+    case FAILED -> ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("FAILED");
+    default -> ResponseEntity.ok(e.getStatus().name());
+  };
+}
+
+
+That way “STOPPING/STOPPED/ABANDONED/UNKNOWN” are deterministic. Otherwise your current logic is fine.
+
+2) SFTP: what to add, where it goes, which approach
+
+You don’t need local files. You can either buffer in memory and upload at the end, or stream straight to SFTP while the job runs.
+
+Dependencies (pick one stack)
+
+Option A – Spring Integration SFTP (recommended)
+
+<dependency>
+  <groupId>org.springframework.integration</groupId>
+  <artifactId>spring-integration-sftp</artifactId>
+</dependency>
+
+
+Option B – Plain JSch (minimal)
+
+<dependency>
+  <groupId>com.jcraft</groupId>
+  <artifactId>jsch</artifactId>
+  <version>0.1.55</version>
+</dependency>
+
+Properties (application.yaml)
+sftp:
+  host: sftp.example.com
+  port: 22
+  user: svc-user
+  # use ONE of the two auth methods:
+  password: ${SFTP_PASSWORD:}         # or omit if using key
+  privateKey: file:/etc/keys/id_rsa    # optional
+  passphrase: ${SFTP_PASSPHRASE:}      # optional
+  knownHosts: file:/etc/ssh/ssh_known_hosts
+  remoteDir: /drop/mail
+  filePattern: "WIRES_%s.TST"          # you already have a formatter
+
+Where the two writer approaches go
+
+You currently have a FileAppendWriter. Replace it with one of these writers as a Spring bean; both implement ItemStreamWriter<String> and also act as a JobExecutionListener to write the banner header in beforeJob.
+
+A) In-memory → upload once at the end (good up to ~120 MB if your heap allows)
+
+Pros: simplest; one network call at the end.
+
+Cons: your process must hold the whole file in RAM (120 MB + overhead). If your container has ~512 MB+ heap, you’re fine. If memory is tight, pick Streaming.
+
+// @Configuration
+@Bean
+InMemorySftpWriter inMemorySftpWriter(SftpProps props, TemplateMapper templateMapper) {
+  return new InMemorySftpWriter(props, templateMapper); // uses ByteArrayOutputStream
+}
+
+@Bean
+Job mailJob(JobRepository repo, JobBuilderFactory jobs, Step step, InMemorySftpWriter writer) {
+  return jobs.get("mailJob").listener(writer).start(step).build();
+}
+
+B) Streaming → no buffering, upload as you write (safest for big files)
+
+Pros: minimal memory; no temp files.
+
+Cons: slightly more complex (one worker thread pushing a PipedInputStream to SFTP).
+
+// @Configuration
+@Bean
+StreamingSftpWriter streamingSftpWriter(SftpProps props, TemplateMapper templateMapper) {
+  return new StreamingSftpWriter(props, templateMapper); // uses Piped streams
+}
+
+@Bean
+Job mailJob(JobRepository repo, JobBuilderFactory jobs, Step step, StreamingSftpWriter writer) {
+  return jobs.get("mailJob").listener(writer).start(step).build();
+}
+
+
+(Both writers keep your CRLF handling and write the 8-line header in beforeJob.)
+
+If you choose Spring Integration SFTP (Option A)
+
+Make a session factory and template once, and inject into either writer:
+
+@ConfigurationProperties(prefix = "sftp")
+public record SftpProps(
+  String host, int port, String user, String password,
+  String privateKey, String passphrase, String knownHosts,
+  String remoteDir, String filePattern) {}
+
+@Configuration
+@EnableConfigurationProperties(SftpProps.class)
+class SftpConfig {
+
+  @Bean
+  DefaultSftpSessionFactory sftpSessionFactory(SftpProps p) {
+    var f = new DefaultSftpSessionFactory(true);
+    f.setHost(p.host()); f.setPort(p.port());
+    f.setUser(p.user());
+    if (p.password() != null) f.setPassword(p.password());
+    if (p.privateKey() != null) f.setPrivateKeyResource(new FileSystemResource(URI.create(p.privateKey())));
+    if (p.passphrase() != null) f.setPrivateKeyPassphrase(p.passphrase());
+    if (p.knownHosts() != null) f.setKnownHostsResource(new FileSystemResource(URI.create(p.knownHosts())));
+    return f;
+  }
+
+  @Bean
+  SftpRemoteFileTemplate sftpTemplate(DefaultSftpSessionFactory f, SftpProps p) {
+    var t = new SftpRemoteFileTemplate(f);
+    t.setAutoCreateDirectory(true);
+    t.setRemoteDirectoryExpression(new LiteralExpression(p.remoteDir()));
+    return t;
+  }
+}
+
+
+Inside the writer you can do:
+
+template.execute(session -> {
+  String tmp = name + ".uploading";
+  try (OutputStream os = session.write(tmp)) { os.write(bytes); }
+  session.rename(tmp, name);
+  return null;
+});
+
+If you choose JSch (Option B)
+
+Use the JSch-based writers I gave earlier; just bind SftpProps the same way and you’re done—no extra Spring Integration dependency.
+
+Is 120 MB OK in memory?
+
+In-memory: 120 MB payload + some overhead (string-to-CRLF normalization and BAOS growth). If your JVM heap has headroom (e.g., -Xmx512m or higher), it’s fine—pre-size the ByteArrayOutputStream to avoid re-allocation:
+
+baos = new ByteArrayOutputStream(128 * 1024 * 1024);
+
+
+Streaming: no concerns; memory stays small regardless of file size. If in doubt, pick streaming.
+
+If you share your current @Configuration where the step is built, I can drop in the exact bean wiring (swapping your FileAppendWriter for InMemorySftpWriter or StreamingSftpWriter) with minimal diff.
