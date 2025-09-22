@@ -1,0 +1,152 @@
+Absolutely — here’s a clean, copy-pasteable setup with two ways to use it, and it doesn’t rely on options.isBlock() (some Handlebars.java versions don’t expose it).
+
+1) Helper code (register once)
+import com.github.jknack.handlebars.Handlebars;
+import com.github.jknack.handlebars.Options;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.Objects;
+
+public final class TemplateHelper {
+
+  public static Handlebars registerAll(Handlebars hb) {
+    registerWordWrap(hb);                 // basic width-only wrap (optional)
+    registerWordWrapWithPosition(hb);     // width + start + hang (your main one)
+    return hb;
+  }
+
+  /** Basic wrap with width only; keeps defaults for positions if your WordWrap has them. */
+  private static void registerWordWrap(Handlebars hb) {
+    hb.registerHelper("wordWrap", (Object ctx, Options opt) -> {
+      String text = extractText(ctx, opt);
+      int width = intArg(opt, "width", 35, 0);  // named "width=" or positional #0
+      // Adjust call if your WordWrap signature differs
+      return WordWrap.wrap(text, width, /*start*/0, /*hang*/0);
+    });
+  }
+
+  /** Wrap with width + start column + hanging indent column. */
+  private static void registerWordWrapWithPosition(Handlebars hb) {
+    hb.registerHelper("wordWrapWithPosition", (Object ctx, Options opt) -> {
+      String text = extractText(ctx, opt);
+
+      int width = intArg(opt, "width", 35, 0); // width= or param 0
+      int start = intArg(opt, "start", 38, 1); // start= or param 1
+      int hang  = intArg(opt, "hang",  39, 2); // hang=  or param 2
+
+      return WordWrap.wrap(text, width, start, hang);
+    });
+  }
+
+  /** Prefer the block body; else first param; else a CharSequence context; else empty. */
+  private static String extractText(Object ctx, Options opt) throws IOException {
+    if (hasBlock(opt)) {
+      // Render the block with the *current* context so {{variables}} inside the block resolve.
+      return opt.fn();
+    }
+    if (opt.params != null && opt.params.length > 0) {
+      Object p0 = opt.params[0];
+      return p0 == null ? "" : p0.toString();
+    }
+    if (ctx instanceof CharSequence cs) {
+      return cs.toString();
+    }
+    return "";
+  }
+
+  /** Works across Handlebars.java versions (no opt.isBlock()). */
+  private static boolean hasBlock(Options opt) {
+    try {
+      if (opt == null || opt.fn == null) return false;
+      String raw = opt.fn.text();          // the literal block body before rendering
+      return raw != null && !raw.isEmpty();
+    } catch (Throwable ignore) {
+      return false;
+    }
+  }
+
+  /** Named (hash) arg first, then positional; default if absent. */
+  private static int intArg(Options opt, String name, int def, int posIndex) {
+    Object v = opt.hash(name);
+    if (v == null && opt.params != null && opt.params.length > posIndex) {
+      v = opt.params[posIndex];
+    }
+    if (v == null) return def;
+    if (v instanceof Number n) return n.intValue();
+    String s = v.toString().trim();
+    return s.isEmpty() ? def : Integer.parseInt(s);
+  }
+}
+
+
+Keep your existing WordWrap.wrap(text, width, start, hang) implementation.
+If your signature differs, adjust those calls.
+
+2) Template usages (three approaches)
+A) Block form (best for static paragraphs and when you want {{variables}} inside)
+
+⚠️ Do not put quotes around the block text.
+
+{{#wordWrapWithPosition width=73 start=3 hang=3}}
+This letter serves as notification of the following Incoming Wire Transfer
+credited to account number {{mask posting.accountNumber}} on {{createDate}}.
+If you have any questions, please contact your nearest TD Bank Branch
+or call 1-800-YES-2000.
+{{/wordWrapWithPosition}}
+
+
+The helper renders the whole block with the current model (so {{mask ...}} etc. work), then wraps and indents.
+
+This avoids the “whole payload printed” issue you saw, because the helper now prefers the block body over the context.
+
+B) Inline with a variable
+{{wordWrapWithPosition creditor.name width=35 start=38 hang=39}}
+
+C) Inline with a quoted literal (short one-liners)
+{{wordWrapWithPosition
+  "A short static sentence that needs wrapping and indenting."
+  width=73 start=3 hang=3
+}}
+
+
+You can also pass positional numbers if you prefer:
+
+{{wordWrapWithPosition creditor.name 35 38 39}}
+
+3) Common pitfalls to avoid
+
+Quotes inside block form
+In your screenshot you had:
+
+{{#wordWrapWithPosition ...}}"This letter serves..."{{/wordWrapWithPosition}}
+
+
+Those quotes become literal characters. Remove them in block form.
+
+Whole payload printed
+Happens when a helper falls back to context.toString(). The extractText above prevents that by preferring block → param → char sequence context → empty.
+
+Wrong defaults
+
+start is the first line’s starting column (so 38 ⇒ 38 spaces).
+
+hang is the subsequent lines’ starting column (your “start at column 39” rule).
+
+4) Where to register
+
+Wherever you build your Handlebars instance:
+
+@Configuration
+public class TemplateConfig {
+  @Bean
+  public Handlebars handlebars() {
+    Handlebars hb = new Handlebars();
+    TemplateHelper.registerAll(hb);
+    return hb;
+  }
+}
+
+
+(Or call TemplateHelper.registerAll(existingHandlebars); in your current config.)
+
+If you want, I can also include a tiny WordWrap.wrap(...) reference implementation that matches your earlier rules (break on spaces, move whole word to next line, but split long words > width).
