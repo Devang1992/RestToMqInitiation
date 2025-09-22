@@ -1,0 +1,56 @@
+You’re seeing the whole payload map because your helper is falling back to context.toString() (the current template context) instead of using the block body. That happens when the helper doesn’t correctly detect “I’m being used in block form.”
+
+Fix: prefer the block body when options.isBlock() is true; otherwise use the first param (inline), and only as a last resort use the context.
+
+Drop-in helper (robust)
+private Handlebars registerWordWrapWithInitialPosition(Handlebars hb) {
+  return hb.registerHelper("wordWrapWithPosition", (Object ctx, Options opt) -> {
+    // 1) block body  2) first param (inline)  3) context string  4) ""
+    String text;
+    if (opt.isBlock()) {
+      text = opt.fn(); // render the block with current context
+    } else if (opt.params != null && opt.params.length > 0) {
+      text = Objects.toString(opt.params[0], "");
+    } else if (ctx instanceof CharSequence cs) {
+      text = cs.toString();
+    } else {
+      return ""; // nothing to wrap; avoid printing ctx map
+    }
+
+    int width = intArg(opt, "width", 35, 0);
+    int start = intArg(opt, "start", 38, 1);
+    int hang  = intArg(opt, "hang",  39, 2);
+
+    return WordWrap.wrap(text, width, start, hang);
+  });
+}
+
+private static int intArg(Options opt, String name, int def, int posIndex) {
+  Object v = opt.hash(name);
+  if (v == null && opt.params != null && opt.params.length > posIndex) v = opt.params[posIndex];
+  if (v == null) return def;
+  return (v instanceof Number n) ? n.intValue() : Integer.parseInt(v.toString());
+}
+
+Template usage (no quotes in block)
+
+Use block form for your static paragraph, and don’t put quotes around the text (quotes inside the block become literal characters):
+
+{{#wordWrapWithPosition width=73 start=3 hang=3}}
+This letter serves as notification of the following Incoming Wire Transfer
+credited to account number {{mask posting.accountNumber}} on {{createDate}}.
+If you have any questions, please contact your nearest TD Bank Branch
+or call 1-800-YES-2000.
+{{/wordWrapWithPosition}}
+
+
+Inline variants also work:
+
+{{wordWrapWithPosition creditor.name width=73 start=3 hang=3}}     {{!-- variable --}}
+{{wordWrapWithPosition "Static one-liner" width=73 start=3 hang=3}} {{!-- quoted literal --}}
+
+Why it broke
+
+Your previous helper likely did something like “if no param, use ctx.toString()”, and didn’t check options.isBlock(). In block usage, ctx is your whole model (a Map), so its toString() printed the entire payload.
+
+After this change you should get your wrapped/indented paragraph instead of the payload dump.
