@@ -1,0 +1,199 @@
+For lines like:
+
+Local Instrument Code: {{coverPayment.localInstructionCode}}
+
+
+the easiest/cleanest path is a Handlebars helper that knows about a “label + value” line and auto-computes the hanging indent so wrapped lines align under the value.
+
+Recommended: wrapField helper (label + value)
+Helper (drop-in)
+// register once at startup
+handlebars.registerHelper("wrapField", (Object ctx, com.github.jknack.handlebars.Options opt) -> {
+  String label = opt.params.length > 0 ? String.valueOf(opt.params[0]) : "";
+  String value = opt.params.length > 1 && opt.params[1] != null ? String.valueOf(opt.params[1]) : "";
+
+  // defaults
+  int width = getInt(opt, "width", 73);        // max per line (content)
+  int start = getInt(opt, "start", 1);         // first line starts at column 1 by default
+  // hanging indent defaults to "right after the label and a space"
+  Integer hangArg = getIntOrNull(opt, "hang");
+  int hang = (hangArg != null) ? hangArg : start + label.length() + 1;
+
+  // Optional: skip empty values
+  boolean skipEmpty = getBool(opt, "skipEmpty", true);
+  if (skipEmpty && (value.isBlank())) return "";
+
+  String text = (label.endsWith(" ") ? label : label + " ") + value;
+  return WordWrap.wrap(text, width, start, hang);
+});
+
+private static Integer getIntOrNull(com.github.jknack.handlebars.Options opt, String name) {
+  Object v = opt.hash(name);
+  if (v == null) return null;
+  return (v instanceof Number n) ? n.intValue() : Integer.parseInt(v.toString().trim());
+}
+private static int getInt(com.github.jknack.handlebars.Options opt, String name, int def) {
+  Integer v = getIntOrNull(opt, name);
+  return v == null ? def : v;
+}
+private static boolean getBool(com.github.jknack.handlebars.Options opt, String name, boolean def) {
+  Object v = opt.hash(name);
+  if (v == null) return def;
+  if (v instanceof Boolean b) return b;
+  return Boolean.parseBoolean(v.toString().trim());
+}
+
+Template usage
+{{wrapField "Local Instrument Code:" coverPayment.localInstructionCode width=73 start=1}}
+
+
+First line prints the label + value.
+
+If it exceeds width, subsequent lines start at column = start + label.length() + 1 (right under the value).
+
+Override alignment if needed:
+
+{{wrapField "CTP Information:" freeText1 width=73 start=1 hang=20}}
+
+
+This keeps templates readable and you only write the wrapping logic once.
+
+Alternatives (if you prefer not to add a new helper)
+
+Use your existing wordWrapWithPosition + concat:
+
+{{wordWrapWithPosition (concat "Local Instrument Code: " coverPayment.localInstructionCode) width=73 start=1 hang=22}}
+
+
+(Here 22 = 1 + length("Local Instrument Code: ") )
+
+Pre-wrap in Java before rendering and pass the already formatted string to the template. This removes Handlebars logic but spreads formatting into service code and is harder to tweak in templates.
+
+Which to pick?
+
+For many fields like in your screenshot, the wrapField helper is the most ergonomic: one-liners in templates, consistent alignment, easy defaults, and no manual math for the hanging column.
+
+You said:
+but mutliple on same line can casue some problem right? cos if they fit on same line they should and all those logics, will concat take care of it?
+ChatGPT said:
+Thought for 2m 15s
+
+Great q. Short version:
+
+If you do {{wordWrapWithPosition (concat "Label1: " v1 " " "Label2: " v2 ...) ...}} then yes, it will keep everything on one line if it fits. When it doesn’t fit, it wraps like one long sentence.
+
+BUT: that means a wrap can split inside a pair (e.g., break after Label2: and move its value to the next line). If that’s fine, concat is the easiest.
+
+If you want pairs to stay together and only break between pairs, use a tiny helper.
+
+Option A — Simple (pairs may split)
+
+Works if you’re okay with a pair being broken by wrapping.
+
+{{wordWrapWithPosition
+  (concat "Local Instrument Code: " coverPayment.localInstructionCode
+          "  Other Field: " otherValue
+          "  Yet Another: " yetValue)
+  width=73 start=1 hang=1
+}}
+
+
+Keeps everything on one line if total length ≤ width.
+
+On overflow, wrapping happens anywhere whitespace appears (could split label/value).
+
+Option B — Keep pairs intact (wrapPairs helper)
+
+Greedily packs whole pairs on the line; if the next pair doesn’t fit, it starts a new line. (If a single pair is longer than the remaining space, it moves it to the next line; if it’s longer than the full width, it will wrap inside the value only—label stays together with at least one character of its value.)
+
+Helper
+handlebars.registerHelper("wrapPairs", (Object ctx, com.github.jknack.handlebars.Options opt) -> {
+  int width = getInt(opt, "width", 73);       // visible content width
+  int start = getInt(opt, "start", 1);        // 1-based start column
+  int gap   = getInt(opt, "gap", 2);          // spaces between pairs
+  String sep = " ".repeat(Math.max(0, gap));
+  String indent = " ".repeat(Math.max(0, start - 1));
+  StringBuilder out = new StringBuilder().append(indent);
+  int col = start;                             // current column (1-based)
+
+  Object[] ps = opt.params;
+  for (int i = 0; i < ps.length; i += 2) {
+    String label = ps[i] == null ? "" : ps[i].toString();
+    String value = (i + 1 < ps.length && ps[i + 1] != null) ? ps[i + 1].toString() : "";
+    String prefix = label.isEmpty() ? "" : (label.endsWith(" ") ? label : label + " ");
+
+    // Compute pair length quickly
+    int pairLen = prefix.length() + value.length();
+    int maxCol = start + width - 1;
+    int need = (col > start ? sep.length() : 0) + pairLen;
+
+    // If sep + pair doesn't fit, break line first
+    if (col + need - 1 > maxCol && col > start) {
+      out.append("\r\n").append(indent);
+      col = start;
+    }
+
+    // Always write the label+space at least together
+    if (!prefix.isEmpty()) {
+      // If label doesn't fit even alone, new line
+      if (col + prefix.length() - 1 > maxCol) {
+        out.append("\r\n").append(indent);
+        col = start;
+      }
+      // Add separator only if not at line start
+      if (col > start) { out.append(sep); col += sep.length(); }
+      out.append(prefix); col += prefix.length();
+    } else if (col > start) { // no label but we already have content on the line
+      out.append(sep); col += sep.length();
+    }
+
+    // Write value with simple hard-wrap as needed
+    int idx = 0;
+    while (idx < value.length()) {
+      int remaining = maxCol - col + 1;
+      if (remaining <= 0) {
+        out.append("\r\n").append(indent);
+        col = start;
+        remaining = maxCol - col + 1;
+      }
+      int take = Math.min(remaining, value.length() - idx);
+      out.append(value, idx, idx + take);
+      col += take;
+      idx += take;
+    }
+  }
+  return out.toString();
+});
+
+private static int getInt(com.github.jknack.handlebars.Options opt, String name, int def) {
+  Object v = opt.hash(name);
+  if (v == null) return def;
+  if (v instanceof Number n) return n.intValue();
+  String s = v.toString().trim();
+  return s.isEmpty() ? def : Integer.parseInt(s);
+}
+
+Template
+{{wrapPairs
+  "Local Instrument Code:" coverPayment.localInstructionCode
+  "Other:"                 otherValue
+  "Yet:"                   yetValue
+  width=73 start=1 gap=2
+}}
+
+
+Behavior:
+
+If pairs fit → all on one line.
+
+When they don’t → line breaks only between pairs.
+
+If one pair is too long for a line → label + at least part of value on the line; the rest of the value wraps (label not stranded on its own line).
+
+Which to pick?
+
+Want the quickest thing and don’t mind pairs splitting? → Option A with concat.
+
+Want neat packing and “don’t split pairs”? → Option B wrapPairs helper.
+
+Both play nicely with your existing wordWrapWithPosition approach; wrapPairs just bakes “pair-aware” wrapping so templates stay clean and you don’t have to hand-calc hanging columns.
