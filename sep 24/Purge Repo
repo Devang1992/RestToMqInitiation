@@ -1,0 +1,161 @@
+Yep—totally doable. Spring Batch doesn’t expose a “delete” API on JobRepository, so the usual, safe way is:
+
+Query old executions (COMPLETED/FAILED/ABANDONED/STOPPED, end_time < cutoff)
+
+Delete from the Batch tables in FK order
+
+Clean orphaned BATCH_JOB_INSTANCE rows
+
+Run it on a schedule (cron weekly, or fixed delay daily)
+
+Below is a small, production-ready version that works with the default table names.
+
+1) Cleaner (single class)
+package your.pkg.batch.housekeeping;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
+import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.sql.Timestamp;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.List;
+
+@Slf4j
+@Repository
+@RequiredArgsConstructor
+public class BatchMetadataCleaner {
+
+  private final NamedParameterJdbcTemplate jdbc;
+
+  /**
+   * Purge Spring Batch metadata older than retentionDays.
+   * Deletes in FK-safe order and removes orphan job instances.
+   *
+   * @return number of job executions deleted
+   */
+  @Transactional
+  public int purgeOlderThanDays(int retentionDays) {
+    Instant cutoff = Instant.now().minus(retentionDays, ChronoUnit.DAYS);
+    MapSqlParameterSource p = new MapSqlParameterSource("cutoff", Timestamp.from(cutoff));
+
+    // Pick executions that finished before cutoff (avoid RUNNING/STARTING/STOPPING)
+    List<Long> execIds = jdbc.queryForList(
+        """
+        select e.JOB_EXECUTION_ID
+          from BATCH_JOB_EXECUTION e
+         where e.END_TIME is not null
+           and e.END_TIME < :cutoff
+           and e.STATUS in ('COMPLETED','FAILED','ABANDONED','STOPPED')
+        """,
+        p, Long.class);
+
+    if (execIds.isEmpty()) {
+      log.debug("Batch cleaner: nothing to purge (cutoff={})", cutoff);
+      return 0;
+    }
+    MapSqlParameterSource ids = new MapSqlParameterSource("execIds", execIds);
+
+    // FK order matters:
+    jdbc.update(
+        """
+        delete from BATCH_STEP_EXECUTION_CONTEXT
+         where STEP_EXECUTION_ID in (
+               select s.STEP_EXECUTION_ID
+                 from BATCH_STEP_EXECUTION s
+                where s.JOB_EXECUTION_ID in (:execIds)
+         )
+        """, ids);
+
+    jdbc.update(
+        "delete from BATCH_STEP_EXECUTION where JOB_EXECUTION_ID in (:execIds)", ids);
+
+    jdbc.update(
+        "delete from BATCH_JOB_EXECUTION_CONTEXT where JOB_EXECUTION_ID in (:execIds)", ids);
+
+    jdbc.update(
+        "delete from BATCH_JOB_EXECUTION_PARAMS where JOB_EXECUTION_ID in (:execIds)", ids);
+
+    int deletedExec = jdbc.update(
+        "delete from BATCH_JOB_EXECUTION where JOB_EXECUTION_ID in (:execIds)", ids);
+
+    // Remove orphaned job instances (no remaining executions)
+    jdbc.update(
+        """
+        delete from BATCH_JOB_INSTANCE ji
+         where not exists (
+               select 1 from BATCH_JOB_EXECUTION e
+                where e.JOB_INSTANCE_ID = ji.JOB_INSTANCE_ID
+         )
+        """,
+        new MapSqlParameterSource());
+
+    log.info("Batch cleaner: purged {} job executions (cutoff={}, retentionDays={})",
+             deletedExec, cutoff, retentionDays);
+    return deletedExec;
+  }
+}
+
+2) Schedule it
+package your.pkg.batch.housekeeping;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.annotation.Scheduled;
+
+@Slf4j
+@Configuration
+@EnableScheduling
+@RequiredArgsConstructor
+public class BatchHousekeepingScheduler {
+
+  private final BatchMetadataCleaner cleaner;
+
+  // Defaults: keep 7 days; also run a daily sweep (in case Sunday missed)
+  @Value("${batch.housekeeping.retention-days:7}")
+  private int retentionDays;
+
+  /** Weekly purge: Sunday 23:00 server time */
+  @Scheduled(cron = "${batch.housekeeping.weekly-cron:0 0 23 ? * SUN}")
+  public void weeklyPurge() {
+    cleaner.purgeOlderThanDays(retentionDays);
+  }
+
+  /** Optional rolling purge: once per day */
+  @Scheduled(fixedDelayString = "${batch.housekeeping.fixed-delay:PT24H}",
+             initialDelayString = "${batch.housekeeping.initial-delay:PT2M}")
+  public void rollingPurge() {
+    cleaner.purgeOlderThanDays(retentionDays);
+  }
+}
+
+application.yml (test/prod override as needed)
+batch:
+  housekeeping:
+    retention-days: 7
+    weekly-cron: "0 0 23 ? * SUN"   # Sundays 23:00
+    fixed-delay: "PT24H"            # also run daily
+    initial-delay: "PT2M"
+
+Notes / gotchas
+
+No built-in delete API: Spring Batch doesn’t provide deletion on JobRepository; SQL is the standard approach.
+
+Statuses: Only purge finished executions. Don’t touch STARTED/STARTING/STOPPING.
+
+FK order: The delete order above matches the schema. If you customized table names or added table-prefix, adjust statements accordingly.
+
+DB TTL / partitioning: If your DB supports automatic retention (e.g., partitioned tables with retention or TTL), consider offloading this to the DB instead.
+
+Restarts: Deleting metadata makes restarting old executions impossible—that’s expected for finished/old jobs.
+
+Transactions: The method is @Transactional so either all related rows are removed, or none.
+
+If you want to purge by “keep last N instances per job” instead of age, I can drop in an alternative that selects the newest N per JOB_NAME and deletes the rest.
