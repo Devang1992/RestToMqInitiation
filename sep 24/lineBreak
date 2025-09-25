@@ -1,0 +1,69 @@
+ou’re hitting a classic “break only at a space inside the window” bug.
+
+In your loop you do:
+
+set windowEnd = i + maxWidth
+
+find breakAt = lastIndexOfSpace(line, i, windowEnd - 1)
+
+emit line[i, breakAt) and wrap
+
+That logic requires the break character (a space) to be inside the window.
+If the next word (e.g., OGB2-123...) still fits completely before windowEnd but its trailing space happens to be just past windowEnd, there is no space inside the window after that word. Your code then picks the previous space and pushes the whole word to the next line. That’s exactly why OGB2-... drops to the second line even though it would fit at the end of the first.
+
+Minimal fix
+
+After you find breakAt (the last space ≤ windowEnd-1), check whether the next word ends within the window. If it does, break at the end of that word (not at the space). Here’s a drop-in change inside wrapParagraph right after you compute breakAt:
+
+// Break at last space within the window
+int breakAt = lastIndexOfSpace(line, i, windowEnd - 1);
+
+// If the next word (after that space) still ends within the window,
+// include it on this line instead of pushing it to the next line.
+if (breakAt > i) {
+    int wordStart = breakAt + 1;
+    // scan to end of that word but do not pass windowEnd
+    int endOfWord = wordStart;
+    while (endOfWord < n && endOfWord < windowEnd && line.charAt(endOfWord) != ' ') {
+        endOfWord++;
+    }
+    // If the whole word fits before or exactly at windowEnd, break after the word
+    if (endOfWord - i <= maxWidth && endOfWord > wordStart) {
+        breakAt = endOfWord; // note: this is a non-space boundary now
+    }
+}
+
+if (breakAt <= i) {
+    // Degenerate (space at start or repeated spaces) — hard split
+    if (!firstSegment) out.append(indent);
+    out.append(line, i, windowEnd).append(CRLF);
+    i = windowEnd;
+    firstSegment = false;
+    continue;
+}
+
+// Emit up to breakAt (if breakAt ended on a word char, that's fine)
+if (!firstSegment) out.append(indent);
+out.append(line, i, breakAt).append(CRLF);
+
+// Advance past spaces after the break (only if we broke on a space)
+i = breakAt;
+while (i < n && line.charAt(i) == ' ') i++;
+
+firstSegment = false;
+
+Why this works
+
+If the next word’s end (not its following space) is ≤ windowEnd, we end the line at the end of the word.
+
+Only when the next word would overrun maxWidth do we break at the previous space (or hard-split if there’s no space).
+
+Optional polish
+
+You already normalize tabs and CRLF; keep that.
+
+Your “skip leading spaces for each segment” code is commented out; that’s fine, because the breakAt <= i path guards against zero-length lines.
+
+The indent logic is correct: you add indent only on continuation segments, and maxWidth is “content width” (not counting the indent).
+
+Apply the tweak above and OGB2-... (and any similar token) will stay on the first line whenever it actually fits.
