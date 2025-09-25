@@ -1,0 +1,174 @@
+Your symptom (“M”, “A”, “S” stuck at the end of the previous line; next line starts missing its first letter) happens because the “include-the-next-word” tweak was checking the word end clipped to windowEnd. If the next word doesn’t actually fit (its true end is beyond windowEnd), the scan still stops at windowEnd, so you end up breaking after just 1 char of that word. The fix is: when deciding whether the next word fits, scan to the true end of the word without the window limit, then compare that true end to windowEnd.
+
+Below is a corrected wrapParagraph plus helpers, and a compact set of JUnit 5 tests to prevent regressions.
+
+Fixed implementation (drop-in)
+public final class WordWrap {
+    private static final String CRLF = "\r\n";
+
+    public static String wrap(String text, int maxWidth, int hangingIndentColumn) {
+        if (text == null || text.isEmpty()) return "";
+        String normalized = text.replace("\r\n", "\n").replace("\r", "\n").replace('\t', ' ');
+        String[] paragraphs = normalized.split("\n", -1);
+
+        int indentSpaces = Math.max(0, hangingIndentColumn - 1);
+        String indent = " ".repeat(indentSpaces);
+
+        StringBuilder out = new StringBuilder();
+        for (int p = 0; p < paragraphs.length; p++) {
+            wrapParagraph(paragraphs[p], maxWidth, indent, out);
+            if (p < paragraphs.length - 1) out.append(CRLF);
+        }
+        return out.toString();
+    }
+
+    // -------- FIXED CORE --------
+    private static void wrapParagraph(String line, int maxWidth, String indent, StringBuilder out) {
+        int i = 0, n = line.length();
+        boolean firstSegment = true;
+
+        while (i < n) {
+            int remaining = n - i;
+            if (remaining <= maxWidth) {
+                if (!firstSegment) out.append(indent);
+                out.append(line, i, n);
+                break;
+            }
+
+            int windowEnd = i + maxWidth; // exclusive
+
+            // Is there any space inside the window?
+            int spaceInWindow = indexOfSpace(line, i, windowEnd);
+            if (spaceInWindow == -1) {
+                // Long token: hard split
+                if (!firstSegment) out.append(indent);
+                out.append(line, i, windowEnd).append(CRLF);
+                i = windowEnd;
+                firstSegment = false;
+                continue;
+            }
+
+            // Prefer the last space within the window
+            int breakAt = lastIndexOfSpace(line, i, windowEnd - 1);
+
+            // --- KEY FIX ---
+            // If the *entire* next word fits before windowEnd, include it on this line.
+            if (breakAt >= i) {
+                int wordStart = breakAt + 1;
+                int trueWordEnd = wordStart;
+                // scan to true end of word WITHOUT clamping to windowEnd
+                while (trueWordEnd < n && line.charAt(trueWordEnd) != ' ') {
+                    trueWordEnd++;
+                }
+                if (trueWordEnd <= windowEnd) {
+                    breakAt = trueWordEnd; // break right after the whole word (exclusive)
+                }
+            } else {
+                // Degenerate (spaces right at i). Fall back to hard split to avoid zero-length lines.
+                if (!firstSegment) out.append(indent);
+                out.append(line, i, windowEnd).append(CRLF);
+                i = windowEnd;
+                firstSegment = false;
+                continue;
+            }
+
+            if (!firstSegment) out.append(indent);
+            out.append(line, i, breakAt).append(CRLF);
+
+            // advance past spaces only if we're sitting on spaces
+            i = breakAt;
+            while (i < n && line.charAt(i) == ' ') i++;
+
+            firstSegment = false;
+        }
+    }
+
+    private static int indexOfSpace(String s, int from, int toExclusive) {
+        int limit = Math.min(toExclusive, s.length());
+        for (int k = from; k < limit; k++) if (s.charAt(k) == ' ') return k;
+        return -1;
+    }
+
+    private static int lastIndexOfSpace(String s, int from, int toInclusive) {
+        int k = Math.min(toInclusive, s.length() - 1);
+        for (; k >= from; k--) if (s.charAt(k) == ' ') return k;
+        return -1;
+    }
+}
+
+JUnit 5 tests
+import static org.junit.jupiter.api.Assertions.*;
+import org.junit.jupiter.api.Test;
+
+public class WordWrapTest {
+    private static final String CRLF = "\r\n";
+
+    @Test
+    void includesWordWhenTrailingSpaceIsOutsideWindow() {
+        // "Originator Bank: " (17) + "Malibu" (6) = 23 exactly -> space after "Malibu" sits at windowEnd
+        String in = "Originator Bank: Malibu CA";
+        String out = WordWrap.wrap(in, 23, 1);
+        assertEquals("Originator Bank: Malibu" + CRLF + "CA", out);
+    }
+
+    @Test
+    void doesNotIncludeWordIfItWouldOverflow() {
+        // Now width 22, "Malibu" would overflow; it must wrap before "Malibu"
+        String in = "Originator Bank: Malibu CA";
+        String out = WordWrap.wrap(in, 22, 1);
+        assertEquals("Originator Bank:" + CRLF + "Malibu CA", out);
+    }
+
+    @Test
+    void hardSplitsVeryLongTokenWithoutSpaces() {
+        String token = "OGB2-12345678901234567890";
+        String in = "Ref: " + token;
+        String out = WordWrap.wrap(in, 10, 1);
+        String[] lines = out.split("\\r\\n");
+        // Ensure no empty lines, no duplication, no loss
+        assertTrue(lines.length >= 3);
+        assertEquals("Ref: OGB2", lines[0]);
+        assertEquals("-12345678", lines[1]);
+        assertEquals("9012345678", lines[2].substring(0, 10)); // first 10 chars of remainder
+        assertEquals(String.join("", lines).replace("Ref: ", ""), token); // compare concatenation
+    }
+
+    @Test
+    void appliesHangingIndentOnContinuationLines() {
+        String in = "AAAAA BBBBB CCCCC DDDDD EEEEE FFFFF";
+        String out = WordWrap.wrap(in, 12, 5); // continuation lines should start at col 5
+        assertTrue(out.contains(CRLF + "    ")); // 4 spaces before content (col 5 start)
+    }
+
+    @Test
+    void noLostOrDuplicatedFirstLetterAcrossWrap() {
+        // Construct a case where previously only 'M' would bleed to prior line.
+        String in = "XXXXXX XXXXX " + "Malibu CA";
+        String out = WordWrap.wrap(in, 17, 1); // "XXXXXX XXXXX" (13 incl. space) + "Malibu"(6) > 17, but not by much
+        String[] lines = out.split("\\r\\n");
+        assertTrue(lines[1].startsWith("Malibu")); // full word starts next line; no missing 'M'
+        assertFalse(lines[0].endsWith("M"));       // nothing leaked
+    }
+
+    @Test
+    void normalizesCrLfAndTabs() {
+        String in = "A\tB\tC\r\nD\tE";
+        String out = WordWrap.wrap(in, 5, 1);
+        assertTrue(out.contains(CRLF));      // CRLF produced
+        assertFalse(out.contains("\r\n\r\n"));// no extra
+        assertFalse(out.contains("\t"));      // tabs normalized to spaces
+    }
+}
+
+
+What changed & why it fixes your screenshot:
+
+We now compute the true end of the next word (scan until the next space with no window clamp).
+
+Only if that true end <= windowEnd do we extend the line to include the whole word.
+
+Otherwise we wrap at the last space (or hard-split if none).
+
+This prevents the “single letter (‘M’, ‘A’, ‘S’) at line end” artifact and ensures words either sit intact on the current line (when they fit) or start intact on the next line.
+
+Plug this in and the OGB2/Malibu CA, OGB3/Antonio Street, OGB4/Suite 100 lines will behave as intended.
