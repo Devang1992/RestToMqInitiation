@@ -1,0 +1,167 @@
+You’re right—the last version over-eagerly hard-split. The culprit was a pre-check (“any space inside window?”) that fails when the only delimiter is exactly at the window boundary, so it hard-split even when the word fits.
+
+Here’s a clean, loop-safe implementation that combines all requirements:
+
+maxWidth is total printed width; continuation lines have maxWidth - indentLen content.
+
+Prefer breaking at spaces; if the next word fits, keep it on this line.
+
+If the next word doesn’t fit, start it on the current line and hard-split (no wasted tail).
+
+No infinite loops (cursor always advances; content width clamped ≥ 1).
+
+WordWrap.java
+public final class WordWrap {
+    private static final String CRLF = "\r\n";
+
+    /**
+     * @param text input text (paragraph breaks preserved)
+     * @param maxWidth TOTAL printed width per line (content + hanging indent on wrapped lines)
+     * @param hangingIndentColumn 1-based column where continuation lines start (>= 1)
+     */
+    public static String wrap(String text, int maxWidth, int hangingIndentColumn) {
+        if (text == null || text.isEmpty()) return "";
+        if (maxWidth <= 0) maxWidth = 1;
+
+        // Normalize newlines; tabs -> spaces
+        String normalized = text.replace("\r\n", "\n").replace("\r", "\n").replace('\t', ' ');
+        String[] paragraphs = normalized.split("\n", -1);
+
+        int indentSpaces = Math.max(0, hangingIndentColumn - 1);
+        String indent = " ".repeat(indentSpaces);
+
+        StringBuilder out = new StringBuilder();
+        for (int p = 0; p < paragraphs.length; p++) {
+            wrapParagraph(paragraphs[p], maxWidth, indent, out);
+            if (p < paragraphs.length - 1) out.append(CRLF);
+        }
+        return out.toString();
+    }
+
+    // ---------- CORE ----------
+    private static void wrapParagraph(String line, int maxWidthTotal, String indent, StringBuilder out) {
+        final int n = line.length();
+        final int indentLen = indent.length();
+        int i = 0;
+        boolean first = true;
+
+        while (i < n) {
+            int contentWidth = first ? maxWidthTotal : Math.max(1, maxWidthTotal - indentLen); // never < 1
+            int remaining = n - i;
+
+            // Fits entirely on this visual line
+            if (remaining <= contentWidth) {
+                if (!first) out.append(indent);
+                out.append(line, i, n);
+                break;
+            }
+
+            int windowEnd = i + contentWidth; // exclusive
+
+            // Find last space strictly inside the window
+            int lastSpace = lastIndexOfSpace(line, i, windowEnd - 1);
+
+            int breakPos; // exclusive
+            if (lastSpace >= i) {
+                // There is a space inside the window. Decide whether to also include the next word.
+                int wordStart = lastSpace + 1;
+                int trueWordEnd = wordStart;
+                while (trueWordEnd < n && line.charAt(trueWordEnd) != ' ') trueWordEnd++;
+
+                if (trueWordEnd <= windowEnd) {
+                    // The whole next word fits → include it on this line (break AFTER the word)
+                    breakPos = trueWordEnd;
+                } else {
+                    // Next word doesn't fit → start it NOW and hard-split at windowEnd
+                    breakPos = windowEnd;
+                }
+            } else {
+                // No space before windowEnd (long token starting at i) → hard split
+                breakPos = windowEnd;
+            }
+
+            if (!first) out.append(indent);
+            out.append(line, i, breakPos).append(CRLF);
+
+            // Advance cursor (guaranteed progress), then skip any spaces
+            i = breakPos;
+            while (i < n && line.charAt(i) == ' ') i++;
+
+            first = false;
+        }
+    }
+
+    // last space index in [from, toInclusive], or -1
+    private static int lastIndexOfSpace(String s, int from, int toInclusive) {
+        int k = Math.min(toInclusive, s.length() - 1);
+        for (; k >= from; k--) if (s.charAt(k) == ' ') return k;
+        return -1;
+    }
+}
+
+JUnit 5 tests
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+public class WordWrapTest {
+    private static final String CRLF = "\r\n";
+
+    @Test
+    void includesWordEvenIfFollowingSpaceIsOutsideWindow() {
+        String in = "Originator Bank: Malibu CA";
+        String out = WordWrap.wrap(in, 23, 1);
+        assertEquals("Originator Bank: Malibu" + CRLF + "CA", out);
+    }
+
+    @Test
+    void startsLongWordOnCurrentLineAndHardSplits_NoWastedTail() {
+        String token = "OBI-1234567890123456789012345678901234567890";
+        String in = "Bank to Bank Information: " + token;
+        String out = WordWrap.wrap(in, 32, 6); // continuation lines indent 5 spaces
+        String[] lines = out.split("\\r\\n");
+        assertEquals(32, lines[0].length());       // first line filled
+        assertTrue(lines[1].startsWith(" ".repeat(5)));
+    }
+
+    @Test
+    void normalWrapAtSpaces() {
+        String in = "AAAAA BBBBB CCCCC DDDDD EEEEE FFFFF";
+        String out = WordWrap.wrap(in, 12, 5);
+        String[] lines = out.split("\\r\\n");
+        assertTrue(lines.length >= 3);
+        for (int i = 0; i < lines.length; i++) {
+            assertTrue(lines[i].length() <= 12);
+            if (i > 0) assertTrue(lines[i].startsWith(" ".repeat(4)));
+        }
+    }
+
+    @Test
+    void noInfiniteLoopWhenIndentExceedsWidth() {
+        String in = "ABCDEFGHIJ";
+        String out = WordWrap.wrap(in, 3, 10); // available content clamped to 1 on cont. lines
+        for (String line : out.split("\\r\\n")) assertTrue(line.length() <= 3);
+    }
+
+    @Test
+    void normalizesCrLfAndTabs() {
+        String in = "A\tB\r\nC\tD";
+        String out = WordWrap.wrap(in, 5, 1);
+        assertTrue(out.contains(CRLF));
+        assertFalse(out.contains("\t"));
+    }
+}
+
+
+Why this fixes your screenshot:
+
+We removed the “any space in window?” pre-check that caused false hard-splits when a space sat exactly at the boundary.
+
+Decision order is now:
+
+If a space exists inside the window and the entire next word ends before/at the boundary → include it on this line.
+
+Otherwise (no space, or next word too long) → start that word now and hard-split at the boundary.
+
+Continuation lines always honor total width by subtracting the indent from available content.
+
+Drop this in and your OGB2… Malibu, OGB3… Antonio, OGB4… Suite lines should wrap exactly as intended. If anything still looks off, paste one concrete input line with your maxWidth and indent—I’ll run it through this logic and adjust.
