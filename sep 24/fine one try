@@ -1,0 +1,124 @@
+You’re right—the last version was too aggressive about hard-splitting whenever the next word didn’t fit the current line, even if it would fit on the next (indented) line. The correct rule is:
+
+If next word fits now → keep it on this line.
+
+Else if next word fits on the next line’s content width → break at the last space and move the word to the next line whole.
+
+Else (it won’t fit even on the next line) → start it now and hard-split at the window end.
+
+Here’s a clean, loop-safe drop-in that implements exactly that.
+
+public final class WordWrap {
+    private static final String CRLF = "\r\n";
+
+    /**
+     * @param text input text (paragraph breaks preserved)
+     * @param maxWidth TOTAL printed width per line (content + hanging indent on wrapped lines)
+     * @param hangingIndentColumn 1-based column where continuation lines start (>= 1)
+     */
+    public static String wrap(String text, int maxWidth, int hangingIndentColumn) {
+        if (text == null || text.isEmpty()) return "";
+        if (maxWidth <= 0) maxWidth = 1;
+
+        // normalize newlines; tabs -> single spaces
+        String normalized = text.replace("\r\n", "\n").replace("\r", "\n").replace('\t', ' ');
+        String[] paragraphs = normalized.split("\n", -1);
+
+        int indentSpaces = Math.max(0, hangingIndentColumn - 1);
+        String indent = " ".repeat(indentSpaces);
+
+        StringBuilder out = new StringBuilder();
+        for (int p = 0; p < paragraphs.length; p++) {
+            wrapParagraph(paragraphs[p], maxWidth, indent, out);
+            if (p < paragraphs.length - 1) out.append(CRLF);
+        }
+        return out.toString();
+    }
+
+    // ---------- CORE ----------
+    private static void wrapParagraph(String line, int maxWidthTotal, String indent, StringBuilder out) {
+        final int n = line.length();
+        final int indentLen = indent.length();
+        final int nextLineContentWidth = Math.max(1, maxWidthTotal - indentLen);
+
+        int i = 0;
+        boolean first = true;
+
+        while (i < n) {
+            int contentWidth = first ? maxWidthTotal : nextLineContentWidth; // available content this line
+            int remaining = n - i;
+
+            // Everything fits on this visual line
+            if (remaining <= contentWidth) {
+                if (!first) out.append(indent);
+                out.append(line, i, n);
+                break;
+            }
+
+            int windowEnd = i + contentWidth; // exclusive
+
+            // Find last space inside the window
+            int lastSpace = lastIndexOfSpace(line, i, windowEnd - 1);
+
+            int breakPos; // exclusive end for this line
+            if (lastSpace >= i) {
+                // There is a space before the boundary — decide what to do with the next word
+                int wordStart = lastSpace + 1;
+                int trueWordEnd = wordStart;
+                while (trueWordEnd < n && line.charAt(trueWordEnd) != ' ') trueWordEnd++;
+                int nextWordLen = trueWordEnd - wordStart;
+
+                if (trueWordEnd <= windowEnd) {
+                    // (A) Next word fits on this line → include it here
+                    breakPos = trueWordEnd;
+                } else if (nextWordLen <= nextLineContentWidth) {
+                    // (B) Next word won't fit here, but WILL fit on next line → wrap at space
+                    breakPos = lastSpace;
+                } else {
+                    // (C) Next word is too long even for next line → start it now, hard-split
+                    breakPos = windowEnd;
+                }
+            } else {
+                // No space inside window → a long token starting at i; must hard-split
+                breakPos = windowEnd;
+            }
+
+            // Emit [i, breakPos)
+            if (!first) out.append(indent);
+            out.append(line, i, breakPos).append(CRLF);
+
+            // Advance cursor; guaranteed progress
+            i = breakPos;
+
+            // If we ended on spaces, skip them so next line doesn't start with blanks
+            while (i < n && line.charAt(i) == ' ') i++;
+
+            first = false;
+        }
+    }
+
+    // last space index in [from, toInclusive], or -1
+    private static int lastIndexOfSpace(String s, int from, int toInclusive) {
+        int k = Math.min(toInclusive, s.length() - 1);
+        for (; k >= from; k--) if (s.charAt(k) == ' ') return k;
+        return -1;
+    }
+}
+
+Why this should finally match what you want
+
+Normal wrapping: breaks at the last space inside the window.
+
+If the trailing space is just outside the window but the word fits, it stays on the current line.
+
+If the word doesn’t fit here but would fit next line, we break at the space (no hard split).
+
+Only when the word is too long even for the next line (e.g., OBI-123...), we start it now and hard-split—so you don’t waste tail space.
+
+If it still hard-splits in your output, check two common gotchas:
+
+The “spaces” in your data are not ASCII spaces (e.g., NBSP \u00A0). If so, switch the space checks to Character.isWhitespace(ch) or normalize \u00A0 to ' '.
+
+maxWidth you pass is the total printed width (including indent on wrapped lines). If you instead pass the content width, remove the indent subtraction logic.
+
+Want quick regression guards? I can drop a compact JUnit test class next.
