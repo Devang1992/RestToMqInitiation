@@ -1,0 +1,99 @@
+Yep—I get it. If the next token is so long that it can’t fit any continuation line (after subtracting the hanging-indent), we shouldn’t leave slack at the end of the current line and push the whole token down. We should start that long token on the current line and hard-split it at windowEnd.
+
+Here’s the tiny change you need inside wrapParagraph (this assumes you’re already using the “total width” semantics from my last message):
+
+// Prefer the last space within the window
+int breakAt = lastIndexOfSpace(line, i, windowEnd - 1);
+
+// Decide how to break:
+if (breakAt >= i) {
+    int wordStart   = breakAt + 1;
+    int trueWordEnd = wordStart;
+    while (trueWordEnd < n && line.charAt(trueWordEnd) != ' ') trueWordEnd++;
+
+    if (trueWordEnd <= windowEnd) {
+        // The whole next word fits → keep it on this line.
+        breakAt = trueWordEnd;
+    } else {
+        // <<< KEY BEHAVIOR >>>
+        // The next word doesn't fit in the current window.
+        // Start it on THIS line and hard-split at windowEnd
+        // (don't waste space and postpone to next line).
+        breakAt = windowEnd;
+    }
+} else {
+    // Degenerate (space at i or none found) → hard split
+    if (!firstSegment) out.append(indent);
+    out.append(line, i, windowEnd).append(CRLF);
+    i = windowEnd;
+    firstSegment = false;
+    continue;
+}
+
+
+Everything else in your method can stay as in the previous version (i.e., compute contentWidth = firstSegment ? maxWidthTotal : maxWidthTotal - indent.length() and use windowEnd = i + contentWidth).
+
+Focused tests (JUnit 5)
+
+These assert: (1) continuation lines respect total width; (2) we include a fitting word even if its trailing space is beyond the window; (3) when a token can’t fit, we start it on the current line and hard-split (your new requirement).
+
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+public class WordWrapTest {
+    private static final String CRLF = "\r\n";
+
+    @Test
+    void continuationLinesRespectTotalWidthAndIndent() {
+        String in = "AAAAA BBBBB CCCCC DDDDD EEEEE FFFFF";
+        int total = 12, indentCol = 5;  // continuation lines start at col 5 (4 spaces)
+        String out = WordWrap.wrap(in, total, indentCol);
+        String[] lines = out.split("\\r\\n");
+        for (int idx = 0; idx < lines.length; idx++) {
+            assertTrue(lines[idx].length() <= total, "line " + idx + " exceeds width");
+            if (idx > 0) assertTrue(lines[idx].startsWith(" ".repeat(indentCol - 1)));
+        }
+    }
+
+    @Test
+    void includesWordIfItFitsEvenWhenTrailingSpaceIsOutside() {
+        String in = "Originator Bank: Malibu CA";
+        // trailing space after "Malibu" falls outside window, but the word itself fits
+        String out = WordWrap.wrap(in, 23, 1);
+        assertEquals("Originator Bank: Malibu" + CRLF + "CA", out);
+    }
+
+    @Test
+    void startsLongWordOnCurrentLineAndHardSplits() {
+        String token = "OBI-1234567890123456789012345678901234567890";
+        String in = "Bank to Bank Information: " + token;
+        int total = 32;      // total width including indent on wrapped lines
+        int indentCol = 6;   // continuation lines have 5-space indent
+        String out = WordWrap.wrap(in, total, indentCol);
+        String[] lines = out.split("\\r\\n");
+
+        // 1) No wasted space: the first line is filled to total width
+        assertEquals(total, lines[0].length());
+
+        // 2) It ends with the beginning of the long token (we started it on line 1)
+        String prefix = "Bank to Bank Information: ";
+        int chunk0 = total - prefix.length();
+        assertTrue(lines[0].startsWith(prefix));
+        assertTrue(lines[0].endsWith(token.substring(0, chunk0)));
+
+        // 3) Next line continues with indent then the rest of the token
+        assertTrue(lines[1].startsWith(" ".repeat(indentCol - 1)));
+        String rest = token.substring(chunk0);
+        assertTrue(lines[1].substring(indentCol - 1).startsWith(rest.substring(0,
+                Math.min(rest.length(), lines[1].length() - (indentCol - 1)))));
+    }
+}
+
+
+This gives you the exact behavior from your screenshot:
+
+If the next word fits, keep it on the line (even if its trailing space doesn’t).
+
+If it doesn’t fit, start it now and hard-split at windowEnd (so no blank tail on the current line).
+
+Continuation lines always respect maxWidth including hanging indent.
