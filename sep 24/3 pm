@@ -1,0 +1,129 @@
+Got it. Here’s a clean, loop-safe WordWrap you can drop in. It implements:
+
+Total width semantics (maxWidth includes indent on continuation lines).
+
+Continuation lines use maxWidth - indentLen content.
+
+If a word fits, keep it on this line (even if its trailing space is outside the window).
+
+If a word doesn’t fit, start it on the current line and hard-split at the window end (no wasted tail).
+
+No infinite loops: the cursor i always advances by ≥ 1 each iteration, even on degenerate input (repeated spaces, tiny widths, huge tokens).
+
+public final class WordWrap {
+    private static final String CRLF = "\r\n";
+
+    /**
+     * @param text input text; paragraph breaks preserved
+     * @param maxWidth TOTAL printed width per line (content + hanging indent on wrapped lines)
+     * @param hangingIndentColumn 1-based column where continuation lines start (>= 1)
+     */
+    public static String wrap(String text, int maxWidth, int hangingIndentColumn) {
+        if (text == null || text.isEmpty()) return "";
+        if (maxWidth <= 0) maxWidth = 1; // safety
+
+        // Normalize newlines, tabs → spaces
+        String normalized = text.replace("\r\n", "\n").replace("\r", "\n").replace('\t', ' ');
+        String[] paragraphs = normalized.split("\n", -1);
+
+        int indentSpaces = Math.max(0, hangingIndentColumn - 1);
+        String indent = " ".repeat(indentSpaces);
+
+        StringBuilder out = new StringBuilder();
+        for (int p = 0; p < paragraphs.length; p++) {
+            wrapParagraph(paragraphs[p], maxWidth, indent, out);
+            if (p < paragraphs.length - 1) out.append(CRLF);
+        }
+        return out.toString();
+    }
+
+    // -------- Core (loop-safe) --------
+    private static void wrapParagraph(String line, int maxWidthTotal, String indent, StringBuilder out) {
+        int n = line.length();
+        int i = 0;
+        boolean firstSegment = true;
+        final int indentLen = indent.length();
+
+        while (i < n) {
+            int contentWidth = firstSegment ? maxWidthTotal : Math.max(1, maxWidthTotal - indentLen); // clamp ≥1
+            int remaining = n - i;
+
+            // Fits entirely on this visual line
+            if (remaining <= contentWidth) {
+                if (!firstSegment) out.append(indent);
+                out.append(line, i, n);
+                break;
+            }
+
+            int windowEnd = i + contentWidth; // exclusive
+
+            // Is there any space in the window?
+            boolean anySpace = indexOfSpace(line, i, windowEnd) != -1;
+
+            int breakPos; // exclusive
+            if (!anySpace) {
+                // Long token or no spaces: hard split
+                breakPos = windowEnd;
+            } else {
+                // Prefer the last space inside the window
+                int lastSpace = lastIndexOfSpace(line, i, windowEnd - 1);
+
+                if (lastSpace >= i) {
+                    // See if the NEXT word (after that space) fully fits before windowEnd
+                    int wordStart = lastSpace + 1;
+                    int trueWordEnd = wordStart;
+                    while (trueWordEnd < n && line.charAt(trueWordEnd) != ' ') trueWordEnd++;
+
+                    if (trueWordEnd <= windowEnd) {
+                        // Word fits → include it on this line
+                        breakPos = trueWordEnd;
+                    } else {
+                        // Word doesn't fit → start it now and hard-split at windowEnd
+                        breakPos = windowEnd;
+                    }
+                } else {
+                    // Degenerate: space at i or none found earlier → hard split
+                    breakPos = windowEnd;
+                }
+            }
+
+            // Emit [i, breakPos)
+            if (!firstSegment) out.append(indent);
+            out.append(line, i, breakPos).append(CRLF);
+
+            // Advance cursor; ALWAYS progresses (breakPos > i guaranteed by construction)
+            i = breakPos;
+
+            // If we broke at a space boundary, skip any following spaces
+            while (i < n && line.charAt(i) == ' ') i++;
+
+            firstSegment = false;
+        }
+    }
+
+    // first space index in [from, toExclusive), or -1
+    private static int indexOfSpace(String s, int from, int toExclusive) {
+        int limit = Math.min(toExclusive, s.length());
+        for (int k = from; k < limit; k++) if (s.charAt(k) == ' ') return k;
+        return -1;
+    }
+
+    // last space index in [from, toInclusive], or -1
+    private static int lastIndexOfSpace(String s, int from, int toInclusive) {
+        int k = Math.min(toInclusive, s.length() - 1);
+        for (; k >= from; k--) if (s.charAt(k) == ' ') return k;
+        return -1;
+    }
+}
+
+Quick sanity checklist
+
+✔️ Long tokens begin on the current line and are split at the window end.
+
+✔️ Continuation lines’ printed length (indent + content) never exceeds maxWidth.
+
+✔️ No infinite loop: each iteration advances i by at least 1 (breakPos > i), and we clamp contentWidth to ≥1 even if indent ≥ width.
+
+✔️ Handles repeated spaces and tabs (tabs normalized to single spaces).
+
+If you want, I can also paste a compact JUnit 5 test class you can run to lock this down.
