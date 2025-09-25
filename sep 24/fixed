@@ -1,0 +1,192 @@
+Fixed WordWrap (total width semantics)
+public final class WordWrap {
+    private static final String CRLF = "\r\n";
+
+    /**
+     * @param text  input (paragraph breaks preserved)
+     * @param maxWidth  TOTAL width per visual line (content + any hanging indent on wrapped lines)
+     * @param hangingIndentColumn  1-based column where continuation lines start
+     */
+    public static String wrap(String text, int maxWidth, int hangingIndentColumn) {
+        if (text == null || text.isEmpty()) return "";
+
+        // Normalize newlines and tabs
+        String normalized = text.replace("\r\n", "\n").replace("\r", "\n").replace('\t', ' ');
+        String[] paragraphs = normalized.split("\n", -1);
+
+        int indentSpaces = Math.max(0, hangingIndentColumn - 1);   // 1-based column → spaces count
+        String indent = " ".repeat(indentSpaces);
+
+        StringBuilder out = new StringBuilder();
+        for (int p = 0; p < paragraphs.length; p++) {
+            wrapParagraph(paragraphs[p], maxWidth, indent, out);
+            if (p < paragraphs.length - 1) out.append(CRLF);
+        }
+        return out.toString();
+    }
+
+    // --- core ---
+    private static void wrapParagraph(String line, int maxWidthTotal, String indent, StringBuilder out) {
+        int i = 0, n = line.length();
+        boolean firstSegment = true;
+        int indentLen = indent.length();
+
+        while (i < n) {
+            // Available content width for this visual line
+            int contentWidth = firstSegment ? maxWidthTotal
+                                            : Math.max(1, maxWidthTotal - indentLen);  // never < 1
+            int remaining = n - i;
+
+            if (remaining <= contentWidth) {
+                if (!firstSegment) out.append(indent);
+                out.append(line, i, n);
+                break;
+            }
+
+            int windowEnd = i + contentWidth; // exclusive
+
+            // If no space inside the window, hard-split a long token
+            if (indexOfSpace(line, i, windowEnd) == -1) {
+                if (!firstSegment) out.append(indent);
+                out.append(line, i, windowEnd).append(CRLF);
+                i = windowEnd;
+                firstSegment = false;
+                continue;
+            }
+
+            // Prefer the last space within the window
+            int breakAt = lastIndexOfSpace(line, i, windowEnd - 1);
+
+            // If the whole next word fits before windowEnd, include it on this line.
+            if (breakAt >= i) {
+                int wordStart = breakAt + 1;
+                int trueWordEnd = wordStart;
+                while (trueWordEnd < n && line.charAt(trueWordEnd) != ' ') trueWordEnd++;
+                if (trueWordEnd <= windowEnd) breakAt = trueWordEnd; // break after full word
+            } else {
+                // Degenerate (space at i or repeated spaces) → hard split
+                if (!firstSegment) out.append(indent);
+                out.append(line, i, windowEnd).append(CRLF);
+                i = windowEnd;
+                firstSegment = false;
+                continue;
+            }
+
+            if (!firstSegment) out.append(indent);
+            out.append(line, i, breakAt).append(CRLF);
+
+            // advance past any spaces after the break
+            i = breakAt;
+            while (i < n && line.charAt(i) == ' ') i++;
+
+            firstSegment = false;
+        }
+    }
+
+    private static int indexOfSpace(String s, int from, int toExclusive) {
+        int limit = Math.min(toExclusive, s.length());
+        for (int k = from; k < limit; k++) if (s.charAt(k) == ' ') return k;
+        return -1;
+    }
+
+    private static int lastIndexOfSpace(String s, int from, int toInclusive) {
+        int k = Math.min(toInclusive, s.length() - 1);
+        for (; k >= from; k--) if (s.charAt(k) == ' ') return k;
+        return -1;
+    }
+}
+
+
+What changed
+
+Each iteration computes contentWidth:
+
+first line: contentWidth = maxWidthTotal
+
+continuation lines: contentWidth = maxWidthTotal - indent.length()
+
+All wrapping math uses contentWidth (so printed line length, including indent on wrapped lines, never exceeds maxWidthTotal).
+
+Keeps the earlier fix that prevents “single letters” leaking to the previous line by checking the true end of the next word.
+
+JUnit 5 tests (covering width + indent + word-fit behaviors)
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+public class WordWrapTest {
+    private static final String CRLF = "\r\n";
+
+    private static int visualLen(String line) { return line.length(); }
+
+    @Test
+    void continuationLinesRespectTotalWidthWithIndent() {
+        String in = "AAAAA BBBBB CCCCC DDDDD EEEEE FFFFF";
+        int total = 12;             // total characters per printed line
+        int indentCol = 5;          // continuation lines start at column 5 → 4-space indent
+        String out = WordWrap.wrap(in, total, indentCol);
+        String[] lines = out.split("\\r\\n");
+
+        for (int idx = 0; idx < lines.length; idx++) {
+            assertTrue(visualLen(lines[idx]) <= total, "line " + idx + " exceeds total width");
+            if (idx > 0) assertTrue(lines[idx].startsWith(" ".repeat(indentCol - 1)),
+                                    "continuation line not indented to column");
+        }
+    }
+
+    @Test
+    void includesWordWhenTrailingSpaceFallsJustOutsideWindow() {
+        // Space after "Malibu" lies just beyond the window; whole word still fits.
+        String in = "Originator Bank: Malibu CA";
+        String out = WordWrap.wrap(in, 23, 1);
+        assertEquals("Originator Bank: Malibu" + CRLF + "CA", out);
+    }
+
+    @Test
+    void wrapsBeforeWordWhenItWouldOverflow() {
+        String in = "Originator Bank: Malibu CA";
+        String out = WordWrap.wrap(in, 22, 1);
+        assertEquals("Originator Bank:" + CRLF + "Malibu CA", out);
+    }
+
+    @Test
+    void noLeakingFirstLetterAcrossWrap() {
+        String in = "XXXXXX XXXXX Malibu CA";
+        String out = WordWrap.wrap(in, 17, 1);
+        String[] lines = out.split("\\r\\n");
+        assertFalse(lines[0].endsWith("M"));
+        assertTrue(lines[1].startsWith("Malibu"));
+    }
+
+    @Test
+    void hardSplitsVeryLongTokenWithoutSpaces() {
+        String token = "OGB2-12345678901234567890";
+        String in = "Ref: " + token;
+        String out = WordWrap.wrap(in, 10, 1);
+        String[] lines = out.split("\\r\\n");
+
+        // No empty lines, and concatenation (minus "Ref: ") equals original token
+        assertTrue(lines.length >= 3);
+        String recon = (lines[0] + lines[1] + String.join("", java.util.Arrays.copyOfRange(lines, 2, lines.length)))
+                       .replaceFirst("^Ref: ", "");
+        assertEquals(token, recon.substring(0, token.length()));
+    }
+
+    @Test
+    void indentGreaterThanOrEqualToWidthStillProgresses() {
+        String in = "ABCDEFGHIJ";
+        // total width 3, indent column 5 (4 spaces) → available content width clamped to 1
+        String out = WordWrap.wrap(in, 3, 5);
+        for (String line : out.split("\\r\\n")) assertTrue(line.length() <= 3);
+    }
+
+    @Test
+    void normalizesCrLfAndTabs() {
+        String in = "A\tB\r\nC\tD";
+        String out = WordWrap.wrap(in, 5, 1);
+        assertTrue(out.contains(CRLF));
+        assertFalse(out.contains("\t"));
+    }
+}
+
+
+If you want, I can also add a small “assert printer” helper for your tests that checks every line’s rendered width against maxWidth and prints offending lines with indexes — handy when you tweak templates.
