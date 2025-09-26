@@ -1,0 +1,353 @@
+Architecture (fits your current config)
+
+Step A – build the payload in memory
+Replace your file writer with an ItemStreamWriter<String> that appends lines to a ByteArrayOutputStream (CRLF).
+On close(), drop payload (byte[]) and fileName into the Step ExecutionContext.
+
+Promote to Job context
+Use ExecutionContextPromotionListener so Step B can read payload/fileName.
+
+Step B – SFTP upload tasklet
+Reads payload & fileName from JobExecutionContext, uploads via SftpRemoteFileTemplate using a RetryTemplate (3 attempts with backoff). Upload to name.part, then rename to the final name.
+
+This keeps the payload purely in memory (note: still in heap—if you take heap dumps, you could capture it).
+
+1) In-memory writer (CRLF, no disk)
+@Component
+@StepScope
+public class InMemoryAppendWriter implements ItemStreamWriter<String> {
+
+  private static final byte[] CRLF = "\r\n".getBytes(StandardCharsets.UTF_8);
+
+  private ByteArrayOutputStream baos;
+  private ExecutionContext stepCtx;
+
+  @Value("#{jobParameters['fileName'] ?: 'WIRES_' + T(java.time.LocalDate).now().toString() + '.DAT'}")
+  private String fileName;
+
+  @Override public void open(ExecutionContext ctx) { this.stepCtx = ctx; this.baos = new ByteArrayOutputStream(64 * 1024); }
+  @Override public void update(ExecutionContext ctx) { /* no-op */ }
+
+  @Override
+  public void write(List<? extends String> items) {
+    for (String line : items) {
+      if (line != null) {
+        byte[] b = line.getBytes(StandardCharsets.UTF_8);
+        baos.write(b, 0, b.length);
+        baos.write(CRLF, 0, CRLF.length);
+      }
+    }
+  }
+
+  @Override
+  public void close() {
+    // expose to the next step
+    stepCtx.put("payload", baos.toByteArray());
+    stepCtx.putString("fileName", fileName);
+  }
+}
+
+
+If your Step already assembles the header/body itself, just feed those lines into this writer instead of the FileAppendWriter.
+
+2) Promote keys to Job context
+@Bean
+public ExecutionContextPromotionListener promotePayload() {
+  var l = new ExecutionContextPromotionListener();
+  l.setKeys(new String[] { "payload", "fileName" });
+  return l;
+}
+
+
+Add this listener to Step A.
+
+3) SFTP config + retry
+@Configuration
+public class SftpConfig {
+
+  @Bean
+  public SessionFactory<org.springframework.integration.sftp.session.SftpClient.DirEntry> sftpSessionFactory(SftpProps p) {
+    var f = new org.springframework.integration.sftp.session.DefaultSftpSessionFactory(true);
+    f.setHost(p.getHost());
+    f.setPort(p.getPort());
+    f.setUser(p.getUser());
+    if (p.getPrivateKey() != null) f.setPrivateKey(new FileSystemResource(p.getPrivateKey()));
+    if (p.getPrivateKeyPassphrase() != null) f.setPrivateKeyPassphrase(p.getPrivateKeyPassphrase());
+    if (p.getPassword() != null) f.setPassword(p.getPassword());
+    f.setAllowUnknownKeys(false); // verify host keys in known_hosts ideally
+    var caching = new org.springframework.integration.file.remote.session.CachingSessionFactory<>(f);
+    caching.setSessionWaitTimeout(10_000);
+    return caching;
+  }
+
+  @Bean
+  public org.springframework.integration.sftp.session.SftpRemoteFileTemplate sftpTemplate(
+      SessionFactory<org.springframework.integration.sftp.session.SftpClient.DirEntry> sf) {
+    return new org.springframework.integration.sftp.session.SftpRemoteFileTemplate(sf);
+  }
+
+  @Bean
+  public RetryTemplate sftpRetryTemplate() {
+    var retry = new org.springframework.retry.policy.SimpleRetryPolicy(3); // 3 tries
+    var backoff = new org.springframework.retry.backoff.ExponentialBackOffPolicy();
+    backoff.setInitialInterval(2000);
+    backoff.setMultiplier(2.0);
+    backoff.setMaxInterval(15000);
+    var t = new RetryTemplate();
+    t.setRetryPolicy(retry);
+    t.setBackOffPolicy(backoff);
+    return t;
+  }
+}
+
+@Data
+@Component
+@ConfigurationProperties(prefix = "app.sftp")
+class SftpProps {
+  private String host;
+  private int port = 22;
+  private String user;
+  private String password;           // or
+  private String privateKey;         // path
+  private String privateKeyPassphrase;
+  private String remoteDir = "/inbound";
+}
+
+
+pom.xml needs spring-integration-sftp and spring-retry.
+
+4) SFTP upload tasklet (atomic rename + 3 retries)
+@Component
+@StepScope
+public class SftpUploadTasklet implements Tasklet {
+
+  private final SftpRemoteFileTemplate sftp;
+  private final RetryTemplate retry;
+  private final SftpProps props;
+
+  public SftpUploadTasklet(SftpRemoteFileTemplate sftp, RetryTemplate retry, SftpProps props) {
+    this.sftp = sftp; this.retry = retry; this.props = props;
+  }
+
+  @Value("#{jobExecutionContext['payload']}")
+  private byte[] payload;
+
+  @Value("#{jobExecutionContext['fileName']}")
+  private String fileName;
+
+  @Override
+  public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) {
+    if (payload == null || payload.length == 0) return RepeatStatus.FINISHED;
+
+    String temp = props.getRemoteDir() + "/" + fileName + ".part";
+    String fin  = props.getRemoteDir() + "/" + fileName;
+
+    retry.execute(ctx -> {
+      try (InputStream in = new ByteArrayInputStream(payload)) {
+        sftp.execute(session -> {
+          session.write(in, temp);    // upload stream (in-memory)
+          if (session.exists(fin)) session.remove(fin); // idempotent
+          session.rename(temp, fin);  // atomic publish
+          return null;
+        });
+      }
+      return null;
+    });
+
+    return RepeatStatus.FINISHED;
+  }
+}
+
+5) Wire the steps in your job
+@Bean
+public Step readWriteStep(JobRepository repo,
+                          PlatformTransactionManager tx,
+                          ItemReader<ConsumerRecord<String,String>> reader,
+                          ItemProcessor<ConsumerRecord<String,String>, String> processor,
+                          InMemoryAppendWriter writer,
+                          ExecutionContextPromotionListener promotePayload,
+                          PantsBatchProperties props) {
+
+  return new StepBuilder("readWriteStep", repo)
+      .<ConsumerRecord<String,String>, String>chunk(props.getChunkSize(), tx)
+      .reader(reader)
+      .processor(processor)
+      .writer(writer)
+      .listener(promotePayload)          // promote payload & fileName
+      .build();
+}
+
+@Bean
+public Step sftpSendStep(JobRepository repo,
+                         PlatformTransactionManager tx,
+                         SftpUploadTasklet tasklet) {
+  return new StepBuilder("sftpSendStep", repo)
+      .tasklet(tasklet, tx)
+      .build();
+}
+
+@Bean
+public Job batchFileGeneratorJob(JobRepository repo,
+                                 Step readWriteStep,
+                                 Step sftpSendStep,
+                                 HeaderWriter headerWriterListener,
+                                 JobInformationLogger infoLogger) {
+  return new JobBuilder("batchFileGeneratorJob", repo)
+      .listener(infoLogger)
+      .listener(headerWriterListener)
+      .start(readWriteStep)
+      .next(sftpSendStep)
+      .build();
+}
+
+
+If you still want to also leave a local file (for QA), add a second writer (or tee the output) guarded by a profile flag. But your stated goal was pure in-memory → SFTP.
+
+FAQ / trade-offs
+
+“Send it three times?” I implemented 3 retries on failure. If you literally need to deliver three copies even on success, loop the upload in the tasklet.
+
+Very large files? In-memory means RAM usage ≈ file size. If that’s a risk, consider a streaming approach (PipedOutputStream → SFTP write) or writing to an encrypted tmp file (e.g., to an encrypted volume) and streaming it.
+
+CRLF / encoding is preserved because we write lines with \r\n into the byte[].
+
+Security: prefer key auth + host key verification (set allowUnknownKeys=false and configure known_hosts).
+
+If you want, I can tweak this to stream directly (no full byte[] in heap) using a PipedOutputStream the writer writes to while the tasklet reads and uploads concurrently.
+
+You said:
+let's say the accumulative data file can be somewhere around 100 to 200 mb, that much in memory should be fine right?
+ChatGPT said:
+Thought for 49s
+
+Short answer: yes, 100–200 MB in-memory is fine as long as your JVM has enough headroom and you avoid accidental copies.
+
+What to watch for
+
+Heap headroom. With our in-memory approach, aim for ~2× payload at peak to be safe (GC, Kafka buffers, objects, etc.). For a 200 MB file, give the app ≥ 512–768 MB heap; I usually set -Xmx1g to be comfy.
+
+Avoid hidden copies. ByteArrayOutputStream.toByteArray() duplicates the buffer (another 200 MB). That’s what spikes memory. Write bytes once and reuse the same backing array.
+
+Minimal change: zero-copy accumulator
+
+Swap the ByteArrayOutputStream for a small “growable byte buffer” that exposes its internal byte[] + size and gives an InputStream view—no extra copy.
+
+// --- util: growable buffer without toByteArray() copy
+final class ByteAccumulator {
+  private byte[] buf;
+  private int count;
+
+  ByteAccumulator(int initial) { buf = new byte[Math.max(initial, 4 * 1024)]; }
+  int size() { return count; }
+  byte[] buffer() { return buf; }
+
+  void write(byte b) {
+    ensure(count + 1);
+    buf[count++] = b;
+  }
+  void write(byte[] b, int off, int len) {
+    ensure(count + len);
+    System.arraycopy(b, off, buf, count, len);
+    count += len;
+  }
+  InputStream asInputStream() { return new ByteArrayInputStream(buf, 0, count); }
+
+  private void ensure(int min) {
+    if (min > buf.length) buf = java.util.Arrays.copyOf(buf, Math.max(min, buf.length << 1));
+  }
+}
+
+
+In-memory writer (no copy):
+
+@Component
+@StepScope
+public class InMemoryAppendWriter implements ItemStreamWriter<String> {
+  private static final byte[] CRLF = "\r\n".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+  private ByteAccumulator acc;
+  private ExecutionContext stepCtx;
+
+  @Value("#{jobParameters['fileName'] ?: 'WIRES_' + T(java.time.LocalDate).now().toString() + '.DAT'}")
+  private String fileName;
+
+  @Override public void open(ExecutionContext ctx) { this.stepCtx = ctx; this.acc = new ByteAccumulator(256 * 1024); }
+  @Override public void update(ExecutionContext ctx) { /* no-op */ }
+
+  @Override public void write(java.util.List<? extends String> items) {
+    for (String line : items) {
+      if (line == null) continue;
+      byte[] b = line.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      acc.write(b, 0, b.length);
+      acc.write(CRLF, 0, CRLF.length);
+    }
+  }
+
+  @Override public void close() {
+    // store the accumulator itself; no toByteArray() copy
+    stepCtx.put("payloadBuf", acc);
+    stepCtx.putString("fileName", fileName);
+  }
+}
+
+
+SFTP tasklet (stream from the same buffer):
+
+@Component
+@StepScope
+public class SftpUploadTasklet implements org.springframework.batch.core.step.tasklet.Tasklet {
+  private final org.springframework.integration.sftp.session.SftpRemoteFileTemplate sftp;
+  private final org.springframework.retry.support.RetryTemplate retry;
+  private final SftpProps props;
+
+  public SftpUploadTasklet(org.springframework.integration.sftp.session.SftpRemoteFileTemplate sftp,
+                           org.springframework.retry.support.RetryTemplate retry,
+                           SftpProps props) { this.sftp = sftp; this.retry = retry; this.props = props; }
+
+  @Value("#{jobExecutionContext['payloadBuf']}") private ByteAccumulator payloadBuf;
+  @Value("#{jobExecutionContext['fileName']}")  private String fileName;
+
+  @Override
+  public org.springframework.batch.repeat.RepeatStatus execute(
+      org.springframework.batch.core.StepContribution c, org.springframework.batch.core.scope.context.ChunkContext x) {
+    if (payloadBuf == null || payloadBuf.size() == 0) return org.springframework.batch.repeat.RepeatStatus.FINISHED;
+
+    String tmp = props.getRemoteDir() + "/" + fileName + ".part";
+    String fin = props.getRemoteDir() + "/" + fileName;
+
+    retry.execute(ctx -> {
+      try (InputStream in = payloadBuf.asInputStream()) {
+        sftp.execute(session -> {
+          session.write(in, tmp);
+          if (session.exists(fin)) session.remove(fin);
+          session.rename(tmp, fin);
+          return null;
+        });
+      }
+      return null;
+    });
+    return org.springframework.batch.repeat.RepeatStatus.FINISHED;
+  }
+}
+
+
+This keeps peak memory ~payload size + a little growth slack (no duplicate 200 MB array).
+
+When to consider streaming instead
+
+If you might:
+
+run multiple jobs in parallel,
+
+bump into >200 MB files later, or
+
+run with tight container limits,
+
+switch to streaming (no whole-file buffer): connect a PipedOutputStream (writer writes lines) to a PipedInputStream that the SFTP tasklet uploads concurrently. That keeps peak memory in the KB–MB range. I can share that version if/when you want it.
+
+Bottom line
+
+For one job at a time, 200 MB is totally fine with -Xmx1g and the zero-copy accumulator above.
+
+Avoid .toByteArray() and avoid collecting List<String> of all lines (massive overhead).
+
+Keep retries/atomic rename as we wired earlier.
