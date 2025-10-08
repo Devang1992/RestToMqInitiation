@@ -1,0 +1,22 @@
+import java.util.regex.Pattern;
+
+public final class AddressFixer {
+  private static final Pattern ZIP_PLUS4_ALL_ZERO =
+      Pattern.compile("\\b(\\d{5})\\s*[-\\p{Pd}]\\s*0{4}\\b");
+  private static final Pattern HYPHEN_BEFORE_SPACE =
+      Pattern.compile("(?<=\\S)-\\s+(?=\\S)");
+  private static final Pattern TRAILING_HYPHEN =
+      Pattern.compile("-\\s*$");
+
+  public static String fix(String s) {
+    if (s == null) return null;
+    // 1) 60452-0000 -> 60452
+    s = ZIP_PLUS4_ALL_ZERO.matcher(s).replaceAll("$1");
+    // 2) "word-  WORD" -> "word WORD"
+    s = HYPHEN_BEFORE_SPACE.matcher(s).replaceAll(" ");
+    // 3) "... 60452-" -> "... 60452"
+    s = TRAILING_HYPHEN.matcher(s).replaceFirst("");
+    // tidy spaces
+    return s.replaceAll("\\s{2,}", " ").trim();
+  }
+}
