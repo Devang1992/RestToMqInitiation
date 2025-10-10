@@ -1,0 +1,85 @@
+import com.github.jknack.handlebars.Handlebars;
+import com.github.jknack.handlebars.Template;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+
+import java.util.HashMap;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+class FormatCityStateZipHandlebarsTest {
+
+  private Handlebars hbs;
+  private Template tpl;
+
+  @BeforeEach
+  void setUp() throws Exception {
+    hbs = new Handlebars();
+    // register your real helper
+    registerFormatCityStateZip(hbs);
+
+    // tiny inline template that mirrors your file usage
+    tpl = hbs.compileInline("{{formatCityStateZip customer.city customer.state customer.zip}}");
+  }
+
+  @ParameterizedTest
+  @CsvSource(textBlock = """
+      # city      | state | zip            | expected
+                 ,       ,                , _SKIP_LINE_
+      Toronto    , ON    , 60452          , Toronto, ON 60452
+      Toronto    , ON    , 60452-         , Toronto, ON 60452
+      Toronto    , ON    , 60452-0000     , Toronto, ON 60452
+                 , ON    , 60452          , ON 60452
+                 ,       , 60452          , 60452
+      Toronto    ,       , 60452          , Toronto, 60452
+      Toronto    , ON    ,                , Toronto, ON
+      ' Toronto ', 'ON ', ' 60452 '       , Toronto, ON 60452
+      Toronto    , ON    , '60452- US'    , Toronto, ON 60452 US
+                 ,       , '60452- US'    , 60452 US
+      """)
+  void renders_expected(String city, String state, String zip, String expected) throws Exception {
+    Map<String, Object> ctx = new HashMap<>();
+    ctx.put("customer", Map.of(
+        "city",  city == null ? "" : city,
+        "state", state == null ? "" : state,
+        "zip",   zip == null ? "" : zip
+    ));
+
+    String out = tpl.apply(ctx);
+    assertEquals(expected, out);
+  }
+
+  /** --- Helper registration exactly like in your app --- */
+  private void registerFormatCityStateZip(Handlebars handlebars) {
+    handlebars.registerHelper("formatCityStateZip", (context, options) -> {
+      String city  = safe(options.param(0, ""));
+      String state = safe(options.param(1, ""));
+      String zip   = sanitizeZip(safe(options.param(2, "")));
+
+      boolean hasCity  = !city.isEmpty();
+      boolean hasState = !state.isEmpty();
+      boolean hasZip   = !zip.isEmpty();
+
+      if (!hasCity && !hasState && !hasZip) return "_SKIP_LINE_";
+
+      StringBuilder sb = new StringBuilder();
+      if (hasCity) { sb.append(city); if (hasState || hasZip) sb.append(", "); }
+      if (hasState) { sb.append(state); if (hasZip) sb.append(" "); }
+      if (hasZip) { sb.append(zip); }
+
+      return sb.toString().replaceAll("\\s{2,}", " ").trim();
+    });
+  }
+
+  private static String safe(Object s) { return s == null ? "" : s.toString().trim(); }
+
+  private static String sanitizeZip(String z) {
+    if (z.isEmpty()) return z;
+    z = z.replaceFirst("-0{4}\\s*$", "");   // drop -0000 at end
+    z = z.replaceAll("-(?=\\s)", "");       // drop hyphen before whitespace: "60452- US" -> "60452 US"
+    z = z.replaceFirst("-\\s*$", "");       // drop trailing hyphen (and trailing spaces)
+    return z.replaceAll("\\s{2,}", " ").trim();
+  }
+}
