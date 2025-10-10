@@ -1,0 +1,131 @@
+import com.github.jknack.handlebars.Handlebars;
+import com.github.jknack.handlebars.Template;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.util.HashMap;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+class FormatCityStateZipHandlebarsTest {
+
+  private Handlebars hbs;
+  private Template tpl;
+
+  @BeforeEach
+  void setUp() throws Exception {
+    hbs = new Handlebars();
+    registerFormatCityStateZip(hbs);
+    // inline template mirrors production usage
+    tpl = hbs.compileInline("{{formatCityStateZip customer.city customer.state customer.zip}}");
+  }
+
+  @Test
+  void allEmpty_returnsSkipLine() throws Exception {
+    assertEquals("_SKIP_LINE_", render("", "", ""));
+    assertEquals("_SKIP_LINE_", render(null, null, null));
+  }
+
+  @Test
+  void fullAddress() throws Exception {
+    assertEquals("Toronto, ON 60452", render("Toronto", "ON", "60452"));
+  }
+
+  @Test
+  void zip_trailingHyphen_removed() throws Exception {
+    assertEquals("Toronto, ON 60452", render("Toronto", "ON", "60452-"));
+    assertEquals("Toronto, ON 60452", render("Toronto", "ON", "60452- "));
+  }
+
+  @Test
+  void zip_dashThenSpace_collapses() throws Exception {
+    assertEquals("Toronto, ON 60452 US", render("Toronto", "ON", "60452- US"));
+    assertEquals("60452 US", render("", "", "60452- US"));
+  }
+
+  @Test
+  void zip_minus0000_removed() throws Exception {
+    assertEquals("Toronto, ON 60452", render("Toronto", "ON", "60452-0000"));
+    assertEquals("Toronto, ON 60452", render("Toronto", "ON", "60452-0000 "));
+  }
+
+  @Test
+  void onlyStateAndZip() throws Exception {
+    assertEquals("ON 60452", render("", "ON", "60452"));
+  }
+
+  @Test
+  void onlyZip() throws Exception {
+    assertEquals("60452", render("", "", "60452"));
+  }
+
+  @Test
+  void cityAndZip_only() throws Exception {
+    assertEquals("Toronto, 60452", render("Toronto", "", "60452"));
+  }
+
+  @Test
+  void cityAndState_only() throws Exception {
+    assertEquals("Toronto, ON", render("Toronto", "ON", ""));
+  }
+
+  @Test
+  void trimsExtraSpaces() throws Exception {
+    assertEquals("Toronto, ON 60452", render(" Toronto  ", " ON ", " 60452 "));
+  }
+
+  // ---------- helpers ----------
+
+  private String render(String city, String state, String zip) throws Exception {
+    Map<String, Object> customer = new HashMap<>();
+    customer.put("city", city);
+    customer.put("state", state);
+    customer.put("zip", zip);
+
+    Map<String, Object> ctx = new HashMap<>();
+    ctx.put("customer", customer);
+
+    return tpl.apply(ctx);
+  }
+
+  private void registerFormatCityStateZip(Handlebars handlebars) {
+    handlebars.registerHelper("formatCityStateZip", (context, options) -> {
+      String city  = safe(options.param(0, ""));
+      String state = safe(options.param(1, ""));
+      String zip   = sanitizeZip(safe(options.param(2, "")));
+
+      boolean hasCity  = !city.isEmpty();
+      boolean hasState = !state.isEmpty();
+      boolean hasZip   = !zip.isEmpty();
+
+      if (!hasCity && !hasState && !hasZip) return "_SKIP_LINE_";
+
+      StringBuilder sb = new StringBuilder();
+      if (hasCity) {
+        sb.append(city);
+        if (hasState || hasZip) sb.append(", ");
+      }
+      if (hasState) {
+        sb.append(state);
+        if (hasZip) sb.append(" ");
+      }
+      if (hasZip) {
+        sb.append(zip);
+      }
+      return sb.toString().replaceAll("\\s{2,}", " ").trim();
+    });
+  }
+
+  private static String safe(Object s) {
+    return s == null ? "" : s.toString().trim();
+  }
+
+  private static String sanitizeZip(String z) {
+    if (z.isEmpty()) return z;
+    z = z.replaceFirst("-0{4}\\s*$", ""); // drop -0000 at end
+    z = z.replaceAll("-(?=\\s)", "");     // drop hyphen before whitespace: "60452- US" -> "60452 US"
+    z = z.replaceFirst("-\\s*$", "");     // drop trailing hyphen
+    return z.replaceAll("\\s{2,}", " ").trim();
+  }
+}
