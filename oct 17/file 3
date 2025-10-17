@@ -1,0 +1,21 @@
+flowchart LR
+  A[Controller: Start Job Request] --> B{Is Job Already Running?}
+  B -- Yes --> C[Return HTTP 409 Conflict] --> S([End Process])
+  B -- No  --> D[Start Batch Job]
+  D --> E[Batch Job: Start Kafka Consumer]
+  E --> F{Are Kafka Headers Null?}
+  F -- Yes --> G[Log Warning: Null Header Key/Value] --> H[Extract Headers to Map]
+  F -- No  --> H[Extract Headers to Map]
+  H --> I{Are Required Headers Present?}
+  I -- No --> J[Log Error: Missing Required Headers] --> K[Throw PantsException: MISSING_REQUIRED_HEADERS] --> S
+  I -- Yes --> L[Log Info: Processing Record] --> M[Map Template Using TemplateMapper]
+  M --> N{Mapping Successful?}
+  N -- No --> O[Log Error: Template Mapping Failed] --> P[Throw PantsException: TEMPLATE_MAPPING_FAILED] --> S
+  N -- Yes --> Q[Generate Template String Using BatchTemplateGenerator]
+  Q --> T[Attempt File Transfer (SFTP) with up to 3 retries]
+  T --> U{Transfer Successful?}
+  U -- Yes --> R[Return Generated Template String] --> S
+  U -- No  --> V[Log Error: File Transfer Failed After Retries] --> W[Throw PantsException: FILE_TRANSFER_FAILED] --> S
+
+  classDef big font-size:20px,font-weight:bold;
+  class A,B,C,D,E,F,G,H,I,J,K,L,M,N,O,P,Q,R,S,T,U,V,W big;
