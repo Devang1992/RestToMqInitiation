@@ -1,0 +1,185 @@
+Architecture at a glance
+
+Emit errors → your adapter routes failed records to an error-topic with fields like: errorCode, source, ts.
+
+KStreams error monitor (small topology):
+
+Read error-topic.
+
+Group by a chosen key ("global" or (source,errorCode)).
+
+Sliding/tumbling window count.
+
+When count >= threshold, publish a control event to control-topic (e.g., {action: "PAUSE", reason, until?}).
+
+Control listener (tiny KStreams or Spring Kafka listener):
+
+On PAUSE, call StreamsBuilderFactoryBean.stop() (pauses all Streams topologies in this app) or close specific named topologies if you use named-topology mode.
+
+On RESUME, call StreamsBuilderFactoryBean.start().
+
+Why control topic? It ensures all instances respond consistently and avoids multiple nodes trying to coordinate via local state.
+
+Windowed detection (DSL)
+@Bean
+public KStream<String, ErrorEvent> errorMonitor(StreamsBuilder b) {
+    KStream<String, ErrorEvent> errors = b.stream("error-topic",
+            Consumed.with(Serdes.String(), Serdes.serdeFrom(ErrorEvent.class)));
+
+    // Key all to a single bucket, or use errorCode if you want per-type thresholds
+    KStream<String, ErrorEvent> keyed = errors.selectKey((k, v) -> "global");
+
+    var counts = keyed
+        .groupByKey()
+        .windowedBy(SlidingWindows.ofTimeDifferenceAndGrace(Duration.ofMinutes(5), Duration.ofMinutes(1)))
+        .count(Materialized.as("err-counts"));
+
+    counts
+        .toStream()
+        .filter((windowedKey, count) -> count >= 5) // threshold: 5 errors in 5 min
+        .mapValues((wKey, cnt) -> new ControlEvent("PAUSE", "5 errors in 5 minutes", Instant.now()))
+        .to("control-topic", Produced.with(WindowedSerdes.timeWindowedSerdeFrom(String.class), 
+                                           Serdes.serdeFrom(ControlEvent.class)));
+
+    return errors; // return just to satisfy @Bean; not used further
+}
+
+
+Notes:
+
+Sliding window reacts sooner than tumbling.
+
+Use a constant key ("global") if you want a cluster-wide breaker. If you need per-source/per-errorCode breakers, key appropriately.
+
+Pausing & resuming Streams cleanly (Spring)
+
+Spring manages Kafka Streams via StreamsBuilderFactoryBean. You can stop/start without killing the JVM.
+
+@Component
+@RequiredArgsConstructor
+public class StreamsCircuitBreaker {
+    private final StreamsBuilderFactoryBean streamsFactory; // autowired by Spring
+    private final AtomicBoolean paused = new AtomicBoolean(false);
+
+    public void pauseAll(String reason) {
+        if (paused.compareAndSet(false, true)) {
+            // Graceful stop (commits offsets, closes state stores)
+            streamsFactory.stop();
+            log.warn("Kafka Streams paused due to: {}", reason);
+        }
+    }
+
+    public void resumeAll() {
+        if (paused.compareAndSet(true, false)) {
+            streamsFactory.start();
+            log.info("Kafka Streams resumed.");
+        }
+    }
+
+    public boolean isPaused() { return paused.get(); }
+}
+
+
+Now wire a tiny control listener:
+
+@Component
+@RequiredArgsConstructor
+public class ControlTopicListener {
+    private final StreamsCircuitBreaker breaker;
+
+    @Bean
+    public KStream<String, ControlEvent> controlStream(StreamsBuilder b) {
+        var control = b.stream("control-topic",
+                Consumed.with(Serdes.String(), Serdes.serdeFrom(ControlEvent.class)));
+
+        control.peek((k, v) -> {
+            if ("PAUSE".equalsIgnoreCase(v.action())) {
+                breaker.pauseAll(v.reason());
+            } else if ("RESUME".equalsIgnoreCase(v.action())) {
+                breaker.resumeAll();
+            }
+        });
+
+        return control;
+    }
+}
+
+
+If you prefer a simple @KafkaListener for the control topic instead of KStreams, that’s fine too—sometimes better when Streams is fully stopped, because a separate Spring Kafka consumer can still listen for RESUME.
+
+Emitting control events
+
+From the windowed monitor (above) you already emit PAUSE. For auto-resume, pick one:
+
+Cool-down timer: when you emit PAUSE, also emit a RESUME scheduled via your scheduler (Quartz / Spring @Scheduled) after X minutes.
+
+Manual resume: expose an Actuator endpoint or CLI that sends RESUME to control-topic.
+
+Health-based resume: have a probe that watches error-rate back to normal for Y minutes and emits RESUME.
+
+Example actuator-backed resume:
+
+@RestController
+@RequiredArgsConstructor
+@RequestMapping("/streams")
+public class StreamsAdminController {
+    private final KafkaTemplate<String, ControlEvent> template;
+
+    @PostMapping("/resume")
+    public ResponseEntity<Void> resume() {
+        template.send("control-topic", "global", new ControlEvent("RESUME", "manual", Instant.now()));
+        return ResponseEntity.accepted().build();
+    }
+}
+
+Stopping “all Kafka messages” (important nuance)
+
+Kafka Streams doesn’t expose pause() like the consumer API; to truly stop fetching, you stop/close the KafkaStreams instance. Using StreamsBuilderFactoryBean.stop() is the Spring way.
+
+If you also have Spring Kafka @KafkaListener consumers (outside Streams), you can pause those via KafkaListenerEndpointRegistry.pause(). But for Streams, use the factory bean.
+
+Multi-instance & ordering concerns
+
+Using the control topic avoids the “every node decides differently” problem.
+
+The error aggregation is global (if you key to one bucket) and windowing is performed cluster-wide.
+
+To avoid a thundering herd of PAUSE messages, you can suppress intermediate counts and only emit when the window finalizes—or dedupe control messages with a compacted control-topic keyed by "global".
+
+Consider grace to accommodate late records.
+
+What to count?
+
+Count records on error-topic (easiest).
+
+Or count only certain errorCodes: filter first.
+
+Or use unique keys (e.g., error per source system) and set thresholds per key.
+
+Persistence & visibility
+
+Materialize the count to a state store (err-counts), expose via a read-only REST endpoint (Interactive Queries) for dashboards/alerts.
+
+Also forward a compacted metrics topic for Grafana/Prometheus exporters.
+
+Quick config tips
+
+Give the error monitor a separate application.id if you want it to keep running even when the main ingestion Streams is stopped. Otherwise, put the control listener on Spring Kafka so you can still receive RESUME after Streams is stopped.
+
+Set processing.guarantee=exactly_once_v2 only if needed; window counts don’t usually require it.
+
+Tune commit.interval.ms and cache.max.bytes.buffering for timely counts.
+
+Minimal POJOs
+public record ErrorEvent(String errorCode, String source, Instant ts, String details) {}
+public record ControlEvent(String action, String reason, Instant ts) {}
+
+TL;DR recommended pattern
+
+Build a tiny KStreams job that watches error-topic → windowed count → writes a single control event.
+
+Run a separate control consumer (Spring Kafka) that pauses/resumes by calling StreamsBuilderFactoryBean.stop()/start().
+
+Optionally auto-resume after a cool-down or via an actuator.
+
+If you want, I can tailor this to your exact package names and current beans (Streams binder vs raw spring-kafka-streams, actuator endpoints you already have, etc.) and wire in your existing Batch trigger so that a PAUSE also halts new job launches.
