@@ -1,0 +1,23 @@
+@Override
+public void accept(KStream<String, JsonNode> input) {
+    // JSON serde for your values
+    JsonSerde<JsonNode> jsonSerde = new JsonSerde<>(JsonNode.class);
+    jsonSerde.deserializer().addTrustedPackages("*");
+
+    // 1) Windowed count -> KTable<Windowed<String>, Long>
+    KTable<Windowed<String>, Long> counts = input
+        .selectKey((k, v) -> "global")
+        .groupByKey(Grouped.with(Serdes.String(), jsonSerde))
+        .windowedBy(SlidingWindows.ofTimeDifferenceAndGrace(Duration.ofMinutes(5), Duration.ofMinutes(1)))
+        .count(Materialized.<String, Long, WindowStore<Bytes, byte[]>>as("error-counts")
+                .withKeySerde(Serdes.String())
+                .withValueSerde(Serdes.Long()));
+
+    // 2) KTable -> KStream and flatten/remove Windowed key
+    counts
+        .toStream() // KStream<Windowed<String>, Long>
+        .filter((wKey, c) -> c != null && c >= 5)
+        .map((wKey, c) -> KeyValue.pair("global",    // plain key for control topic
+                new ControlEvent("PAUSED", ">=5 errors in 5m", Instant.now())))
+        .to("control-topic", Produced.with(Serdes.String(), new JsonSerde<>(ControlEvent.class)));
+}
