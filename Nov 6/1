@@ -1,0 +1,130 @@
+package com.td.payments.pants.kafka.processor;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.streams.*;
+import org.apache.kafka.streams.kstream.KStream;
+import org.apache.kafka.streams.StreamsConfig;
+import org.junit.jupiter.api.*;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.*;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.kafka.support.serializer.JsonDeserializer;
+import org.springframework.kafka.support.serializer.JsonSerializer;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.Properties;
+import java.util.Set;
+
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class ErrorConsumerTest {
+
+    private static final String INPUT_TOPIC = "error-topic";
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    private TopologyTestDriver testDriver;
+    private TestInputTopic<String, JsonNode> input;
+
+    @Mock private ErrorConsumerConfigs configs;
+    @Mock private BinderConfigUpdater binderConfigUpdater;
+
+    private ErrorConsumer errorConsumer; // SUT
+
+    @AfterEach
+    void tearDown() {
+        if (testDriver != null) testDriver.close();
+    }
+
+    @Test
+    void shouldPauseWhenThresholdExceededInWindow() throws Exception {
+        // given: config -> window 60s, grace 0s, advance 1s, threshold 3, codes = {"DB_DOWN"}
+        when(configs.getErrorWindowSize()).thenReturn(1);        // minutes
+        when(configs.getGracePeriod()).thenReturn(0);            // seconds
+        when(configs.getAdvanceBy()).thenReturn(1);              // seconds
+        when(configs.getErrorCountThreshold()).thenReturn(3);
+        when(configs.getErrorCodes()).thenReturn(Set.of("DB_DOWN"));
+
+        errorConsumer = new ErrorConsumer(configs, binderConfigUpdater);
+
+        // build topology
+        StreamsBuilder builder = new StreamsBuilder();
+        KStream<String, JsonNode> stream = builder.stream(INPUT_TOPIC);
+        errorConsumer.accept(stream);
+
+        testDriver = new TopologyTestDriver(builder.build(), streamProps());
+        input = testDriver.createInputTopic(
+                INPUT_TOPIC,
+                Serdes.String().serializer(),
+                new JsonSerializer<>(),
+                // event-time semantics: control timestamps explicitly
+                Instant.parse("2025-01-01T00:00:00Z"),
+                Duration.ZERO
+        );
+
+        // when: 3 records with the same error code inside the 60s window
+        JsonNode payload = mapper.readTree("{\"msg\":\"x\"}");
+        input.pipeInput("DB_DOWN", payload);                         // t
+        input.pipeInput("DB_DOWN", payload, Instant.parse("2025-01-01T00:00:01Z")); // t+1s
+        input.pipeInput("DB_DOWN", payload, Instant.parse("2025-01-01T00:00:02Z")); // t+2s
+
+        // then: breaker invoked once
+        verify(binderConfigUpdater, timeout(1000).times(1)).stopAll();
+        verifyNoMoreInteractions(binderConfigUpdater);
+    }
+
+    @Test
+    void shouldNotPauseForNonErrorCodesOrBelowThreshold() throws Exception {
+        // given
+        when(configs.getErrorWindowSize()).thenReturn(1);
+        when(configs.getGracePeriod()).thenReturn(0);
+        when(configs.getAdvanceBy()).thenReturn(1);
+        when(configs.getErrorCountThreshold()).thenReturn(3);
+        when(configs.getErrorCodes()).thenReturn(Set.of("DB_DOWN"));
+
+        errorConsumer = new ErrorConsumer(configs, binderConfigUpdater);
+
+        StreamsBuilder builder = new StreamsBuilder();
+        KStream<String, JsonNode> stream = builder.stream(INPUT_TOPIC);
+        errorConsumer.accept(stream);
+
+        testDriver = new TopologyTestDriver(builder.build(), streamProps());
+        input = testDriver.createInputTopic(
+                INPUT_TOPIC,
+                Serdes.String().serializer(),
+                new JsonSerializer<>(),
+                Instant.parse("2025-01-01T00:00:00Z"),
+                Duration.ZERO
+        );
+
+        JsonNode payload = mapper.readTree("{\"msg\":\"x\"}");
+
+        // 1) below threshold: only 2 DB_DOWN within window
+        input.pipeInput("DB_DOWN", payload);
+        input.pipeInput("DB_DOWN", payload, Instant.parse("2025-01-01T00:00:01Z"));
+
+        // 2) different code not in configs -> ignored
+        input.pipeInput("SOME_OTHER", payload, Instant.parse("2025-01-01T00:00:02Z"));
+
+        // then
+        verify(binderConfigUpdater, after(300).never()).stopAll();
+    }
+
+    // ---- helpers ----
+
+    private Properties streamProps() {
+        Properties p = new Properties();
+        p.put(StreamsConfig.APPLICATION_ID_CONFIG, "error-consumer-test");
+        p.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "dummy:9092");
+        p.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+        // value serde defaults don’t matter much since we pass explicit serializers,
+        // but set Json serde metadata so any internal serdes behave:
+        p.put(JsonDeserializer.TRUSTED_PACKAGES, "*");
+        p.put(JsonDeserializer.TYPE_MAPPINGS, "JsonNode:com.fasterxml.jackson.databind.JsonNode");
+        return p;
+    }
+}
