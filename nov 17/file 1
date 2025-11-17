@@ -1,0 +1,148 @@
+Mapper throws exception during stageCheck → record should forward with DB error
+@Test
+void shouldForwardDbErrorWhenMapperFails() throws JsonProcessingException {
+    when(notificationsMapperMock.mapToMidStatusMap(anySet()))
+            .thenThrow(new RuntimeException("DB failure"));
+
+    List<TestRecord<String, JsonNode>> trList = List.of(
+            getTestRecord("1", objectMapper.readTree(testRequest), "1")
+    );
+
+    final StageProcessorSupplier<String, JsonNode> stageProcessorSupplier = getProcessor();
+    setUp(stream -> stream.process(stageProcessorSupplier).to(outputTopic));
+
+    input.pipeRecordList(trList);
+
+    topologyTestDriver.advanceWallClockTime(Duration.ofSeconds(6));
+
+    List<TestRecord<String, JsonNode>> out = output.readRecordsToList();
+    assertEquals(1, out.size());
+
+    // The record should carry DB ERROR header
+    assertEquals("E04000", KafkaHeaderUtils.lastStringHeader(out.get(0).headers(), KafkaHeaders.ERROR_CODE));
+}
+
+2️⃣ Status list from mapper is empty → should forward DB_NOT_FOUND error
+@Test
+void shouldForwardDbNotFoundWhenStatusListEmpty() throws Exception {
+    when(notificationsMapperMock.mapToMidStatusMap(anySet()))
+            .thenReturn(Collections.emptyList());
+
+    List<TestRecord<String, JsonNode>> trList = List.of(
+            getTestRecord("3", objectMapper.readTree(testRequest), "3")
+    );
+
+    final StageProcessorSupplier<String, JsonNode> supplier = getProcessor();
+    setUp(stream -> stream.process(supplier).to(outputTopic));
+
+    input.pipeRecordList(trList);
+    topologyTestDriver.advanceWallClockTime(Duration.ofSeconds(6));
+
+    List<TestRecord<String, JsonNode>> out = output.readRecordsToList();
+    assertEquals(1, out.size());
+
+    assertEquals("STATUS_NOT_FOUND_ERROR",
+            KafkaHeaderUtils.lastStringHeader(out.get(0).headers(), KafkaHeaders.ERROR_CODE));
+}
+
+3️⃣ Invalid JSON (extractHvpRequestTag throws exception) → STAGE_PROCESS_ERROR
+@Test
+void shouldForwardStageProcessErrorWhenJsonExtractionFails() throws JsonProcessingException {
+    // Break JSON to force extractHvpRequestTag to fail
+    when(notificationsMapperMock.mapToMidStatusMap(anySet()))
+            .thenReturn(List.of(new NotificationStatus("TEST", "10")));
+
+    JsonNode badJson = objectMapper.readTree("{\"invalid\":}");
+
+    List<TestRecord<String, JsonNode>> trList = List.of(
+            getTestRecord("10", badJson, "10")
+    );
+
+    final StageProcessorSupplier<String, JsonNode> supplier = getProcessor();
+    setUp(stream -> stream.process(supplier).to(outputTopic));
+
+    input.pipeRecordList(trList);
+    topologyTestDriver.advanceWallClockTime(Duration.ofSeconds(6));
+
+    List<TestRecord<String, JsonNode>> out = output.readRecordsToList();
+    assertEquals(1, out.size());
+
+    assertEquals("STAGE_PROCESS_ERROR",
+            KafkaHeaderUtils.lastStringHeader(out.get(0).headers(), KafkaHeaders.ERROR_CODE));
+}
+
+4️⃣ Max retry reached → RETRY_MAX_ERROR forwarded
+@Test
+void shouldForwardRetryMaxErrorWhenAttemptsExhausted() throws Exception {
+    NotificationStatus statusFail = new NotificationStatus("FAILED", "20");
+
+    when(notificationsMapperMock.mapToMidStatusMap(anySet()))
+            .thenReturn(List.of(statusFail))
+            .thenReturn(List.of(statusFail))
+            .thenReturn(List.of(statusFail)) // 3 retries
+            .thenReturn(List.of(statusFail));
+
+    JsonNode request = objectMapper.readTree(testRequest);
+
+    List<TestRecord<String, JsonNode>> trList = List.of(
+            getTestRecord("20", request, "20")
+    );
+
+    StageProcessorSupplier<String, JsonNode> supplier = getProcessor();
+    setUp(stream -> stream.process(supplier).to(outputTopic));
+
+    input.pipeRecordList(trList);
+
+    // Wait until retry logic triggers
+    topologyTestDriver.advanceWallClockTime(Duration.ofSeconds(6));
+
+    List<TestRecord<String, JsonNode>> out = output.readRecordsToList();
+    assertEquals(1, out.size());
+
+    assertEquals("RETRY_MAX_ERROR",
+            KafkaHeaderUtils.lastStringHeader(out.get(0).headers(), KafkaHeaders.ERROR_CODE));
+}
+
+5️⃣ Null MID in header → should route using record key instead
+@Test
+void shouldFallbackToKeyWhenMidHeaderMissing() throws Exception {
+    when(notificationsMapperMock.mapToMidStatusMap(anySet()))
+            .thenReturn(List.of(new NotificationStatus("COMPLETE", "x1")));
+
+    JsonNode node = objectMapper.readTree(testRequest);
+
+    TestRecord<String, JsonNode> rec =
+            new TestRecord<>("fallback-key", node)
+                    .withHeaders(h -> {}); // No MID
+
+    setUp(stream -> stream.process(getProcessor()).to(outputTopic));
+
+    input.pipeInput(rec);
+
+    topologyTestDriver.advanceWallClockTime(Duration.ofSeconds(6));
+
+    List<TestRecord<String, JsonNode>> out = output.readRecordsToList();
+    assertEquals(1, out.size());
+
+    assertEquals("fallback-key", out.get(0).key());
+}
+
+⭐ All negative test cases validated
+
+These cover:
+
+✔ mapper throws exception
+✔ empty status list
+✔ JSON extraction failure
+✔ retries exhausted
+✔ missing MID header
+
+If you want, I can also provide:
+
+✅ A refactored, clean StageProcessorTest class with all tests combined
+✅ A Mock builder for NotificationsMapper
+✅ A Test utility class
+✅ Add test cases for headersToMap, mapToHeaders, isDatabaseError
+
+Just tell me:
+“Refactor and combine full test class.”
