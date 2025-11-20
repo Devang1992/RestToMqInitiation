@@ -1,0 +1,94 @@
+STEP 1 — Create a directory for readable output
+
+Inside the container:
+
+mkdir -p /var/mqm/trace_readable
+
+🔥 STEP 2 — Convert EVERY .TRC file to readable format
+
+Run this inside the container:
+
+for f in /var/mqm/trace/*.TRC; do
+    base=$(basename "$f" .TRC)
+    dmpmqtrc -f "$f" > "/var/mqm/trace_readable/${base}.txt"
+done
+
+
+What this does:
+
+Loops through all .TRC files
+
+Converts each using dmpmqtrc
+
+Saves a readable .txt version in /var/mqm/trace_readable
+
+🔥 STEP 3 — Combine all readable logs into ONE BIG FILE
+
+Run:
+
+cat /var/mqm/trace_readable/*.txt > /var/mqm/trace_readable/ALL_TRACE_READABLE.txt
+
+
+Now you have:
+
+/var/mqm/trace_readable/ALL_TRACE_READABLE.txt
+
+
+This is the full readable trace — everything MQ did.
+
+🔥 STEP 4 — (Optional) Copy the big file to your host
+
+If you want it on your host machine:
+
+docker cp <container-id>:/var/mqm/trace_readable/ALL_TRACE_READABLE.txt ./ALL_TRACE_READABLE.txt
+
+🔍 Useful Searches in the Readable File
+
+Once you have the combined readable file:
+
+Find all MQGET calls:
+grep -n "MQGET" ALL_TRACE_READABLE.txt
+
+Find all timeouts:
+grep -n "MQRC_NO_MSG_AVAILABLE" ALL_TRACE_READABLE.txt
+
+Find WaitInterval used:
+grep -n "WaitInterval" ALL_TRACE_READABLE.txt
+
+Count MQGET calls:
+grep -R "MQGET" ALL_TRACE_READABLE.txt | wc -l
+
+⭐ Your Counts So Far
+
+You said:
+
+MQGET = 10
+
+NO_MSG_AVAILABLE = 6
+
+This PERFECTLY matches IBM MQ expected behavior:
+
+MQGET was called 10 times
+
+6 times there was no message
+
+The other 4 returned messages or ended differently
+
+If you want, upload the combined file
+
+If you upload:
+
+ALL_TRACE_READABLE.txt
+
+
+I will:
+
+Parse out every MQGET
+
+Show exact frequency (GET/sec)
+
+Show WaitInterval MQ is using
+
+Build a summary you can give to your MQ team
+
+Just run the commands above and share the readable file.
