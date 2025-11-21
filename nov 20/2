@@ -1,0 +1,107 @@
+Sanitization Engine (Final Code)
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+
+import java.util.Iterator;
+import java.util.Map;
+
+public class JsonPatternSanitizer {
+
+    private static final ObjectMapper mapper = new ObjectMapper();
+
+    /**
+     * Entry point for sanitizing based on a schema containing "pattern" fields.
+     */
+    public static JsonNode sanitize(JsonNode input, JsonNode schema) {
+        JsonNode copy = input.deepCopy();
+        sanitizeNode(copy, schema);
+        return copy;
+    }
+
+    /**
+     * Recursive sanitization that respects "pattern" field in the JSON schema.
+     */
+    private static void sanitizeNode(JsonNode node, JsonNode schema) {
+
+        if (schema == null || !schema.has("properties") || !node.isObject())
+            return;
+
+        ObjectNode objectNode = (ObjectNode) node;
+        Iterator<Map.Entry<String, JsonNode>> fields = schema.get("properties").fields();
+
+        while (fields.hasNext()) {
+            Map.Entry<String, JsonNode> entry = fields.next();
+            String field = entry.getKey();
+            JsonNode fieldSchema = entry.getValue();
+
+            if (!objectNode.has(field))
+                continue;
+
+            JsonNode fieldValue = objectNode.get(field);
+
+            // If this field has a pattern → apply whitelist sanitization
+            if (fieldSchema.has("pattern") && fieldValue.isTextual()) {
+                String allowedPattern = fieldSchema.get("pattern").asText();
+
+                // Convert JSON Schema pattern to whitelist regex for replacement
+                // JSON Schema pattern uses ^ and $ → we remove them to build strip regex
+                String corePattern = allowedPattern
+                        .replace("^", "")
+                        .replace("$", "");
+
+                String stripRegex = "[^" + corePattern + "]";  // characters NOT in whitelist
+
+                String original = fieldValue.asText();
+                String cleaned = original.replaceAll(stripRegex, "");
+
+                objectNode.put(field, cleaned);
+            }
+
+            // Recursive sanitation for nested objects
+            if (fieldSchema.has("properties") && fieldValue.isObject()) {
+                sanitizeNode(fieldValue, fieldSchema);
+            }
+
+            // Recursive sanitation for arrays
+            if (fieldSchema.has("items") && fieldValue.isArray()) {
+                ArrayNode array = (ArrayNode) fieldValue;
+                for (int i = 0; i < array.size(); i++) {
+                    JsonNode item = array.get(i);
+                    sanitizeNode(item, fieldSchema.get("items"));
+                }
+            }
+        }
+    }
+}
+
+🧪 Usage Example
+ObjectMapper mapper = new ObjectMapper();
+
+// Convert POJO to JsonNode
+JsonNode message = mapper.valueToTree(yourPojo);
+
+// Load schema (already generated)
+JsonNode schema = mapper.readTree(
+    new ClassPathResource("schemas/payment-event-schema.json").getInputStream()
+);
+
+// Sanitize
+JsonNode sanitized = JsonPatternSanitizer.sanitize(message, schema);
+
+// Send to Kafka
+kafkaTemplate.send("topic-name", sanitized);
+
+🧾 Example
+Schema says:
+"customerName": {
+  "type": "string",
+  "pattern": "^[A-Za-z .,-]*$"
+}
+
+Input:
+"customerName": "Dev@ng Ach@rya!!! #243"
+
+After Sanitize:
+"customerName": "Devng Achrya "
