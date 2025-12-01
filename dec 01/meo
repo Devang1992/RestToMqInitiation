@@ -1,0 +1,21 @@
+bash -c 'OFFSET=$I_OFFSET; PARTITION=0; 
+if [ -z "$OFFSET" ]; then echo "ERROR: Missing OFFSET"; exit 1; fi; 
+echo "Retry using offset: $OFFSET"; 
+JOB_ID=$(curl -k -s -i -X POST "https://localhost:8080/jobs/launch?offset=$OFFSET&partition=$PARTITION" \
+    | grep -i "^Location:" | sed "s/.*\///" | tr -d "\r"); 
+echo "Retry Job ID: $JOB_ID"; 
+
+COUNT=0; STATUS="RUNNING"; 
+while [ $COUNT -lt 60 ]; do 
+   sleep 15; 
+   STATUS=$(curl -k -s "https://localhost:8080/jobs/executions/$JOB_ID"); 
+   echo "Retry Status = $STATUS"; 
+   if [ "$STATUS" != "RUNNING" ]; then break; fi; 
+   COUNT=$((COUNT+1)); 
+done; 
+
+if [ "$STATUS" != "COMPLETED" ]; then 
+   echo "Retry job failed with $STATUS"; exit 1; 
+fi; 
+
+echo "Retry completed successfully"; exit 0;'
