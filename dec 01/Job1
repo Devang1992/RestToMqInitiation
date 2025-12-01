@@ -1,0 +1,327 @@
+Big picture design (what you described)
+
+BOX: KAFKA_BATCH_BOX
+
+Inside the box:
+
+Job 1 – KAFKA_BATCH_NORMAL
+
+Scheduled (e.g., every night).
+
+Calls /batch/run without offset.
+
+Reads JSON { jobId, status, lastOffset }.
+
+If status=COMPLETED → saves lastOffset into Autosys global variable LAST_KAFKA_OFFSET.
+
+No retries on this job (if it fails, we don’t keep hammering the same broken run).
+
+Job 2 – KAFKA_BATCH_RETRY
+
+No schedule.
+
+condition: failure(KAFKA_BATCH_NORMAL) → runs automatically when normal job fails.
+
+Reads global variable $LAST_KAFKA_OFFSET.
+
+Calls /batch/run?startOffset=$LAST_KAFKA_OFFSET.
+
+This job has up to 5 retries configured in Autosys.
+
+If it still fails after 5 retries → whole box fails.
+
+That’s it. Clean, auditable, and exactly what you want.
+
+2. Spring Boot side: controller response & offset capture
+2.1 Step listener to store last offset into JobExecutionContext
+
+Assuming single partition + manual consumer or KafkaItemReader:
+
+@Component
+public class KafkaOffsetStepListener extends StepExecutionListenerSupport {
+
+    private long lastOffset = -1L;
+
+    // Call this from your ItemReader / Kafka listener
+    public void updateOffset(long offset) {
+        this.lastOffset = offset;
+    }
+
+    @Override
+    public ExitStatus afterStep(StepExecution stepExecution) {
+        if (lastOffset >= 0) {
+            stepExecution.getJobExecution()
+                         .getExecutionContext()
+                         .putLong("lastReadOffset", lastOffset);
+        }
+        return ExitStatus.COMPLETED;
+    }
+}
+
+
+In your reader (where you consume Kafka records), just call:
+
+lastOffsetStepListener.updateOffset(record.offset());
+
+2.2 Controller that runs job and returns JSON
+@RestController
+@RequestMapping("/batch")
+@RequiredArgsConstructor
+public class BatchController {
+
+    private final JobLauncher jobLauncher;
+    private final Job kafkaBatchJob;
+
+    @PostMapping("/run")
+    public ResponseEntity<Map<String, Object>> runBatch(
+            @RequestParam(required = false) Long startOffset) throws Exception {
+
+        JobParameters params = new JobParametersBuilder()
+                .addLong("requestTime", System.currentTimeMillis())
+                .addLong("startOffset", startOffset == null ? 0L : startOffset)
+                .toJobParameters();
+
+        JobExecution execution = jobLauncher.run(kafkaBatchJob, params);
+
+        long lastOffset = execution.getExecutionContext()
+                                   .getLong("lastReadOffset", -1L);
+
+        Map<String, Object> body = Map.of(
+                "jobId", execution.getJobId(),
+                "status", execution.getStatus().toString(),
+                "lastOffset", lastOffset
+        );
+
+        HttpStatus httpStatus = execution.getStatus() == BatchStatus.COMPLETED
+                ? HttpStatus.OK
+                : HttpStatus.INTERNAL_SERVER_ERROR;
+
+        return new ResponseEntity<>(body, httpStatus);
+    }
+}
+
+
+So the API response looks like:
+
+{
+  "jobId": 12345,
+  "status": "COMPLETED",
+  "lastOffset": 987654321
+}
+
+
+Perfect for the script to parse.
+
+3. Autosys scripts
+
+I’ll assume you’ll put these in files on the agent, e.g.:
+
+/opt/scripts/kafka_batch_normal.sh
+
+/opt/scripts/kafka_batch_retry.sh
+
+You can then just point the Command field in WCC to those paths.
+
+3.1 Normal job script (kafka_batch_normal.sh)
+#!/bin/bash
+
+API_URL="https://localhost:8080/batch/run"   # change host/port as needed
+LOG_DIR="/opt/springboot/logs/kafka-batch"
+RESP_FILE="$LOG_DIR/normal_response.json"
+LOG_FILE="$LOG_DIR/normal_job.log"
+
+mkdir -p "$LOG_DIR"
+
+echo "$(date) - Starting NORMAL batch run" >> "$LOG_FILE"
+
+# Call Spring Boot (synchronous)
+HTTP_CODE=$(curl -k -s -S -w "%{http_code}" -o "$RESP_FILE" -X POST "$API_URL")
+
+if [ "$HTTP_CODE" -ne 200 ]; then
+  echo "$(date) - HTTP $HTTP_CODE from batch API" >> "$LOG_FILE"
+  exit 1
+fi
+
+STATUS=$(grep -o '"status":"[^"]*"' "$RESP_FILE" | cut -d':' -f2 | tr -d '"')
+LAST_OFFSET=$(grep -o '"lastOffset":[0-9]*' "$RESP_FILE" | cut -d':' -f2)
+JOB_ID=$(grep -o '"jobId":[0-9]*' "$RESP_FILE" | cut -d':' -f2)
+
+if [ "$STATUS" != "COMPLETED" ]; then
+  echo "$(date) - Batch status $STATUS (jobId=$JOB_ID)" >> "$LOG_FILE"
+  exit 1
+fi
+
+# Save offset to global variable for retry job
+sendevent -E SET_GLOBAL -G LAST_KAFKA_OFFSET -V "$LAST_OFFSET"
+
+echo "$(date) - NORMAL run completed OK, jobId=$JOB_ID, lastOffset=$LAST_OFFSET" >> "$LOG_FILE"
+exit 0
+
+
+(If your infra has jq, you can swap the grep/cut with jq -r '.status' etc., but this will work anywhere.)
+
+3.2 Retry job script (kafka_batch_retry.sh)
+#!/bin/bash
+
+API_URL="https://localhost:8080/batch/run"
+LOG_DIR="/opt/springboot/logs/kafka-batch"
+RESP_FILE="$LOG_DIR/retry_response.json"
+LOG_FILE="$LOG_DIR/retry_job.log"
+
+mkdir -p "$LOG_DIR"
+
+START_OFFSET="$LAST_KAFKA_OFFSET"
+
+if [ -z "$START_OFFSET" ]; then
+  echo "$(date) - ERROR: LAST_KAFKA_OFFSET global variable is empty; nothing to retry from" >> "$LOG_FILE"
+  exit 1
+fi
+
+echo "$(date) - Starting RETRY batch run from offset $START_OFFSET" >> "$LOG_FILE"
+
+HTTP_CODE=$(curl -k -s -S -w "%{http_code}" -o "$RESP_FILE" \
+            -X POST "$API_URL?startOffset=$START_OFFSET")
+
+if [ "$HTTP_CODE" -ne 200 ]; then
+  echo "$(date) - HTTP $HTTP_CODE from retry API" >> "$LOG_FILE"
+  exit 1
+fi
+
+STATUS=$(grep -o '"status":"[^"]*"' "$RESP_FILE" | cut -d':' -f2 | tr -d '"')
+LAST_OFFSET=$(grep -o '"lastOffset":[0-9]*' "$RESP_FILE" | cut -d':' -f2)
+JOB_ID=$(grep -o '"jobId":[0-9]*' "$RESP_FILE" | cut -d':' -f2)
+
+if [ "$STATUS" != "COMPLETED" ]; then
+  echo "$(date) - RETRY batch status $STATUS (jobId=$JOB_ID)" >> "$LOG_FILE"
+  exit 1
+fi
+
+# Optionally update global variable to the new offset
+sendevent -E SET_GLOBAL -G LAST_KAFKA_OFFSET -V "$LAST_OFFSET"
+
+echo "$(date) - RETRY run completed OK, jobId=$JOB_ID, lastOffset=$LAST_OFFSET" >> "$LOG_FILE"
+exit 0
+
+4. Autosys JIL example
+
+You can paste this into JIL or mirror it in WCC.
+
+insert_job: KAFKA_BATCH_BOX
+job_type: b
+box_name: KAFKA_BATCH_BOX
+max_run_alarm: 0
+alarm_if_fail: n
+
+insert_job: KAFKA_BATCH_NORMAL
+job_type: c
+box_name: KAFKA_BATCH_BOX
+command: /opt/scripts/kafka_batch_normal.sh
+machine: <AGENT_NAME>
+run_calendar: <YOUR_CALENDAR>
+start_times: "02:00"
+std_out_file: /opt/springboot/logs/kafka-batch/normal_stdout.log
+std_err_file: /opt/springboot/logs/kafka-batch/normal_stderr.log
+n_retrys: 0
+
+insert_job: KAFKA_BATCH_RETRY
+job_type: c
+box_name: KAFKA_BATCH_BOX
+command: /opt/scripts/kafka_batch_retry.sh
+machine: <AGENT_NAME>
+condition: failure(KAFKA_BATCH_NORMAL)
+run_calendar:
+std_out_file: /opt/springboot/logs/kafka-batch/retry_stdout.log
+std_err_file: /opt/springboot/logs/kafka-batch/retry_stderr.log
+n_retrys: 5
+
+
+Key bits:
+
+condition: failure(KAFKA_BATCH_NORMAL) → retry job runs automatically when normal job fails.
+
+run_calendar: empty for retry, so it’s never time-scheduled.
+
+n_retrys: 5 on retry job → Autosys will automatically retry it up to 5 times before final fail.
+
+5. How to set this up in WCC UI (like your screenshot)
+
+Create the Box Job
+
+Go to WCC → Scheduling or Monitoring → Job Streams.
+
+Click Create → Job Type = Box.
+
+Name: KAFKA_BATCH_BOX.
+
+Save.
+
+Create KAFKA_BATCH_NORMAL inside the box
+
+Right-click the box → Add Job → Type = Command.
+
+On Command tab:
+
+Command: /opt/scripts/kafka_batch_normal.sh
+
+Shell: /bin/bash (or /bin/sh).
+
+Std output / error paths: set as desired.
+
+On Schedule tab:
+
+Set Run Calendar and Start Time (e.g., 2 AM).
+
+On Termination tab:
+
+Retries = 0.
+
+Save.
+
+Create KAFKA_BATCH_RETRY inside the box
+
+Right-click the box → Add Job → Type = Command.
+
+Command tab:
+
+Command: /opt/scripts/kafka_batch_retry.sh
+
+Schedule tab:
+
+Leave calendar empty / no start time (so it never runs on its own).
+
+Conditions (still on Schedule tab usually):
+
+Add condition → choose KAFKA_BATCH_NORMAL → “On failure”.
+
+Termination tab:
+
+Set Retries = 5 (or whatever you want).
+
+Save.
+
+Permissions
+
+Make sure the Autosys user can:
+
+Execute both scripts.
+
+Run sendevent.
+
+Write to your log directories.
+
+6. Sanity checks / corner cases
+
+First ever failure before successful run:
+If the very first normal run fails before offset is saved, the GVAR LAST_KAFKA_OFFSET will be empty → retry script will detect that and fail immediately (correct behaviour).
+
+Single partition:
+Your design (one offset) is perfect since you only have 1 partition.
+
+Different VMs with same group/app id:
+Offset is in Kafka, but we’re also mirroring it in Autosys GVAR for explicit control. Since any VM can pick the job, Autosys is the orchestrator, so this is fine.
+
+If you want, next step we can:
+
+Adjust scripts to match exactly the curl pattern from your screenshot (with polling), instead of synchronous /batch/run.
+
+Or I can help you wire the startOffset JobParameter into your Kafka consumer and show how you seek to that offset on startup.
