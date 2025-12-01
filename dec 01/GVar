@@ -1,0 +1,76 @@
+bash -c '
+# ================================
+# 1. Read global offset & partition
+# ================================
+OFFSET="$PANTS_BATCH_LAST_KAFKA_OFFSET"
+PARTITION=0
+
+if [ -z "$OFFSET" ]; then
+    echo "ERROR: Global variable PANTS_BATCH_LAST_KAFKA_OFFSET is empty or not set."
+    exit 1
+fi
+
+echo "Using retry offset: $OFFSET"
+echo "Using partition: $PARTITION"
+
+# ======================================================
+# 2. CALL /launch?offset=xxx&partition=0 and capture headers + body
+# ======================================================
+RESPONSE=$(curl -k -s -D - -o - "https://localhost:8080/jobs/launch?offset=$OFFSET&partition=$PARTITION")
+
+# Split HEADERS and BODY
+HEADERS=$(printf "%s" "$RESPONSE" | sed "/^\r$/q")
+BODY=$(printf "%s" "$RESPONSE" | sed "1,/^\r$/d")
+
+echo "===== HEADERS ====="
+echo "$HEADERS"
+echo "===== BODY ========"
+echo "$BODY"
+
+# ======================================================
+# 3. Extract Location → gives /jobs/executions/{id}
+# ======================================================
+LOCATION=$(printf "%s" "$HEADERS" | grep -i "^Location:" | awk "{print \$2}" | tr -d "\r")
+
+if [ -z "$LOCATION" ]; then
+    echo "ERROR: Could not extract Location header"
+    exit 1
+fi
+
+# Extract jobId from URL
+JOB_ID=$(basename "$LOCATION")
+
+echo "STATUS URL: $LOCATION"
+echo "RETRY JOB_ID: $JOB_ID"
+
+# ======================================================
+# 4. Poll for job status
+# ======================================================
+COUNT=0
+STATUS="RUNNING"
+
+while [ $COUNT -lt 60 ]
+do
+    sleep 15
+
+    STATUS=$(curl -k -s "$LOCATION")
+    echo "Retry Job $JOB_ID Status: $STATUS"
+
+    if [ "$STATUS" != "RUNNING" ]; then
+        break
+    fi
+
+    COUNT=$((COUNT + 1))
+done
+
+# ======================================================
+# 5. Final decision
+# ======================================================
+if [ "$STATUS" != "COMPLETED" ]; then
+    echo "Retry execution $JOB_ID FAILED with status $STATUS"
+    exit 1
+fi
+
+echo "Retry execution $JOB_ID COMPLETED successfully"
+exit 0
+'
