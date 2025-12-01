@@ -1,0 +1,114 @@
+NORMAL JOB SCRIPT (stores box variable OFFSET)
+
+This script:
+
+✔ Calls /launch
+✔ Extracts offset from header
+✔ Saves it as a box variable
+✔ Polls job status
+
+Replace URL with yours.
+
+bash -c '
+# 1) Call launch and capture headers + body
+RESPONSE=$(curl -k -s -D - -o - "https://localhost:8080/jobs/launch")
+
+# Split into HEADERS + BODY
+HEADERS=$(printf "%s" "$RESPONSE" | sed "/^\r$/q")
+BODY=$(printf "%s" "$RESPONSE" | sed "1,/^\r$/d")
+
+# Extract offset from header Last-Offset
+OFFSET=$(printf "%s" "$HEADERS" | grep -i "^Last-Offset:" | awk "{print \$2}" | tr -d "\r")
+
+if [ -z "$OFFSET" ]; then
+    echo "ERROR: Could not extract Last-Offset header."
+    exit 1
+fi
+
+echo "Offset returned = $OFFSET"
+
+# ================================
+# SET BOX VARIABLE (IMPORTANT)
+# ================================
+echo "set: OFFSET=$OFFSET"
+
+# Extract Location for status URL
+LOCATION=$(printf "%s" "$HEADERS" | grep -i "^Location:" | awk "{print \$2}" | tr -d "\r")
+JOB_ID=$(basename "$LOCATION")
+
+echo "Job ID: $JOB_ID"
+
+# Polling logic
+COUNT=0
+STATUS="RUNNING"
+
+while [ $COUNT -lt 60 ]
+do
+    sleep 15
+    STATUS=$(curl -k -s "$LOCATION")
+    echo "Status = $STATUS"
+    if [ "$STATUS" != "RUNNING" ]; then break; fi
+    COUNT=$((COUNT + 1))
+done
+
+if [ "$STATUS" != "COMPLETED" ]; then
+    echo "Job $JOB_ID failed with $STATUS"
+    exit 1
+fi
+
+echo "Job $JOB_ID completed successfully"
+exit 0
+'
+
+🟩 2️⃣ RETRY JOB SCRIPT (reads box variable OFFSET)
+
+This script:
+
+✔ Reads $OFFSET set by first job
+✔ Calls /launch?offset=$OFFSET
+✔ Polls exactly same
+✔ No global variables needed
+
+bash -c '
+# Read box variable
+OFFSET="$OFFSET"
+PARTITION=0
+
+if [ -z "$OFFSET" ]; then
+    echo "ERROR: Box variable OFFSET not found"
+    exit 1
+fi
+
+echo "Retry using offset: $OFFSET"
+
+# Call launch with offset
+RESPONSE=$(curl -k -s -D - -o - "https://localhost:8080/jobs/launch?offset=$OFFSET&partition=$PARTITION")
+
+HEADERS=$(printf "%s" "$RESPONSE" | sed "/^\r$/q")
+BODY=$(printf "%s" "$RESPONSE" | sed "1,/^\r$/d")
+
+LOCATION=$(printf "%s" "$HEADERS" | grep -i "^Location:" | awk "{print \$2}" | tr -d "\r")
+JOB_ID=$(basename "$LOCATION")
+
+echo "Retry Job ID: $JOB_ID"
+
+COUNT=0
+STATUS="RUNNING"
+
+while [ $COUNT -lt 60 ]
+do
+    sleep 15
+    STATUS=$(curl -k -s "$LOCATION")
+    echo "Retry Status = $STATUS"
+    if [ "$STATUS" != "RUNNING" ]; then break; fi
+    COUNT=$((COUNT + 1))
+done
+
+if [ "$STATUS" != "COMPLETED" ]; then
+    echo "Retry job failed with $STATUS"
+    exit 1
+fi
+
+echo "Retry completed successfully"
+exit 0
+'
