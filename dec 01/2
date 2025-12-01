@@ -1,0 +1,32 @@
+bash -c '
+HEADERS=$(curl -k -s -D - -o /dev/null -X POST "https://localhost:8080/jobs/launch");
+
+LOCATION=$(printf "%s" "$HEADERS" | grep -i "^Location:" | awk "{print \$2}" | tr -d "\r");
+
+EXECUTION_ID=$(basename "$LOCATION");
+
+COUNT=0;
+STATUS="RUNNING";
+
+echo "LAUNCH HEADERS: $HEADERS";
+echo "STATUS URL: $LOCATION";
+echo "EXECUTION_ID: $EXECUTION_ID";
+
+while [ $COUNT -lt 60 ]; do 
+    sleep 15; 
+    STATUS=$(curl -k -s "https://localhost:8080/jobs/executions/$EXECUTION_ID");  
+    if [ "$STATUS" != "RUNNING" ]; then 
+        break; 
+    fi; 
+    echo "Job execution: $EXECUTION_ID Status: $STATUS"; 
+    COUNT=$((COUNT + 1)); 
+done;
+
+if [ "$STATUS" != "COMPLETED" ]; then 
+    echo "Job execution $EXECUTION_ID failed with status $STATUS"; 
+    exit 1; 
+else 
+    echo "Job execution $EXECUTION_ID completed with status $STATUS"; 
+    exit 0; 
+fi;
+'
