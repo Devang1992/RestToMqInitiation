@@ -1,4 +1,5 @@
 OFFSET=$(echo "$HEADERS" | grep -i 'Last-Offset:' | cut -d':' -f2 | tr -d '\r' | xargs)
+LOCATION=$(echo "$HEADERS" | grep -i "Location:" | cut -d":" -f2 | tr -d "\r" | xargs);
 
 NORMAL JOB SCRIPT (stores box variable OFFSET)
 
