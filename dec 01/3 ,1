@@ -1,0 +1,59 @@
+bash -c '
+# 1️⃣ Make request and capture BOTH headers + body
+RESPONSE=$(curl -k -s -D - -o - "https://localhost:8080/jobs/launch")
+
+# 2️⃣ Split HEADERS and BODY
+HEADERS=$(printf "%s" "$RESPONSE" | sed "/^\r$/q")
+BODY=$(printf "%s" "$RESPONSE" | sed "1,/^\r$/d")
+
+echo "====== HEADERS ======"
+echo "$HEADERS"
+echo "====== BODY ========"
+echo "$BODY"
+
+# 3️⃣ Extract from headers
+LOCATION=$(printf "%s" "$HEADERS" | grep -i "^Location:" | awk "{print \$2}" | tr -d "\r")
+LAST_OFFSET=$(printf "%s" "$HEADERS" | grep -i "^Last-Offset:" | awk "{print \$2}" | tr -d "\r")
+
+# 4️⃣ Extract from body (optional)
+JOB_ID=$(printf "%s" "$BODY" | grep -o "\"jobExecutionId\":[0-9]*" | cut -d: -f2)
+
+# Fallback: If JOB_ID missing in body, extract from Location header
+if [ -z "$JOB_ID" ]; then
+    JOB_ID=$(basename "$LOCATION")
+fi
+
+echo "LOCATION: $LOCATION"
+echo "JOB_ID: $JOB_ID"
+echo "LAST_OFFSET: $LAST_OFFSET"
+
+# Save the retry offset
+if [ -n "$LAST_OFFSET" ]; then
+    sendevent -E SET_GLOBAL -G LAST_KAFKA_OFFSET -V "$LAST_OFFSET"
+    echo "Saved LAST_KAFKA_OFFSET = $LAST_OFFSET"
+fi
+
+# 5️⃣ Poll status
+COUNT=0
+STATUS="RUNNING"
+
+while [ $COUNT -lt 60 ]; do
+    sleep 15
+    STATUS=$(curl -k -s "https://localhost:8080/jobs/executions/$JOB_ID" )
+    echo "Job $JOB_ID status: $STATUS"
+
+    if [ "$STATUS" != "RUNNING" ]; then
+        break
+    fi
+    COUNT=$((COUNT + 1))
+done
+
+# 6️⃣ Final outcome
+if [ "$STATUS" != "COMPLETED" ]; then
+    echo "Job $JOB_ID FAILED with status $STATUS"
+    exit 1
+else
+    echo "Job $JOB_ID COMPLETED successfully"
+    exit 0
+fi
+'
