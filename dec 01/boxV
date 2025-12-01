@@ -112,3 +112,37 @@ fi
 echo "Retry completed successfully"
 exit 0
 '
+-------------------------------------------------------------------------
+bash -c "
+OFFSET=\$OFFSET
+PARTITION=0
+
+if [ -z \"\$OFFSET\" ]; then
+    echo \"ERROR: OFFSET box variable not found\"
+    exit 1
+fi
+
+RESPONSE=\$(curl -k -s -D - -o - \"https://localhost:8080/jobs/launch?offset=\$OFFSET&partition=\$PARTITION\")
+
+HEADERS=\$(printf \"%s\" \"\$RESPONSE\" | sed '/^\r\$/q')
+BODY=\$(printf \"%s\" \"\$RESPONSE\" | sed '1,/^\r\$/d')
+
+LOCATION=\$(printf \"%s\" \"\$HEADERS\" | grep -i '^Location:' | awk '{print \$2}' | tr -d '\r')
+JOB_ID=\$(basename \"\$LOCATION\")
+
+COUNT=0
+STATUS=RUNNING
+
+while [ \$COUNT -lt 60 ]; do
+    sleep 15
+    STATUS=\$(curl -k -s \"\$LOCATION\")
+    if [ \"\$STATUS\" != \"RUNNING\" ]; then break; fi
+    COUNT=\$((COUNT + 1))
+done
+
+if [ \"\$STATUS\" != \"COMPLETED\" ]; then
+    exit 1
+fi
+
+exit 0
+"
