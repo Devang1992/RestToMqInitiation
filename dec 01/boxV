@@ -1,3 +1,5 @@
+OFFSET=$(echo "$HEADERS" | grep -i 'Last-Offset:' | cut -d':' -f2 | tr -d '\r' | xargs)
+
 NORMAL JOB SCRIPT (stores box variable OFFSET)
 
 This script:
