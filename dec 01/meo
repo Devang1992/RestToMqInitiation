@@ -1,3 +1,6 @@
+bash -c 'RES=$(curl -k -s -D - -X POST "https://localhost:8080/jobs/launch?offset=$OFFSET&partition=$PARTITION"); BODY=$(echo "$RES" | tail -1 | tr -d "\r\n"); JOB_ID=$BODY; OFFSET=$(echo "$RES" | grep -i "Last-Offset:" | sed "s/.*Last-Offset:[ ]*//" | tr -d "\r\n"); echo "Job ID = $JOB_ID"; echo "Offset returned = $OFFSET"; if [ -z "$JOB_ID" ]; then echo "ERROR: missing JOB_ID"; exit 1; fi; if [ -z "$OFFSET" ]; then echo "ERROR: missing Last-Offset"; exit 1; fi; exit 0'
+
+
 bash -c 'OFFSET=$I_OFFSET; PARTITION=0; 
 if [ -z "$OFFSET" ]; then echo "ERROR: Missing OFFSET"; exit 1; fi; 
 echo "Retry using offset: $OFFSET"; 
