@@ -1,0 +1,56 @@
+bash -c '
+# 1️⃣ Call /launch and capture ONLY headers in a variable
+HEADERS=$(curl -k -s -D - -o /dev/null -X POST "https://localhost:8080/jobs/launch");
+
+echo "======= HEADERS RECEIVED ======="
+echo "$HEADERS"
+echo "================================"
+
+# 2️⃣ Extract Location header
+LOCATION=$(printf "%s" "$HEADERS" | grep -i "^Location:" | awk "{print \$2}" | tr -d "\r")
+
+# 3️⃣ Extract Last-Offset header (your chosen header name)
+LAST_OFFSET=$(printf "%s" "$HEADERS" | grep -i "^Last-Offset:" | awk "{print \$2}" | tr -d "\r")
+
+# 4️⃣ Extract EXECUTION_ID from Location URL (e.g., /executions/123)
+EXECUTION_ID=$(basename "$LOCATION")
+
+echo "LOCATION:     $LOCATION"
+echo "EXECUTION_ID: $EXECUTION_ID"
+echo "LAST_OFFSET:  $LAST_OFFSET"
+
+# 5️⃣ Save LAST_OFFSET into Autosys Global Variable
+if [ -n "$LAST_OFFSET" ]; then
+    sendevent -E SET_GLOBAL -G LAST_KAFKA_OFFSET -V "$LAST_OFFSET"
+    echo "Saved LAST_KAFKA_OFFSET = $LAST_OFFSET"
+else
+    echo "WARNING: Last-Offset header not found!"
+fi
+
+# 6️⃣ Poll job status until not RUNNING or timeout
+COUNT=0
+STATUS="RUNNING"
+
+while [ $COUNT -lt 60 ]; do 
+    sleep 15
+
+    STATUS=$(curl -k -s "https://localhost:8080/jobs/executions/$EXECUTION_ID")
+
+    echo "Job execution $EXECUTION_ID status: $STATUS"
+
+    if [ "$STATUS" != "RUNNING" ]; then
+        break
+    fi
+
+    COUNT=$((COUNT + 1))
+done
+
+# 7️⃣ Final evaluation
+if [ "$STATUS" != "COMPLETED" ]; then 
+    echo "Job execution $EXECUTION_ID FAILED with status $STATUS"
+    exit 1
+else 
+    echo "Job execution $EXECUTION_ID COMPLETED successfully with status $STATUS"
+    exit 0
+fi
+'
