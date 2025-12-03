@@ -1,0 +1,44 @@
+@Bean
+public Step commitKafka(KafkaConsumer<String, String> consumer,
+                        JobRepository jobRepository,
+                        PlatformTransactionManager transactionManager) {
+
+    return new StepBuilder("commitKafka", jobRepository)
+        .tasklet((contribution, chunkContext) -> {
+
+            JobExecution jobExecution =
+                    chunkContext.getStepContext().getStepExecution().getJobExecution();
+
+            // Fetch previous step execution for transferFiles
+            StepExecution transferFilesStep =
+                    jobExecution.getStepExecutions().stream()
+                        .filter(se -> "transferFiles".equals(se.getStepName()))
+                        .findFirst()
+                        .orElse(null);
+
+            if (transferFilesStep == null) {
+                log.error("transferFiles step not found – NOT committing Kafka offsets!");
+                return null;
+            }
+
+            // ✔ Check if transferFiles failed
+            if (transferFilesStep.getStatus().isUnsuccessful()) {
+                log.error("transferFiles FAILED – NOT committing Kafka offsets!");
+                return null; // do not commit
+            }
+
+            // ✔ Check if transferFiles had exceptions
+            if (!transferFilesStep.getFailureExceptions().isEmpty()) {
+                log.error("transferFiles threw exception – NOT committing Kafka offsets!");
+                return null;
+            }
+
+            // If we reach here: everything OK → commit
+            log.info("transferFiles SUCCEEDED – committing Kafka offsets.");
+            consumer.commitSync();
+
+            return null;
+        })
+        .transactionManager(transactionManager)
+        .build();
+}
