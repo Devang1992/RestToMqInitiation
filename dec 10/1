@@ -1,0 +1,175 @@
+FINAL IMPLEMENTATION
+Dynamic Delay + Exponential Backoff + No @KafkaListener
+
+We will:
+
+Define the business listener
+
+Wrap it with DynamicBackoffDelayedMessageListener
+
+Create a ConcurrentMessageListenerContainer bean
+
+This matches Kafka Streams–style programmatic control but in Spring Kafka.
+
+1️⃣ Your Business Listener (same as before)
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.springframework.kafka.listener.MessageListener;
+
+public class ProcessListener implements MessageListener<String, String> {
+
+    @Override
+    public void onMessage(ConsumerRecord<String, String> record) {
+        System.out.println("Processing message: " + record.value());
+
+        if (record.value().contains("fail")) {
+            throw new RuntimeException("Simulated failure!");
+        }
+    }
+}
+
+2️⃣ Custom Wrapper (dynamic delay + backoff)
+
+(same logic as before — unchanged)
+
+public class DynamicBackoffDelayedMessageListener<K, V> implements MessageListener<K, V> {
+    private final MessageListener<K, V> delegate;
+    private final long baseBackoffMs;
+    private final int maxAttempts;
+    private final RetryProducer retryProducer;
+
+    public DynamicBackoffDelayedMessageListener(
+            MessageListener<K, V> delegate,
+            long baseBackoffMs,
+            int maxAttempts,
+            RetryProducer retryProducer) {
+
+        this.delegate = delegate;
+        this.baseBackoffMs = baseBackoffMs;
+        this.maxAttempts = maxAttempts;
+        this.retryProducer = retryProducer;
+    }
+
+    @Override
+    public void onMessage(ConsumerRecord<K, V> record) {
+        try {
+            long now = System.currentTimeMillis();
+            long targetTimestamp = getTargetTimestamp(record);
+            long delay = Math.max(targetTimestamp - now, 0);
+
+            if (delay > 0) {
+                Thread.sleep(delay);
+            }
+
+            delegate.onMessage(record);
+
+        } catch (Exception ex) {
+            handleFailure(record, ex);
+        }
+    }
+
+    private long getTargetTimestamp(ConsumerRecord<K, V> record) {
+        var header = record.headers().lastHeader("targetTimestamp");
+        if (header == null) return System.currentTimeMillis();
+        return Long.parseLong(new String(header.value()));
+    }
+
+    private int getRetryAttempt(ConsumerRecord<K, V> record) {
+        var h = record.headers().lastHeader("retryAttempt");
+        if (h == null) return 0;
+        return Integer.parseInt(new String(h.value()));
+    }
+
+    private void handleFailure(ConsumerRecord<K, V> record, Exception ex) {
+        int attempt = getRetryAttempt(record);
+
+        if (attempt >= maxAttempts) {
+            retryProducer.sendToDlq(record, ex);
+            return;
+        }
+
+        long nextDelay = (long) (baseBackoffMs * Math.pow(2, attempt));
+        long nextTargetTimestamp = System.currentTimeMillis() + nextDelay;
+
+        retryProducer.sendRetry(record, attempt + 1, nextTargetTimestamp);
+    }
+}
+
+3️⃣ Programmatic Kafka Listener Container (NO @KafkaListener)
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+import org.springframework.kafka.listener.ConcurrentMessageListenerContainer;
+import org.springframework.kafka.listener.ContainerProperties;
+
+import java.util.Map;
+
+@Configuration
+public class DynamicBackoffListenerConfig {
+
+    @Bean
+    public ConcurrentMessageListenerContainer<String, String> dynamicBackoffContainer(
+            RetryProducer retryProducer) {
+
+        // 1 — build real business listener
+        ProcessListener businessListener = new ProcessListener();
+
+        // 2 — wrap it with dynamic delay + backoff logic
+        DynamicBackoffDelayedMessageListener<String, String> delayedListener =
+                new DynamicBackoffDelayedMessageListener<>(
+                        businessListener,
+                        5_000,   // base backoff
+                        5,       // max attempts
+                        retryProducer);
+
+        // 3 — set container properties
+        ContainerProperties containerProps = new ContainerProperties("main-topic");
+
+        containerProps.setMessageListener(delayedListener);
+        containerProps.setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
+
+        // 4 — consumer configuration
+        Map<String, Object> consumerProps = Map.of(
+                ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092",
+                ConsumerConfig.GROUP_ID_CONFIG, "dynamic-delay-cg",
+                ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
+                ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
+                ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest"
+        );
+
+        var consumerFactory = new DefaultKafkaConsumerFactory<String, String>(consumerProps);
+
+        // 5 — create container
+        ConcurrentMessageListenerContainer<String, String> container =
+                new ConcurrentMessageListenerContainer<>(consumerFactory, containerProps);
+
+        container.setConcurrency(1); // increase partitions => increase concurrency
+        container.start();
+
+        return container;
+    }
+}
+
+⭐ WHY THIS IS BETTER THAN @KafkaListener
+Feature	@KafkaListener	Programmatic Container
+Custom delay logic	❌ Hard	✅ Full control
+Custom backoff	❌ Not clean	✅ Built-in to wrapper
+Start/stop dynamically	🟡 Possible but hacky	🟢 Very easy
+Multiple pipelines	❌ Requires multiple methods	✅ Just define more beans
+Tuning partitions & concurrency	🟡 Limited	🟢 Granular
+Supplying custom listeners	❌ Complicated	🟢 Native
+
+This is how enterprise, banking, and payments systems do delayed consumers.
+
+OPTIONAL ADD-ONS I CAN GENERATE FOR YOU
+
+Do you want:
+
+🔹 A version that supports pausing/resuming consumer fetches?
+🔹 A version that supports retry topic + scheduled processing?
+🔹 A version that reads dynamic delay from configuration or message body?
+🔹 A version that scans headers for X-Delay-Ms automatically?
+🔹 A version that uses TaskExecutor so the consumer thread never blocks?
+
+Tell me which one — I can generate the complete clean system for it.
