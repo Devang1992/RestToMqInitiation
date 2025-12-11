@@ -1,0 +1,264 @@
+Topic Creation (1 Partition Each) — via Spring Boot Code
+KafkaTopicConfig.java
+@Configuration
+public class KafkaTopicConfig {
+
+    @Bean
+    public KafkaAdmin kafkaAdmin() {
+        return new KafkaAdmin(
+                Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092")
+        );
+    }
+
+    @Bean
+    public NewTopic mainTopic() {
+        return TopicBuilder.name("main-topic")
+                .partitions(1)
+                .replicas(1)
+                .build();
+    }
+
+    @Bean
+    public NewTopic errorTopic() {
+        return TopicBuilder.name("error-topic")
+                .partitions(1)
+                .replicas(1)
+                .build();
+    }
+
+    @Bean
+    public NewTopic retryTopic() {
+        return TopicBuilder.name("retry-topic")
+                .partitions(1)
+                .replicas(1)
+                .config("retention.ms", "900000")  // 15 minutes
+                .config("segment.ms", "900000")
+                .config("cleanup.policy", "delete")
+                .build();
+    }
+
+    @Bean
+    public NewTopic dlqTopic() {
+        return TopicBuilder.name("dlq-topic")
+                .partitions(1)
+                .replicas(1)
+                .build();
+    }
+}
+
+✅ 2. Consumer Configuration (NO Listeners)
+
+We use KafkaConsumer bean + @PostConstruct loop in a thread.
+
+KafkaConsumerConfig.java
+@Configuration
+public class KafkaConsumerConfig {
+
+    @Bean
+    public Properties consumerProps() {
+        Properties props = new Properties();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "retry-consumer-group");
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest");  // CRITICAL for delay-topic
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+        return props;
+    }
+
+    @Bean
+    public KafkaConsumer<String, String> retryKafkaConsumer(Properties consumerProps) {
+        return new KafkaConsumer<>(consumerProps);
+    }
+}
+
+✅ 3. Retry Consumer as a Bean (runs in its own thread)
+
+This consumer handles delay + retry + DLQ, all in one place.
+
+RetryConsumerService.java
+@Service
+public class RetryConsumerService {
+
+    private final KafkaConsumer<String, String> consumer;
+    private final KafkaTemplate<String, String> producer;
+
+    private static final long MAX_RETRY_WINDOW = 2 * 60 * 60 * 1000; // 2 hours
+    private static final int MAX_ATTEMPTS = 8;
+
+    public RetryConsumerService(KafkaConsumer<String, String> consumer,
+                                KafkaTemplate<String, String> producer) {
+        this.consumer = consumer;
+        this.producer = producer;
+    }
+
+    @PostConstruct
+    public void startRetryConsumer() {
+        consumer.subscribe(List.of("retry-topic"));
+
+        Thread thread = new Thread(() -> {
+            System.out.println("Retry Consumer Started...");
+
+            while (true) {
+                ConsumerRecords<String, String> records = consumer.poll(Duration.ofSeconds(1));
+
+                for (ConsumerRecord<String, String> rec : records) {
+                    handleRetryMessage(rec);
+                }
+
+                consumer.commitAsync();
+            }
+        });
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void handleRetryMessage(ConsumerRecord<String, String> record) {
+
+        long now = System.currentTimeMillis();
+        int retryCount = getHeaderInt(record, "retryCount", 0);
+        long firstFailureTs = getHeaderLong(record, "firstFailureTs", now);
+
+        // 2-hour window OR max attempts reached?
+        if (retryCount >= MAX_ATTEMPTS || (now - firstFailureTs) >= MAX_RETRY_WINDOW) {
+            sendToDlq(record);
+            return;
+        }
+
+        // 🔄 Send back to main-topic for retry
+        sendBackToMain(record.value(), record.key(), retryCount, firstFailureTs);
+    }
+
+    private void sendBackToMain(String value, String key, int retryCount, long firstFailureTs) {
+        ProducerRecord<String, String> newRecord =
+                new ProducerRecord<>("main-topic", key, value);
+
+        newRecord.headers().add("retryCount", String.valueOf(retryCount).getBytes());
+        newRecord.headers().add("firstFailureTs", String.valueOf(firstFailureTs).getBytes());
+
+        producer.send(newRecord);
+        System.out.println("Retry → main-topic, retryCount=" + retryCount);
+    }
+
+    private void sendToDlq(ConsumerRecord<String, String> record) {
+        producer.send("dlq-topic", record.key(), record.value());
+        System.out.println("Moved to DLQ");
+    }
+
+    private int getHeaderInt(ConsumerRecord<String, String> rec, String key, int defaultVal) {
+        try {
+            Header h = rec.headers().lastHeader(key);
+            return h == null ? defaultVal : Integer.parseInt(new String(h.value()));
+        } catch (Exception e) {
+            return defaultVal;
+        }
+    }
+
+    private long getHeaderLong(ConsumerRecord<String, String> rec, String key, long defaultVal) {
+        try {
+            Header h = rec.headers().lastHeader(key);
+            return h == null ? defaultVal : Long.parseLong(new String(h.value()));
+        } catch (Exception e) {
+            return defaultVal;
+        }
+    }
+}
+
+✅ 4. Error Consumer (Manual Consumer Bean)
+
+Takes errors → moves them to retry-topic.
+
+ErrorConsumerService.java
+@Service
+public class ErrorConsumerService {
+
+    private final KafkaTemplate<String, String> producer;
+    private final KafkaConsumer<String, String> errorConsumer;
+
+    public ErrorConsumerService(KafkaTemplate<String, String> producer) {
+        this.producer = producer;
+
+        Properties props = new Properties();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "error-handler-group");
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+
+        this.errorConsumer = new KafkaConsumer<>(props);
+    }
+
+    @PostConstruct
+    public void startErrorConsumer() {
+        errorConsumer.subscribe(List.of("error-topic"));
+
+        Thread thread = new Thread(() -> {
+            System.out.println("Error Consumer Started...");
+
+            while (true) {
+                ConsumerRecords<String, String> records = errorConsumer.poll(Duration.ofSeconds(1));
+
+                for (ConsumerRecord<String, String> rec : records) {
+                    forwardToRetry(rec);
+                }
+
+                errorConsumer.commitAsync();
+            }
+        });
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void forwardToRetry(ConsumerRecord<String, String> record) {
+        long now = System.currentTimeMillis();
+        int retryCount = 1;
+
+        ProducerRecord<String, String> retryRecord =
+                new ProducerRecord<>("retry-topic", record.key(), record.value());
+
+        retryRecord.headers().add("retryCount", String.valueOf(retryCount).getBytes());
+        retryRecord.headers().add("firstFailureTs", String.valueOf(now).getBytes());
+
+        producer.send(retryRecord);
+        System.out.println("Error → Retry");
+    }
+}
+
+⭐ IMPORTANT — WHY THIS WORKS FOR DELAY
+1. You don’t sleep or block consumer thread
+2. Kafka retention = 15-minute delay system
+3. auto-offset-reset=latest = consumer sees message only after retention window
+4. Works even if consumer is always running
+5. Works even after app crash
+
+Kafka acts as:
+
+A durable message timer that survives restart and requires zero scheduling logic.
+
+🎉 Your Final Architecture With Manual Consumers
+main-consumer (manual poll)
+        |
+        |-- failure --> error-topic
+                           |
+                           V
+                error-consumer (manual poll)
+                           |
+                           V
+                     retry-topic  (15 min retention)
+                           |
+                           V
+                retry-consumer (manual poll)
+                     |
+                     |-- if retry < 8 & < 2h --> main-topic
+                     |
+                     |-- else --> dlq-topic
+
+🔥 If you want next:
+✔ Add resilience (graceful shutdown)
+✔ Add metrics
+✔ Add Kafka transaction support
+✔ Add AOP around retryCount
+✔ Add JSON/Avro specific serdes
+✔ Provide full docker-compose + test scripts
+
+Just tell me.
