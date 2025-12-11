@@ -1,0 +1,161 @@
+BUT FIRST: IMPORTANT KAFKA RULE
+
+Kafka expects consumers to poll frequently enough to send heartbeats and avoid consumer group rebalances.
+
+If you poll once every 10 minutes, Kafka will kick your consumer out of the group unless you adjust timeouts.
+
+You MUST increase:
+max.poll.interval.ms
+session.timeout.ms
+heartbeat.interval.ms
+
+
+I will configure these properly below.
+
+✅ GOAL
+
+Create a Spring Boot bean that:
+
+✔ Is a KafkaConsumer<String, String>
+✔ Polls once every 10 minutes
+✔ Processes any messages that are ready
+✔ Does NOT get kicked out of consumer group
+✔ Supports safe shutdown
+
+✅ 1. Kafka Consumer Bean Config
+KafkaConsumerConfig.java
+@Configuration
+public class KafkaConsumerConfig {
+
+    @Bean
+    public KafkaConsumer<String, String> delayedKafkaConsumer() {
+        Properties props = new Properties();
+
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "delayed-consumer-group");
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+
+        // IMPORTANT FOR POLLING EVERY 10 MINUTES
+        props.put(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, 15 * 60 * 1000); // 15 minutes
+        props.put(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, 30000);
+        props.put(ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG, 8000);
+
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest");
+
+        return new KafkaConsumer<>(props);
+    }
+}
+
+✅ 2. Scheduled Polling Every 10 Minutes
+
+Spring's scheduler is ideal for this.
+
+Enable scheduling
+@SpringBootApplication
+@EnableScheduling
+public class App { }
+
+✅ 3. Scheduled Kafka Poller Bean
+DelayedKafkaPoller.java
+@Service
+public class DelayedKafkaPoller {
+
+    private final KafkaConsumer<String, String> consumer;
+
+    public DelayedKafkaPoller(KafkaConsumer<String, String> consumer) {
+        this.consumer = consumer;
+        this.consumer.subscribe(List.of("retry-topic")); // or any topic
+    }
+
+    // Run every 10 minutes
+    @Scheduled(fixedRate = 10 * 60 * 1000)
+    public void pollKafka() {
+        System.out.println("Polling Kafka...");
+
+        ConsumerRecords<String, String> records =
+                consumer.poll(Duration.ofSeconds(5));
+
+        for (ConsumerRecord<String, String> rec : records) {
+            System.out.println("Received: " + rec.value());
+            // process message here...
+        }
+
+        consumer.commitSync();
+    }
+}
+
+🔥 How this works
+✔ App starts → consumer subscribes
+✔ Every 10 minutes → poll is executed
+✔ If a message is ready → consumer receives it
+✔ Offsets committed after processing
+✔ No thread blocking / sleeping
+✔ Works perfectly with delay-topic retention strategy
+✔ Kafka does NOT kick the consumer because:
+
+You configured:
+
+max.poll.interval.ms = 15 minutes
+
+
+So polling every 10 minutes is allowed.
+
+🚨 VERY IMPORTANT
+
+Default max.poll.interval.ms is 5 minutes, so if you poll every 10 minutes without changing it:
+
+➡ Kafka thinks your consumer is dead
+➡ Triggers a rebalance
+➡ You lose your partition
+
+You MUST override it as shown.
+
+⭐ TIMELINE EXAMPLE
+
+T = 0 → consumer started
+
+T = 10 min → poll
+
+T = 20 min → poll
+
+T = 30 min → poll
+
+Messages in retry-topic (with retention = 15 min) naturally “mature”
+and become readable during the next scheduled poll.
+
+🟦 Optional: Poll Once, Sleep for 10 Minutes Manually
+
+Alternative implementation using a background thread:
+
+@PostConstruct
+public void start() {
+    new Thread(() -> {
+        while (true) {
+            ConsumerRecords<String, String> recs = consumer.poll(Duration.ofSeconds(5));
+            process(recs);
+            consumer.commitSync();
+
+            Thread.sleep(10 * 60 * 1000);
+        }
+    }).start();
+}
+
+
+❌ Less recommended
+Because using @Scheduled keeps everything managed cleanly by Spring.
+
+🎉 FINAL ANSWER
+
+Yes — you can create a KafkaConsumer bean and poll it every 10 minutes in Spring Boot.
+
+Use:
+
+KafkaConsumer bean (manual consumer)
+
+@Scheduled(fixedRate = 10 min) poll method
+
+max.poll.interval.ms = 15 min
+
+This is the correct pattern for delayed processing without blocking.
