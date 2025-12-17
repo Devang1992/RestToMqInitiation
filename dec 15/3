@@ -1,0 +1,190 @@
+ErrorProcessorTest.java
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.kafka.common.header.internals.RecordHeader;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.serialization.StringSerializer;
+import org.apache.kafka.streams.*;
+import org.apache.kafka.streams.processor.api.ProcessorContext;
+import org.apache.kafka.streams.test.TestRecord;
+import org.junit.jupiter.api.*;
+import org.mockito.Mockito;
+import org.springframework.kafka.support.serializer.JsonDeserializer;
+import org.springframework.kafka.support.serializer.JsonSerializer;
+
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.*;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+class ErrorProcessorTest {
+
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    private TopologyTestDriver testDriver;
+    private TestInputTopic<String, JsonNode> inputTopic;
+    private TestOutputTopic<String, JsonNode> outputTopic;
+
+    private final String INPUT = "inputTopic";
+    private final String OUTPUT = "outputTopic";
+
+    private MessageRetryProperties retryProps;
+
+    @BeforeEach
+    void setup() {
+        retryProps = new MessageRetryProperties();
+        retryProps.setRetryCheckInterval(Duration.ofMinutes(1)); // 1 min
+        retryProps.setMaxErrorRetries(3);
+
+        StreamsBuilder builder = new StreamsBuilder();
+        ErrorProcessorSupplier<String, JsonNode> supplier = new ErrorProcessorSupplier<>(retryProps);
+
+        KStream<String, JsonNode> stream = builder.stream(INPUT);
+        stream.process(supplier).to(OUTPUT);
+
+        testDriver = new TopologyTestDriver(builder.build(), getConfig());
+
+        JsonDeserializer<JsonNode> valueDeserializer = new JsonDeserializer<>(JsonNode.class);
+        valueDeserializer.addTrustedPackages("*");
+        valueDeserializer.ignoreTypeHeaders();
+
+        inputTopic = testDriver.createInputTopic(
+                INPUT,
+                new StringSerializer(),
+                new JsonSerializer<>()
+        );
+
+        outputTopic = testDriver.createOutputTopic(
+                OUTPUT,
+                new StringDeserializer(),
+                valueDeserializer
+        );
+    }
+
+    @AfterEach
+    void tearDown() {
+        if (testDriver != null) testDriver.close();
+    }
+
+    // -----------------------------------------------------------------------
+    // 1️⃣ TEST: FUTURE TIMESTAMP → SHOULD BE STORED & NOT FORWARDED
+    // -----------------------------------------------------------------------
+    @Test
+    void shouldStoreRecordWhenRetryTimestampInFuture() {
+        long retryAt = System.currentTimeMillis() + 60000; // +1 min
+
+        JsonNode value = mapper.createObjectNode().put("msg", "hello");
+
+        TestRecord<String, JsonNode> record = new TestRecord<>(
+                "1",
+                value,
+                List.of(
+                        new RecordHeader("MID", "1".getBytes()),
+                        new RecordHeader("RETRY_TIMESTAMP", String.valueOf(retryAt).getBytes())
+                )
+        );
+
+        inputTopic.pipeInput(record);
+
+        assertThat(outputTopic.isEmpty()).isTrue(); // NOT forwarded yet
+    }
+
+    // -----------------------------------------------------------------------
+    // 2️⃣ TEST: EXPIRED TIMESTAMP → FORWARD IMMEDIATELY
+    // -----------------------------------------------------------------------
+    @Test
+    void shouldForwardImmediatelyWhenRetryTimestampExpired() {
+        long retryAt = System.currentTimeMillis() - 5000;
+
+        JsonNode value = mapper.createObjectNode().put("msg", "hello");
+
+        TestRecord<String, JsonNode> record = new TestRecord<>(
+                "2",
+                value,
+                List.of(
+                        new RecordHeader("MID", "2".getBytes()),
+                        new RecordHeader("RETRY_TIMESTAMP", String.valueOf(retryAt).getBytes())
+                )
+        );
+
+        inputTopic.pipeInput(record);
+
+        TestRecord<String, JsonNode> out = outputTopic.readRecord();
+        assertThat(out).isNotNull();
+        assertThat(out.key()).isEqualTo("2");
+    }
+
+    // -----------------------------------------------------------------------
+    // 3️⃣ TEST: FUTURE TIMESTAMP, ADVANCE TIME → SHOULD FORWARD
+    // -----------------------------------------------------------------------
+    @Test
+    void shouldForwardStoredRecordWhenPunctuatorTriggers() {
+        long retryAt = System.currentTimeMillis() + 2000; // 2 seconds ahead
+
+        JsonNode value = mapper.createObjectNode().put("msg", "delayed");
+
+        TestRecord<String, JsonNode> record = new TestRecord<>(
+                "3",
+                value,
+                List.of(
+                        new RecordHeader("MID", "3".getBytes()),
+                        new RecordHeader("RETRY_TIMESTAMP", String.valueOf(retryAt).getBytes())
+                )
+        );
+
+        inputTopic.pipeInput(record);
+
+        assertThat(outputTopic.isEmpty()).isTrue(); // not yet forwarded
+
+        // advance time enough to trigger punctuator
+        testDriver.advanceWallClockTime(Duration.ofMinutes(1));
+
+        TestRecord<String, JsonNode> out = outputTopic.readRecord();
+        assertThat(out).isNotNull();
+        assertThat(out.key()).isEqualTo("3");
+    }
+
+    // -----------------------------------------------------------------------
+    // 4️⃣ TEST: RETRY COUNT EXCEEDED → SHOULD FORWARD TO OUTPUT WITH ERROR HEADER
+    // -----------------------------------------------------------------------
+    @Test
+    void shouldForwardToDlqWhenRetryExceeded() {
+        JsonNode value = mapper.createObjectNode().put("msg", "fail");
+
+        TestRecord<String, JsonNode> record = new TestRecord<>(
+                "4",
+                value,
+                List.of(
+                        new RecordHeader("MID", "4".getBytes()),
+                        new RecordHeader("RETRY_TIMESTAMP", String.valueOf(System.currentTimeMillis()).getBytes()),
+                        new RecordHeader("RETRY_COUNT", "5".getBytes()) // > max retries = 3
+                )
+        );
+
+        inputTopic.pipeInput(record);
+
+        TestRecord<String, JsonNode> out = outputTopic.readRecord();
+
+        assertThat(out).isNotNull();
+        assertThat(out.key()).isEqualTo("4");
+
+        // DLQ behavior = ERROR_CODE header set
+        String errorCode = new String(out.headers().lastHeader("ERROR_CODE").value(), StandardCharsets.UTF_8);
+        assertThat(errorCode).isNotBlank();
+    }
+
+    // -----------------------------------------------------------------------
+    // UTILITIES
+    // -----------------------------------------------------------------------
+
+    private Properties getConfig() {
+        Properties props = new Properties();
+        props.put(StreamsConfig.APPLICATION_ID_CONFIG, "error-test-app");
+        props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "dummy:9092");
+        props.put(StreamsConfig.STATE_DIR_CONFIG, TestUtils.tempDirectory().getAbsolutePath());
+        props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass().getName());
+        props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, JsonSerde.class.getName());
+        return props;
+    }
+}
