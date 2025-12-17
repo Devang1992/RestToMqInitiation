@@ -1,0 +1,61 @@
+class ErrorConsumerTest {
+
+    private TopologyTestDriver driver;
+    private TestInputTopic<String, JsonNode> in;
+    private TestOutputTopic<String, JsonNode> out;
+
+    @BeforeEach
+    void setup() {
+        // Mock props → only allow E100
+        MessageRetryProperties props = Mockito.mock(MessageRetryProperties.class);
+        Mockito.when(props.getErrorCodes()).thenReturn(Set.of("E100"));
+
+        // No-op processor
+        ErrorProcessorSupplier<String, JsonNode> processor = Mockito.mock(ErrorProcessorSupplier.class);
+        Mockito.when(processor.get()).thenReturn(new AbstractProcessor<>() {
+            @Override public void process(String key, JsonNode value) {}
+        });
+
+        // Dynamic topic extractor → always write to "allowed-out"
+        DynamicTopicNameExtractor extractor = Mockito.mock(DynamicTopicNameExtractor.class);
+        Mockito.when(extractor.extract(Mockito.any(), Mockito.any(), Mockito.any()))
+                .thenReturn("allowed-out");
+
+        StreamsBuilder b = new StreamsBuilder();
+        KStream<String, JsonNode> input = b.stream("error-in");
+        new ErrorConsumer(props, processor, extractor).accept(input);
+
+        Properties cfg = new Properties();
+        cfg.put(StreamsConfig.APPLICATION_ID_CONFIG, "t");
+        cfg.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "x:123");
+
+        driver = new TopologyTestDriver(b.build(), cfg);
+
+        in = driver.createInputTopic("error-in",
+                Serdes.String().serializer(),
+                new JsonSerde<>(JsonNode.class).serializer());
+
+        out = driver.createOutputTopic("allowed-out",
+                Serdes.String().deserializer(),
+                new JsonSerde<>(JsonNode.class).deserializer());
+    }
+
+    @Test
+    void allowedKey_flowsDownstream() {
+        JsonNode v = new ObjectMapper().createObjectNode().put("msg", "ok");
+
+        in.pipeInput("E100", v);  // ALLOWED
+
+        assertThat(out.isEmpty()).isFalse();
+        assertThat(out.readKeyValue().key).isEqualTo("E100");
+    }
+
+    @Test
+    void disallowedKey_filteredOut() {
+        JsonNode v = new ObjectMapper().createObjectNode().put("msg", "nope");
+
+        in.pipeInput("BAD", v);   // NOT allowed
+
+        assertThat(out.isEmpty()).isTrue();
+    }
+}
