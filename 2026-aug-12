@@ -15,3 +15,69 @@ Header Filter: Account for PP/GPP, and US/CANADA?
 			UMP templates
 			
 	Canadian Templates:
+
+
+
+f the meeting is short, these are the ones I would personally make sure you leave with answers to:
+
+    What RightFax version are we running, and does our installation/licence expose a supported REST/Web API?
+
+    Can PANTS submit a fax synchronously through that API, and can we get the API documentation/OpenAPI/Postman collection?
+
+    What does a successful API response mean: accepted/queued or actually delivered?
+
+    What fax/job ID is returned?
+
+    Can PANTS provide our Kafka MID as a client reference/idempotency key so retrying cannot create a duplicate fax?
+
+    How do we obtain final delivery status—polling API, webhook/callback, or something else?
+
+    Which failures should PANTS retry versus RightFax itself retry?
+
+    What are the API rate/concurrency limits, maximum document size/pages, and supported formats?
+
+    What authentication, TLS, firewall, certificates, hostname and ports are required?
+
+    Can DEV/SIT/PAT use non-production endpoints/accounts and test fax numbers without actually sending real faxes?
+
+    What are the API availability/SLA and recommended connection/read timeout and backoff values?
+
+    Can they provide the full API error-code/error-body catalogue?
+
+If they answer those properly, we'll have enough information to make a real decision between:
+
+CURRENT / BATCH
+
+Kafka
+ ↓
+PANTS Batch
+ ↓
+File
+ ↓
+TIBCO / SFTP
+ ↓
+RightFax
+
+and:
+
+PROPOSED / REAL TIME
+
+Kafka
+ ↓
+Live Consumer / Kafka Streams
+ ↓
+Header filter
+ ↓
+Map document
+ ↓
+Circuit Breaker
+ ↓
+RightFax REST API
+ ↓
+RightFax Job ID
+ ↓
+Status tracking
+ ↓
+Success / Retry / DLQ
+
+And given what we've been designing, the three things I would listen hardest for are idempotency/client reference, final status mechanism, and API throughput/rate limits. Those three answers materially determine how we should build the Kafka side. 
