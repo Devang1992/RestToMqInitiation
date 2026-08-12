@@ -1,0 +1,17 @@
+Header Filter: Account for PP/GPP, and US/CANADA?
+  
+  So two filters: GPP/PP and Email/Fax/Mail - can they be together? does that make any difference? 
+  
+  Mail Adapter:
+  	PP Templates:
+  		Mail:
+  			Broadridge Templates
+	GPP Templates:
+		Mail:
+			Broadridge Templates
+		Fax:
+			Rightfax Templates
+		Email:
+			UMP templates
+			
+	Canadian Templates:
