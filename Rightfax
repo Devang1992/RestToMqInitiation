@@ -1,0 +1,50 @@
+Implement real-time RightFax submission from Kafka.
+
+Flow:
+Kafka message
+→ filter for FAX messages
+→ deserialize/validate payload
+→ render the fax document using the existing Handlebars template approach
+→ generate a PDF fully in memory, preferably using HTML → PDF conversion with OpenHTMLToPDF
+→ keep the result as byte[] / ByteArrayOutputStream; do not write a temporary PDF to disk
+→ call the RightFax REST API using WebClient and multipart/form-data
+→ attach the generated PDF
+→ include destination fax number and Kafka MID/client reference
+→ use MID as idempotency key if RightFax supports it
+→ RightFax returns a fax/job ID
+→ persist or otherwise correlate MID ↔ RightFax fax ID
+→ later call RightFax GET status endpoint using that ID until final status is known
+
+Suggested structure:
+
+FaxMessage
+  ↓
+FaxTemplateService
+  - uses Handlebars
+  - returns HTML String
+
+PdfService
+  - converts HTML to PDF
+  - returns byte[]
+
+RightFaxClient
+  - POST multipart request
+  - PDF attachment
+  - fax number
+  - client reference / MID
+  - Idempotency-Key header if supported
+  - returns RightFax fax ID/status
+
+FaxStatusService
+  - GET RightFax status by fax ID
+  - handles QUEUED / SENDING / DELIVERED / FAILED states
+
+Important design points:
+- No SFTP or flat-file output is required for the new REST flow.
+- No temporary PDF file should be created unless unavoidable.
+- Add strict connection/read timeouts.
+- Protect the RightFax API call with the existing circuit breaker pattern.
+- Retry only transient failures such as timeout, 429, 5xx.
+- Permanent errors such as invalid request/fax number should go to failure/DLQ handling.
+- The REST call is outside the Kafka transaction, so idempotency using MID is important.
+- A successful POST likely means the fax was accepted/queued, not necessarily delivered; final delivery status must come from the GET status API.
