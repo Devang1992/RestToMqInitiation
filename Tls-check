@@ -1,0 +1,847 @@
+
+
+Pasted markdown.md
+File
+he sent me this now, you see any problem or i should start doing this? also can you draw what he is saying here in sequence dieagram
+
+Generated image: Async Fax Workflow Review and Sequence Diagram
+Generated image: Async Fax Workflow Review and Sequence Diagram
+Generated image: Async Fax Workflow Review and Sequence Diagram
+
+You could try:
+
+Highlight the three architecture risks more clearly
+
+Convert this sequence into editable Mermaid or Gliffy
+
+Use this diagram for senior architecture review
+
+
+Yes — the same mechanism can be reused, but I would simplify it because this second application's external operation is only a GET.
+
+That difference is important. In RightFax, retrying POST /SendJobs could create a second fax. Here, retrying a GET should not create any external side effect. So the architecture becomes considerably safer.
+
+The main idea I recommend is:
+
+Kafka
+  ↓
+Kafka Streams
+  ↓
+Filter
+  ↓
+MID dedupe / workflow state
+  ↓
+Dispatch external GET to worker pool
+  ↓
+External Address API
+  ↓
+worker returns result
+  ↓
+StreamThread updates RocksDB
+  ↓
+Map original message + API response
+  ↓
+Produce to output topic
+
+If GET fails:
+  ↓
+State = RETRY_LOOKUP
+  ↓
+nextActionAt = future time
+  ↓
+Punctuator retries later
+  ↓
+max deadline exhausted
+  ↓
+DLQ
+And I would reuse the dispatch-off-thread, apply-on-StreamThread pattern from the RightFax design. That pattern keeps HTTP latency away from the Streams thread while ensuring that only the Streams thread touches RocksDB and forwards records. 
+
+
+The big difference from RightFax
+For RightFax:
+
+POST /SendJobs
+      ↓
+external side effect
+      ↓
+retry can create another fax ❌
+For your address service:
+
+GET /address/123
+      ↓
+read-only operation
+      ↓
+retry GET
+      ↓
+same external business state ✅
+Therefore, if this happens:
+
+GET address succeeds
+        ↓
+app crashes before state/output commits
+        ↓
+Kafka record is replayed
+        ↓
+GET address again
+that's generally fine.
+
+There is no duplicate payment, fax, email, etc.
+
+That means I would not copy the RightFax at_least_once requirement into this application.
+
+In fact, this is a case where I would seriously consider:
+
+processing.guarantee=exactly_once_v2
+because your external operation is read-only, while the operations that actually change durable state are Kafka-native:
+
+State Store update
++
+Output Kafka record
++
+Input Kafka offset
+Those are exactly the things Kafka Streams EOS is designed to coordinate.
+
+So:
+
+Address GET              → outside transaction, but harmless to repeat
+
+RocksDB update
+Output topic record
+Input offset             → Kafka transaction
+That's a much cleaner situation than RightFax.
+
+My preferred low-level design
+I would make the application roughly this:
+
+                  ┌──────────────────────────┐
+                  │ External Address API     │
+                  └────────────▲─────────────┘
+                               │ GET
+                         ┌─────┴─────┐
+                         │ Worker Pool│
+                         └─────┬─────┘
+                               │
+                           StepResult
+                               │
+                         Concurrent Queue
+                               │
+                               ▼
+
+Kafka ──→ StreamThread ───────────────→ Output Topic
+              │
+              │
+              ▼
+          RocksDB
+        Workflow State
+              ▲
+              │
+          Punctuator
+The invariant stays:
+
+Worker threads:
+    HTTP calls only
+
+StreamThread:
+    RocksDB reads/writes
+    context.forward()
+    state transitions
+I like this architecture enough that, since you'll already be implementing it for RightFax, I'd consider extracting a small reusable internal framework around:
+
+dispatch work
+→ worker executes
+→ StepResult queue
+→ punctuator drains
+→ state transition
+Not a huge generic framework — just reusable utilities.
+
+State machine for this project
+Your state is much simpler than RightFax:
+
+RECEIVED
+   ↓
+LOOKUP_PENDING
+   ↓
+LOOKUP_IN_PROGRESS
+   ↓
+LOOKUP_COMPLETE
+   ↓
+MAPPED
+   ↓
+PRODUCED
+Failure path:
+
+LOOKUP_IN_PROGRESS
+      ↓
+transient failure
+      ↓
+RETRY_LOOKUP
+      ↓
+nextActionAt
+      ↓
+LOOKUP_IN_PROGRESS
+Eventually:
+
+RETRY_LOOKUP
+     ↓
+deadline exceeded
+     ↓
+DLQ
+I might simplify even further to:
+
+RECEIVED
+LOOKUP_PENDING
+RETRY_PENDING
+COMPLETED
+FAILED
+because you don't need to persist every temporary in-flight phase.
+
+Suggested state object
+Something like:
+
+public record AddressEnrichmentState(
+
+        String mid,
+
+        Phase phase,
+
+        JsonNode originalPayload,
+
+        String addressLookupKey,
+
+        int retryCount,
+
+        Instant createdAt,
+
+        Instant nextActionAt,
+
+        Instant deadlineAt,
+
+        Integer lastHttpStatus,
+
+        String lastError
+
+) {}
+If the API response is small and useful for recovery, you can also include:
+
+AddressResponse addressResponse
+but you don't necessarily need to.
+
+Important: don't let the old dedupe store fight the workflow store
+This is probably the biggest change I would make to your existing topology.
+
+Previously you had something roughly like:
+
+Filter
+ ↓
+MID dedupe
+ ↓
+map
+ ↓
+output
+You don't want:
+
+MID arrives
+ ↓
+dedupe store says "seen"
+ ↓
+GET fails
+ ↓
+record later retries
+ ↓
+dedupe says "already seen"
+ ↓
+retry accidentally disappears ❌
+Instead, let the state store itself become the dedupe mechanism:
+
+MID not found
+      ↓
+create:
+
+MID-123
+phase = RECEIVED
+If Kafka sends MID-123 again:
+
+store.get(MID-123)
+        ↓
+exists
+        ↓
+don't create another workflow
+But your punctuator can still continue processing the existing MID.
+
+So the rule becomes:
+
+A duplicate Kafka input is ignored, but an existing non-terminal workflow continues.
+
+That's much cleaner.
+
+How retry should work
+I would not do this:
+
+try {
+    callApi();
+} catch (...) {
+    Thread.sleep(15_000);
+    callApi();
+}
+Definitely not.
+
+Instead:
+
+GET fails
+   ↓
+worker returns:
+
+StepResult {
+   type = RETRYABLE_FAILURE
+   error = ...
+}
+StreamThread drains it:
+
+retryCount++
+nextActionAt = now + backoff
+phase = RETRY_PENDING
+Punctuator later sees:
+
+nextActionAt <= now
+and dispatches again.
+
+For example:
+
+Attempt 1
+   ↓ fails
+retry after 5s
+
+Attempt 2
+   ↓ fails
+retry after 15s
+
+Attempt 3
+   ↓ fails
+retry after 45s
+
+Attempt 4
+   ↓ fails
+retry after 2m
+I would actually use a deadline rather than only maxAttempts, just like the RightFax design moved toward.
+
+For example:
+
+deadline = createdAt + 15 minutes
+Then:
+
+while now < deadline
+    retry transient failures
+
+after deadline
+    DLQ
+This handles prolonged API outages more naturally.
+
+Error classification
+I would use roughly this:
+
+API result	Action
+200	Map + continue
+400	DLQ — bad request
+401/403	Refresh auth once if applicable, otherwise alert/config failure
+404	Business decision: probably DLQ / missing address
+408	Retry
+429	Retry with backoff
+500/502/503/504	Retry
+connect timeout	Retry
+read timeout	Retry
+malformed response	Limited retry, then DLQ
+circuit breaker open	Don't call; schedule retry later
+And remember:
+
+503 from address API
+≠
+bad Kafka message
+It's an infrastructure problem.
+
+Only after your retry/deadline policy is exhausted would I put that record on the DLQ.
+
+Circuit breaker
+Yes, absolutely reuse it.
+
+Address API healthy
+      ↓
+Circuit CLOSED
+      ↓
+normal GET calls
+If failures increase:
+
+5xx / timeout
+     ↓
+Circuit OPEN
+     ↓
+punctuator stops dispatching HTTP calls
+     ↓
+records remain RETRY_PENDING
+After wait period:
+
+HALF_OPEN
+   ↓
+test calls
+   ↓
+success → CLOSED
+failure → OPEN
+That's better than throwing 100 failed requests at an API that's already down.
+
+What if there are two GET calls?
+There are two approaches.
+
+If GET #2 depends on GET #1
+Do:
+
+RECEIVED
+   ↓
+GET #1
+   ↓
+store response/result
+   ↓
+GET #2
+   ↓
+mapping
+State:
+
+LOOKUP_1_PENDING
+LOOKUP_2_PENDING
+COMPLETED
+If #1 succeeds and #2 fails, don't necessarily repeat #1.
+
+You could store the small result from GET #1 temporarily.
+
+For example:
+
+String customerAddressId;
+AddressResponse address;
+Then retry only GET #2.
+
+If they're independent and both fast
+The worker could potentially do:
+
+GET #1 ──┐
+         ├── combine
+GET #2 ──┘
+in parallel.
+
+But unless latency matters, I wouldn't complicate it. Your processing volume is likely nowhere near a level where shaving 200ms matters.
+
+What about calling the GET directly inside Streams?
+You can.
+
+For this particular application, I don't think this is inherently wrong:
+
+stream
+    .filter(...)
+    .mapValues(value -> {
+        Address address = client.getAddress(...);
+        return mapper.map(value, address);
+    })
+    .to(outputTopic);
+Because GET is safe.
+
+If:
+
+volume is low
+AND
+API latency is very stable
+AND
+timeout is short
+I'd accept it.
+
+But there are still operational drawbacks:
+
+API becomes slow
+      ↓
+StreamThread waits
+      ↓
+partition processing stops
+      ↓
+lag grows
+Since you're already building the worker + queue + punctuator mechanism for RightFax, I'd reuse the pattern here rather than have two different approaches.
+
+That's the key reason my recommendation now leans toward asynchronous state-driven enrichment.
+
+One important improvement over RightFax: EOS is viable here
+This is probably the most useful architectural distinction between the two projects.
+
+RightFax
+POST external side effect
+     +
+Kafka state
+cannot be atomic.
+
+Therefore we deliberately accepted some ambiguity.
+
+Address enrichment
+GET external data
+     ↓
+Map
+     ↓
+RocksDB state
+     +
+Kafka output
+     +
+input offset
+GET is repeatable.
+
+Therefore Kafka can safely redo the GET after failure while protecting the Kafka-side state/output with EOS.
+
+So I would propose:
+
+processing.guarantee = exactly_once_v2
+for this application unless some other existing constraint prevents it.
+
+That's actually cleaner than blindly sharing all the RightFax Streams settings.
+
+My final recommended architecture
+                    INPUT TOPIC
+                         │
+                         ▼
+                   Kafka Streams
+                         │
+                 Filter required header
+                         │
+                         ▼
+                 State Store lookup
+                         │
+                    MID exists?
+                    /       \
+                  YES        NO
+                   │          │
+                 skip      RECEIVED
+                              │
+                              ▼
+                       Punctuator scans
+                              │
+                              ▼
+                      dispatch to worker
+                              │
+                              ▼
+                    External GET API
+                              │
+                  ┌───────────┴──────────┐
+                  │                      │
+               SUCCESS                FAILURE
+                  │                      │
+                  ▼                      ▼
+             StepResult            StepResult
+                  │                retryable?
+                  └──────────┬───────────┘
+                             ▼
+                         Inbox Queue
+                             │
+                             ▼
+                       StreamThread
+                             │
+              ┌──────────────┴───────────────┐
+              │                              │
+         Success result                 Retry result
+              │                              │
+              ▼                              ▼
+         Map message                   nextActionAt
+              │                        retryCount++
+              ▼                              │
+        OUTPUT TOPIC                         │
+              │                              │
+              ▼                              └── punctuator
+         COMPLETED
+
+                                     deadline exceeded
+                                             │
+                                             ▼
+                                            DLQ
+And I'd keep terminal state for some retention period, perhaps:
+
+24 hours
+so an immediate Kafka replay doesn't perform another enrichment/output unnecessarily.
+
+Bottom line
+Yes, reuse the state-store/punctuator mechanism.
+
+But I'd make these changes relative to RightFax:
+
+use exactly_once_v2 if your current topology allows it;
+
+treat the state store as both workflow state + dedupe, rather than separate dedupe logic;
+
+external GETs run on a bounded worker pool;
+
+worker results return through an inbox queue;
+
+StreamThread alone updates RocksDB/forwards;
+
+circuit breaker around the GET API;
+
+transient failures become scheduled state-store retries;
+
+use a retry deadline, not infinite attempts;
+
+exhausted infrastructure failures → DLQ;
+
+successful GET → mapping → output topic;
+
+repeated GET after a crash is acceptable because it has no customer-visible side effect.
+
+That would be my preferred production design for the second Kafka Streams application. The RightFax mechanism gives you a reusable orchestration pattern; this address-enrichment use case is actually the easier and safer version of it.
+
+
+Today 8:02 AM
+Yo for the right fax where we go to fetch session cookie, how safe is that?
+
+For a backend-to-backend Spring Boot integration, the GET /API/login → rf-auth session cookie → reuse cookie pattern is reasonably safe, provided you treat that cookie essentially like a short-lived bearer credential.
+
+Your RightFax design explicitly does:
+
+GET /API/login
+Authorization: Basic <credentials>
+        ↓
+200 OK
+Set-Cookie: rf-auth=...
+        ↓
+reuse rf-auth on later calls
+and the implementation brief already recommends holding it in memory and refreshing it on authentication failure rather than using a shared browser-style cookie store. 
+
+
+The main security concern is credential/session theft, not the fact that it is a cookie.
+
+The safe version
+PANTS
+  │
+  │ HTTPS/TLS
+  ▼
+RightFax
+
+1. Username/password retrieved from Secret Manager
+2. GET /API/login over HTTPS
+3. RightFax returns rf-auth
+4. rf-auth kept only in application memory
+5. Cookie sent only to RightFax
+6. Cookie never logged
+7. 401 → invalidate cookie → authenticate again
+8. Credentials never appear in source/config repo
+That is a normal enterprise service-to-service authentication model.
+
+The unsafe version
+HTTP instead of HTTPS                 ❌
+log Authorization header              ❌
+log rf-auth cookie                     ❌
+store cookie in RocksDB                ❌
+store cookie in Kafka message          ❌
+hard-code password in application.yml ❌
+disable TLS certificate validation     ❌
+The important point is that HTTP Basic authentication itself does not encrypt anything. username:password is only Base64 encoded. So:
+
+Basic Auth + HTTP  = bad
+Basic Auth + HTTPS = acceptable
+TLS provides the actual confidentiality.
+
+How I would implement it
+For your application, I like the design in the spec:
+
+AtomicReference<AuthSession> authSession;
+roughly:
+
+Worker needs RightFax
+      ↓
+Do we have valid rf-auth?
+    /             \
+  yes              no
+   |                |
+use cookie       login once
+                    |
+                    v
+               cache cookie
+If four worker threads simultaneously discover that the session expired, don't let all four login independently:
+
+Worker 1 ─┐
+Worker 2 ─┤
+Worker 3 ─┼──→ one synchronized refresh → new rf-auth
+Worker 4 ─┘
+That's exactly why your implementation brief proposes a single-flight refresh using a lock and rate-limited login attempts. 
+
+
+I would not put rf-auth into RocksDB. After an application restart:
+
+new JVM
+   ↓
+no cookie
+   ↓
+authenticate again
+That's cleaner and safer.
+
+One thing I'd ask RightFax
+There are a few details your documents have not confirmed yet:
+
+What is the rf-auth session lifetime and idle timeout?
+
+That is already listed as an open item in your design. 
+
+
+Also ask them:
+
+Does rf-auth expire after fixed time or inactivity?
+
+Is there an explicit logout endpoint?
+
+Is the session invalidated when the password is rotated?
+
+Can the same service account have multiple simultaneous sessions?
+
+Is the cookie bound to a client/IP/session context?
+
+Does production require HTTPS only?
+
+Are there account lockout rules?
+
+How I'd rate it
+For your internal PANTS → on-prem RightFax setup:
+
+HTTPS + service account + secret manager + in-memory rf-auth + no logging + controlled refresh = perfectly reasonable.
+
+The cookie itself doesn't worry me much. I would be considerably more concerned if someone proposed putting the rf-auth value into Kafka/RocksDB or making the RightFax call over plain HTTP.
+
+
+Ok so username password will co.e from edp vault, how to check tls thongy if tls is open on my linux from where i will call?
+
+Yes. Think of this as three separate checks from the Linux VM where your Spring Boot service will run:
+
+1. Can Linux reach the RightFax host/port?
+2. Does that port actually speak TLS/HTTPS?
+3. Does Linux/JVM trust the RightFax certificate?
+TLS itself is not something you “open” on Linux like a service. Usually RightFax exposes HTTPS on something like 443, and your VM needs outbound network access to that host/port.
+
+1. First check basic network connectivity
+From the Linux server:
+
+nc -vz rightfax-hostname 443
+Example:
+
+nc -vz rightfax-prod.company.com 443
+Good:
+
+Connection to rightfax-prod.company.com 443 port [tcp/https] succeeded!
+Bad:
+
+Connection timed out
+That usually means firewall/routing/network access is missing.
+
+You can also use:
+
+telnet rightfax-prod.company.com 443
+if nc is not installed.
+
+2. Check the TLS handshake
+This is the best command:
+
+openssl s_client \
+  -connect rightfax-prod.company.com:443 \
+  -servername rightfax-prod.company.com
+Near the bottom you want something like:
+
+Protocol  : TLSv1.2
+or:
+
+TLSv1.3
+and ideally:
+
+Verify return code: 0 (ok)
+That tells you:
+
+Linux VM
+   ↓
+443 reachable
+   ↓
+TLS handshake successful
+   ↓
+certificate trusted
+You can specifically test TLS 1.2:
+
+openssl s_client \
+  -connect rightfax-prod.company.com:443 \
+  -servername rightfax-prod.company.com \
+  -tls1_2
+And TLS 1.3:
+
+openssl s_client \
+  -connect rightfax-prod.company.com:443 \
+  -servername rightfax-prod.company.com \
+  -tls1_3
+If TLS 1.3 fails but TLS 1.2 works, that doesn't necessarily mean anything is wrong. Your RightFax environment may simply be configured for TLS 1.2.
+
+3. Easiest practical test: curl
+Do:
+
+curl -v https://rightfax-prod.company.com/API/login
+You don't even need to supply your real Vault credentials yet.
+
+You're looking for output roughly like:
+
+* Connected to rightfax-prod.company.com
+* SSL connection using TLSv1.2
+* Server certificate:
+*  subject: ...
+*  issuer: ...
+*  SSL certificate verify ok.
+Then you might receive:
+
+HTTP/1.1 401 Unauthorized
+And 401 is actually good for this test.
+
+It means:
+
+Network       ✅
+TLS           ✅
+RightFax API  ✅
+Authentication ❌ because we intentionally didn't provide credentials
+Once your Vault credentials are available, the actual flow becomes:
+
+curl -v \
+  -u "$RIGHTFAX_USER:$RIGHTFAX_PASSWORD" \
+  https://rightfax-prod.company.com/API/login
+But be careful doing that interactively because shell history/process inspection can expose credentials. For production, let the application retrieve them from your EDP Vault rather than manually putting passwords on command lines.
+
+Very important: test Java trust too
+Your OS trusting the certificate doesn't always guarantee that the JVM trusts it.
+
+Since Spring Boot ultimately makes the HTTPS call through Java, check using:
+
+keytool -printcert \
+  -sslserver rightfax-prod.company.com:443
+If Java can establish the connection and display the certificate chain, that's encouraging.
+
+Your Java application may use:
+
+JVM cacerts
+rather than Linux's system CA store.
+
+A classic failure you'll see in Spring Boot if the certificate isn't trusted is:
+
+PKIX path building failed
+or:
+
+unable to find valid certification path to requested target
+That means networking and TLS probably work, but Java doesn't trust the issuing CA.
+
+For your RightFax setup, I would run these four commands
+# DNS
+nslookup rightfax-prod.company.com
+
+# Network/firewall
+nc -vz rightfax-prod.company.com 443
+
+# TLS/certificate
+openssl s_client \
+  -connect rightfax-prod.company.com:443 \
+  -servername rightfax-prod.company.com
+
+# Actual HTTPS test
+curl -v https://rightfax-prod.company.com/API/login
+If you paste me the outputs of those four commands — redact hostnames/certificate details if needed — I can tell you exactly whether the problem, if any, is DNS, firewall, TLS, certificate trust, or RightFax itself.
+
+And one thing I would not do as a solution is:
+
+curl -k ...
+or disabling certificate validation in WebClient. -k is okay for a quick diagnostic, but if it only works with -k, that means you have a certificate trust problem that should be fixed properly before production.
+
