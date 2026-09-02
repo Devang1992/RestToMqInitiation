@@ -1,0 +1,19 @@
+flowchart LR
+    PWSSP["PWSSP<br/>Stream Processor"]
+    PANTS["Pants Notifications<br/>Service<br/>(PANTS)"]
+    PCSS["PCSS<br/>Customer Preference"]
+    MAIL["Pants Adapter<br/>(Mail) Service"]
+    RT["Pants Real Time<br/>Adapter Service"]
+    BR["Broadridge"]
+    RFAX["RightFax"]
+    UMP["UMP<br/>Universal Messaging Platform<br/>incl. eMail"]
+
+    PWSSP -->|"Kafka<br/>ep_wires_engine_pwssp_pdm_public<br/>4 partitions | key = MID"| PANTS
+    PANTS <-->|REST| PCSS
+
+    PANTS -->|"Kafka<br/>ep_wires_engine_pants_processed<br/>1 partition | key = MID"| MAIL
+    PANTS -->|"Kafka<br/>ep_wires_engine_pants_processed_real_time<br/>2 partitions | key = MID"| RT
+
+    MAIL -->|"SFTP (BATCH)"| BR
+    RT -->|REST| RFAX
+    RT -->|REST| UMP
