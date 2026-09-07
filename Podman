@@ -1,0 +1,329 @@
+Yes — **Podman is a very good option for your exact use case**, especially on a locked-down company WSL/Linux environment.
+
+From your screenshot, your environment is already trying to start a Docker daemon, but it fails:
+
+> `Docker Daemon failed to start : ERROR CODE [ DELTA DELTA 01 ]`
+
+That looks like a company wrapper/startup error rather than a normal Docker error. I would **not reinstall Docker immediately**. First figure out what your new Wenix/WSL environment permits.
+
+### Docker vs Podman in your case
+
+Think of it this way:
+
+```text
+DOCKER
+docker run ...
+     |
+     v
+Docker CLI
+     |
+     v
+Docker Daemon (dockerd)  <-- must keep running
+     |
+     v
+Container
+```
+
+```text
+PODMAN
+podman run ...
+     |
+     v
+Container runtime
+     |
+     v
+Container
+
+No permanent central daemon required
+```
+
+Podman is OCI-compatible and deliberately supports a Docker-like CLI. More importantly for a corporate laptop, **Podman can run rootless**, which means you don't necessarily need a privileged Docker daemon running all the time. ([Podman Documentation][1])
+
+And there's particularly good news for you: **IBM explicitly supports running the MQ container with Podman**, and IBM's MQ container documentation literally says you can substitute `podman` for `docker` in its examples. ([GitHub][2])
+
+So for:
+
+```text
+Spring Boot development
+       |
+       +---- IBM MQ container :1414
+       |
+       +---- Kafka container :9092
+```
+
+Podman is completely reasonable.
+
+## What I'd do on this new laptop
+
+Before installing anything, run these in Wenix:
+
+```bash
+cat /etc/os-release
+```
+
+```bash
+command -v docker
+docker --version
+```
+
+```bash
+command -v podman
+podman --version
+```
+
+and:
+
+```bash
+ps -p 1 -o comm=
+```
+
+Also:
+
+```bash
+docker version
+```
+
+Send me the output of those **5 commands**.
+
+That tells us whether you're running Ubuntu/RHEL/Fedora, whether Podman is already installed, whether Docker CLI exists but the daemon is dead, and whether systemd is available.
+
+### Option 1 — Podman
+
+This is the one I'd try first on the company laptop.
+
+If it's RHEL/Fedora-like:
+
+```bash
+sudo dnf install podman
+```
+
+If Ubuntu/Debian:
+
+```bash
+sudo apt update
+sudo apt install podman
+```
+
+Podman is available directly through the standard Debian repositories as well as RHEL/CentOS/Fedora ecosystems. ([Podman][3])
+
+Then:
+
+```bash
+podman --version
+podman info
+```
+
+Test it:
+
+```bash
+podman run --rm docker.io/library/hello-world
+```
+
+If that works, **we basically don't need Docker**.
+
+### Then your IBM MQ
+
+You can do:
+
+```bash
+podman volume create qm1data
+```
+
+Then:
+
+```bash
+podman run -d \
+  --name mq \
+  -e LICENSE=accept \
+  -e MQ_QMGR_NAME=QM1 \
+  -p 1414:1414 \
+  -p 9443:9443 \
+  -v qm1data:/mnt/mqm \
+  icr.io/ibm-messaging/mq:latest
+```
+
+Check it:
+
+```bash
+podman ps
+```
+
+and:
+
+```bash
+podman logs mq
+```
+
+IBM's current example uses this same MQ image, `LICENSE=accept`, `MQ_QMGR_NAME`, ports 1414/9443, and `/mnt/mqm` for persistent data. ([GitHub][2])
+
+You can even run:
+
+```bash
+podman exec -it mq dspmq
+```
+
+and you should eventually see something similar to:
+
+```text
+QMNAME(QM1) STATUS(Running)
+```
+
+### Kafka
+
+Same idea.
+
+For a simple local broker:
+
+```bash
+podman run -d \
+  --name kafka \
+  -p 9092:9092 \
+  docker.io/apache/kafka:4.1.2
+```
+
+The official Apache Kafka image can run with the simple `9092:9092` setup for local development. ([Apache Kafka][4])
+
+Then:
+
+```bash
+podman ps
+```
+
+You'd have:
+
+```text
+CONTAINER    PORTS
+mq           0.0.0.0:1414->1414
+             0.0.0.0:9443->9443
+
+kafka        0.0.0.0:9092->9092
+```
+
+Your Spring Boot app can then use things like:
+
+```properties
+spring.kafka.bootstrap-servers=localhost:9092
+```
+
+and MQ:
+
+```properties
+ibm.mq.connName=localhost(1414)
+ibm.mq.queueManager=QM1
+```
+
+depending on the MQ configuration we set up.
+
+## And your old Docker commands barely change
+
+This is another reason I think Podman is attractive for you.
+
+Old:
+
+```bash
+docker ps
+docker images
+docker pull xyz
+docker run xyz
+docker stop kafka
+docker rm kafka
+docker logs kafka
+docker exec -it kafka bash
+```
+
+Podman:
+
+```bash
+podman ps
+podman images
+podman pull xyz
+podman run xyz
+podman stop kafka
+podman rm kafka
+podman logs kafka
+podman exec -it kafka bash
+```
+
+Almost identical.
+
+You can technically even do:
+
+```bash
+alias docker=podman
+```
+
+although I'd leave them separate initially so we know exactly what runtime we're debugging.
+
+---
+
+## Option 2 — Fix Docker Engine inside Wenix
+
+Docker Desktop is **not required**. We can run Docker Engine directly inside WSL/Linux.
+
+Your screenshot suggests this is what you had working on the old laptop.
+
+But instead of reinstalling, let's find out **why `dockerd` is failing**.
+
+Try:
+
+```bash
+sudo systemctl status docker --no-pager -l
+```
+
+If that works:
+
+```bash
+sudo journalctl -u docker -n 100 --no-pager
+```
+
+If `systemctl` says systemd isn't running, that's very useful information too.
+
+We can also directly test Docker:
+
+```bash
+sudo dockerd --debug
+```
+
+That runs the daemon in the foreground and usually exposes the *actual* problem rather than your company's:
+
+```text
+DELTA DELTA 01
+```
+
+wrapper error.
+
+Docker normally relies on a daemon and, under systemd, `systemctl start docker` starts it. ([Docker Docs][5])
+
+There is also a third possibility: **rootless Docker**. Docker officially supports running the daemon as your normal Linux user rather than root, although it has some prerequisites such as subordinate UID/GID ranges. ([Docker Docs][6])
+
+So realistically our choices are:
+
+| Option                   | Company laptop friendliness |                         MQ | Kafka | My choice        |
+| ------------------------ | --------------------------: | -------------------------: | ----: | ---------------- |
+| Docker Desktop           |             ❌ Often blocked |                          ✅ |     ✅ | Avoid            |
+| Docker daemon inside WSL |        ⚠️ Depends on policy |                          ✅ |     ✅ | Try if permitted |
+| Docker rootless          |                    ✅ Better |                          ✅ |     ✅ | Possible         |
+| **Podman rootless**      |                  **✅ Best** | **✅ officially supported** | **✅** | **Try first**    |
+
+One important thing: we're not trying to circumvent any corporate control. If the security policy deliberately prevents Linux containers/namespace operations, Podman may also be blocked. But if the issue is simply that the company doesn't want a privileged Docker daemon or Docker Desktop, **rootless Podman may work perfectly within the intended controls**.
+
+And since your only real requirement is basically **"give me containers so I can run IBM MQ and Kafka locally"**, you don't actually care whether the engine underneath says Docker or Podman.
+
+Run these and paste the output:
+
+```bash
+cat /etc/os-release
+command -v docker && docker --version
+command -v podman && podman --version
+ps -p 1 -o comm=
+docker version
+```
+
+Then I'll take you through the correct setup on this laptop step-by-step rather than throwing random installation commands at it.
+
+[1]: https://docs.podman.io/en/stable/markdown/podman.1.html?utm_source=chatgpt.com "podman — Podman documentation"
+[2]: https://github.com/ibm-messaging/mq-container/blob/master/docs/usage.md?utm_source=chatgpt.com "mq-container/docs/usage.md at master · ibm-messaging/mq-container · GitHub"
+[3]: https://podman.io/docs/installation?utm_source=chatgpt.com "Podman Installation | Podman"
+[4]: https://kafka.apache.org/41/getting-started/docker/?utm_source=chatgpt.com "Docker | Apache Kafka"
+[5]: https://docs.docker.com/engine/daemon/start/?utm_source=chatgpt.com "Start the daemon | Docker Docs"
+[6]: https://docs.docker.com/engine/security/rootless/?utm_source=chatgpt.com "Rootless mode | Docker Docs"
