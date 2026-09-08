@@ -1,3 +1,25 @@
+podman run -d \
+  --name kafka \
+  --hostname kafka \
+  -p 9092:9092 \
+  -e KAFKA_NODE_ID=1 \
+  -e KAFKA_PROCESS_ROLES='broker,controller' \
+  -e KAFKA_CONTROLLER_QUORUM_VOTERS='1@kafka:29093' \
+  -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP='CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT' \
+  -e KAFKA_LISTENERS='CONTROLLER://:29093,PLAINTEXT_HOST://:9092,PLAINTEXT://:19092' \
+  -e KAFKA_ADVERTISED_LISTENERS='PLAINTEXT_HOST://[::1]:9092,PLAINTEXT://kafka:19092' \
+  -e KAFKA_INTER_BROKER_LISTENER_NAME='PLAINTEXT' \
+  -e KAFKA_CONTROLLER_LISTENER_NAMES='CONTROLLER' \
+  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+  -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+  -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+  -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+  -e KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR=1 \
+  -e KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR=1 \
+  -e CLUSTER_ID='4L6g3nShT-eMCtK--X86sw' \
+  dockerhub.registry.td.com/apache/kafka:4.3.1
+
+
 Yes — **Podman is a very good option for your exact use case**, especially on a locked-down company WSL/Linux environment.
 
 From your screenshot, your environment is already trying to start a Docker daemon, but it fails:
