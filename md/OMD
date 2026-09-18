@@ -1,0 +1,325 @@
+# PWSSP → PANTS_PROCESSED — PCSS enrichment design
+
+## Problem
+
+The application consumes PWSSP events from `PWSSP_PDM_PUBLIC` and must filter unwanted records, deduplicate source events, perform deterministic field and address mappings, derive account and office information required for PCSS, call the PCSS GET API where required, perform preference-specific address mapping, add preference and engine headers, run business validation, and produce one or more advice records to `PANTS_PROCESSED`.
+
+One incoming event may produce multiple advices. An individual advice may require zero, one, or two PCSS lookups.
+
+## The decision that drives everything
+
+Whether PCSS is called from inside the Kafka Streams topology, or from a separate consumer reading a durable work topic.
+
+The deciding constraint is not latency. It is that `max.poll.interval.ms` and an hour-long PCSS outage are fundamentally incompatible. Any design that holds a StreamThread waiting on PCSS will, under sustained failure, breach the poll interval, trigger a rebalance, reprocess the same records, and add load to an already-failing PCSS. That is a cascading failure, not a retry strategy.
+
+This applies equally to `process()` and to `punctuate()`. Punctuators registered via `context.schedule()` run on the StreamThread — the same thread that calls `poll()`. There is no separate punctuation thread. Blocking in a punctuator is exactly as dangerous as blocking in the processor; it is only harder to see in a stack trace.
+
+## Volume context
+
+200K events/day arriving between 08:00 and 17:00, roughly 6 events/sec average. With average fan-out of two, around 12 advices/sec. Advices may spill past 17:00 and into the next day.
+
+Serial processing gives roughly one item per PCSS round trip. At 150ms per call and 1.5 calls per advice, that is about 4–5 advices/sec per partition, or near 26/sec across six partitions. Demand of 12/sec sits comfortably under that. A one-hour outage at peak queues around 22K advices, which drains in about fifteen minutes.
+
+At this volume, capacity does not decide between the two approaches. The amount of retry machinery you maintain does.
+
+Two numbers worth confirming rather than assuming:
+
+- The hourly arrival distribution. "6/sec average" is doing a lot of work in the arithmetic above. Payment flows are rarely flat; a mid-morning or pre-cutoff peak at 3–4× average puts you at 36–48 advices/sec, over the serial ceiling. Given the relaxed deadline that is still survivable, but you should know it before a lag alert fires at 11am.
+- Whether "can go next day" is genuinely open. Advices often have a downstream dispatch cutoff or regulatory clock even when the processing window is loose. If there is a hard "must be out by 06:00 next day", that is the real deadline and it should size the backlog tolerance, not the 17:00 payment cutoff.
+
+---
+
+## Two identifiers, doing two different jobs
+
+Conflating these is the central trap.
+
+**`correlationId`** (the MID) is the source event identity. It is the only key the dedupe store uses. It answers "have I seen this PWSSP event before?"
+
+**`workId`** is the advice identity. Everything downstream of the fan-out keys on it. It answers "have I already produced this specific advice?"
+
+Legitimate fan-out produces distinct `workId`s under a shared `correlationId`, so it cannot be collapsed. Reprocessing produces byte-identical `workId`s, so it can be. Both requirements are satisfied at once.
+
+**The `workId` must derive from a stable business discriminator** — preference type, recipient, channel, whatever actually distinguishes the advices — and never from the ordinal position in the fan-out. If you hash the index and the mapping logic later changes emission order, a replay produces different `workId`s for the same advices and the idempotency guarantee silently disappears. This is worth being pedantic about at design time because the failure is invisible until it matters.
+
+### Open question
+
+Does PWSSP carry a genuinely unique, producer-stable event id? If not, the dedupe key is a hash of a canonical form of the business payload with volatile fields excluded — ingest timestamps, trace headers. That canonical form needs to be agreed explicitly and documented, not left to whoever writes the hash function.
+
+---
+
+## Approach 1 (recommended) — durable work topic, worker owns the advice end to end
+
+Kafka Streams plans the work and stops. A Spring Kafka listener calls PCSS, finishes the advice, and produces to `PANTS_PROCESSED`. Both run in the same Spring Boot application, in separate poll loops.
+
+### Stage 1 — Streams planner, EOS v2
+
+Consume PWSSP. Filter. Deduplicate against a keyed state store. Perform the deterministic field and address mappings, derive account and office, then explode into N advice work items and write them to `PWSSP_PCSS_WORK`. Each work item carries the derived payload, a declaration of how many PCSS lookups it needs (0, 1, or 2), the `correlationId`, and the `workId`.
+
+The dedupe store needs a TTL and a wall-clock punctuator that evicts old keys, sized to your realistic replay window. Unbounded dedupe stores are one of the most common ways Streams applications die in production.
+
+### Stage 2 — Spring Kafka worker, transactional
+
+A `@KafkaListener` on a separate consumer group reads `PWSSP_PCSS_WORK`, performs the zero, one, or two PCSS GETs, applies preference-specific address mapping, adds the preference and engine headers, runs business validation, and produces to `PANTS_PROCESSED`.
+
+Because it is a different poll loop, PCSS latency has no relationship to the Streams poll interval. That isolation is the entire point.
+
+### Sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant UP as Upstream
+    participant SRC as PWSSP_PDM_PUBLIC
+    participant S1 as Streams stage 1 (EOS v2)
+    participant DD as Dedupe store
+    participant WT as PWSSP_PCSS_WORK
+    participant W as Advice worker (listener)
+    participant API as PCSS API
+    participant OUT as PANTS_PROCESSED
+    participant ERR as PANTS_ADVICE_ERROR
+
+    UP->>SRC: PWSSP event, correlationId = MID
+    SRC->>S1: consume, EOS transaction opens
+    S1->>S1: filter unwanted records
+    S1->>DD: get(correlationId)
+    alt already seen
+        DD-->>S1: present
+        S1->>S1: drop, advance offset only
+    else new source event
+        DD-->>S1: absent
+        S1->>DD: put(correlationId, seenAt)
+        S1->>S1: field and address mapping, derive account and office
+        S1->>S1: fan out to N advices, workId per advice from business discriminator
+        S1->>WT: produce N work items, key = account
+    end
+    Note over S1,WT: One transaction commits input offsets, dedupe changelog and work records together
+    Note over S1,DD: Wall-clock punctuator evicts MIDs past the replay window
+
+    WT->>W: consume with read_committed, transaction opens
+    opt lookupsRequired is 1 or 2
+        W->>API: GET account
+        API-->>W: 200
+    end
+    opt lookupsRequired is 2
+        W->>API: GET office
+        API-->>W: 200
+    end
+    W->>W: preference address mapping, preference and engine headers, business validation
+    W->>OUT: produce advice, key = workId
+    Note over W,OUT: Transaction commits the advice and the consumer offsets together
+
+    alt transient failure, single timeout or 5xx
+        W->>API: 2 to 3 retries, jittered backoff, capped inside max.poll.interval.ms
+    else sustained outage, circuit breaker opens
+        W->>W: pause the listener container
+        loop probe every 30s until healthy
+            W->>API: health probe, half open
+        end
+        W->>W: resume from the same offset
+        Note over WT,W: Offsets never advanced. Backlog waits in the work topic. PWSSP is not reingested.
+    else permanent, 400 or 422 or validation reject
+        W->>ERR: produce with reasonCode, correlationId, workId
+    end
+```
+
+### Failure handling — three tiers, and the tiers matter
+
+**Transient** — a single timeout, an isolated 5xx. Bounded in-memory retry with jittered exponential backoff, two or three attempts over a few seconds, capped well inside `max.poll.interval.ms`.
+
+**Sustained** — a Resilience4j circuit breaker wraps the PCSS client. When it opens, pause the listener container via `KafkaListenerEndpointRegistry` rather than retrying or dead-lettering. A scheduled probe drives half-open, and on recovery the container resumes.
+
+During the outage no offsets advance, unprocessed work sits durably in the work topic, and consumption picks up exactly where it stopped. This is the direct answer to the hour-long-outage requirement: nothing is lost, nothing is dead-lettered en masse, PWSSP is never reingested, and recovery is automatic with no operator action.
+
+Set work topic retention comfortably above the maximum tolerable outage — seven days, not one. Do not compact it; it is a queue, not a table.
+
+**Permanent** — 400, 422, business validation rejections, mapping failures. Straight to an error topic with a reason code, never retried.
+
+The one genuinely ambiguous case is 404. Decide deliberately whether "account not found" means the data is bad or means PCSS has not caught up yet. If the latter, a short delayed-retry topic ahead of the error topic is justified. Get that answer from the PCSS team rather than guessing.
+
+### Why not `@RetryableTopic`
+
+Spring's non-blocking retry chain is the right tool when failures are per-record and independent. For a whole-dependency outage it converts a clean pause into thousands of records fanned across retry topics with ordering destroyed and a messy reconciliation afterwards. Pause-and-resume is simpler and preserves per-partition ordering.
+
+### Exactly-once, and why the REST caveat matters less than it sounds
+
+The stated constraint is that an external REST API cannot participate in a Kafka transaction. True, but PCSS is a GET — it has no side effects.
+
+So run the worker as a transactional read-process-write: transactional producer, offsets sent to the transaction, consumer on `read_committed`.
+
+- Hop one is atomic under Streams EOS v2 — input offsets, dedupe changelog, and work topic output commit together.
+- Hop two is atomic under the Spring transaction.
+
+The only non-transactional element in the entire path is an idempotent read. On replay it costs a duplicate lookup and nothing else. You get effectively-once end to end, not at-least-once with dedup bolted on.
+
+Two caveats:
+
+- Downstream consumers of `PANTS_PROCESSED` must read with `read_committed` or the guarantee is decorative.
+- Ship the `workId` on the output record, as key or header, and ask downstream to be idempotent on it. EOS does not survive offset resets, topic recreation, or manual replays from the error topic, and all three will happen eventually.
+
+### Partitioning the work topic
+
+Key by **account or office** for cache locality on PCSS responses plus per-entity ordering, at the risk of skew if one account dominates volume. Key by **`workId`** for even spread and no ordering.
+
+Start with the account key and instrument partition-level lag. The caching benefit is real — many advices in a batch will share accounts, and a Caffeine cache in front of PCSS keyed on account cuts call volume substantially.
+
+### Zero-lookup advices
+
+Route them through the work topic anyway rather than short-circuiting from Streams to `PANTS_PROCESSED`. The direct path saves a few milliseconds and costs two code paths, two ordering regimes, and two places to reproduce a bug.
+
+### Why there is no result topic or stage 2
+
+An earlier shape of this design routed PCSS results back through a result topic into a second Streams stage. That costs a topic, a stage, and one hard problem: an advice needing two lookups produces two result records that stage 2 must correlate. That means another state store keyed by `workId` accumulating partial results, plus a punctuator to time out advices whose second result never arrives.
+
+That is a second scheduler — the exact thing choosing this approach was meant to avoid. It also requires threading the full advice payload through the request and result records, or stashing it in yet another store.
+
+Collapsing it makes two lookups two sequential calls inside one listener invocation. No correlation, no aggregation store, no timeout logic. The topology drops from four boxes to two.
+
+---
+
+## Approach 2 (viable at this volume) — single Streams app, pending work in a state store
+
+One application. Pending PCSS work lives in a second state store instead of a topic, and a punctuator drains it.
+
+Drawn below as **synchronous and serial with a bounded tick**, which is what 200K/day justifies. The async worker-pool variant is the harder version and buys throughput that is not needed here — see the note at the end of this section if you go that way regardless.
+
+### Sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant UP as Upstream
+    participant SRC as PWSSP_PDM_PUBLIC
+    participant ST as Streams app (processor and punctuator)
+    participant DD as Dedupe store
+    participant PW as Pending work store and due index
+    participant API as PCSS API
+    participant OUT as PANTS_PROCESSED
+    participant ERR as PANTS_ADVICE_ERROR
+
+    UP->>SRC: PWSSP event, correlationId = MID
+    SRC->>ST: consume
+    ST->>ST: filter unwanted records
+    ST->>DD: get(correlationId)
+    DD-->>ST: absent, new source event
+    ST->>DD: put(correlationId, seenAt)
+    ST->>ST: mapping, derive account and office, fan out to N advices
+    ST->>PW: put(workId, payload, status PENDING, attempt 0, dueAt now, dispatchedAt null)
+    Note over ST,PW: EOS commits input offsets and both changelogs together
+
+    loop Wall-clock punctuator every 10s, never stream time
+        ST->>PW: sweep IN_FLIGHT items whose dispatchedAt is older than the stale timeout
+        PW-->>ST: orphans left by a crash or a rebalance
+        ST->>PW: reset orphans to PENDING
+        alt circuit breaker open
+            ST->>ST: return immediately, dispatch nothing
+        else breaker closed or half open
+            ST->>PW: scan due index, take up to K items
+            PW-->>ST: due work items
+            loop per item, until K items or T ms spent
+                ST->>PW: set IN_FLIGHT, dispatchedAt now
+                ST->>API: GET account, then office if required, synchronous
+                API-->>ST: 200 or 5xx or timeout
+                alt success
+                    ST->>ST: address mapping, headers, business validation
+                    ST->>OUT: forward advice with explicit correlationId and workId headers
+                    ST->>PW: delete(workId)
+                else retryable
+                    ST->>PW: status PENDING, attempt++, dueAt now plus backoff
+                else permanent
+                    ST->>ERR: forward with reasonCode
+                    ST->>PW: delete(workId)
+                end
+            end
+        end
+        ST->>ST: return unconditionally so poll runs, emit backlogDepth gauge
+    end
+```
+
+### Five pieces that are not optional
+
+A status field gives you durable bookkeeping. It does not give you a retry runtime. "We're already tracking status, so retries are handled" is the easy 10% of the problem.
+
+**1. Wall clock, not stream time.** Stream time only advances when records arrive. After 17:00 the input goes quiet, and with `STREAM_TIME` punctuation the scheduler never fires — exactly when the backlog is meant to be draining overnight. This is a silent, total failure of the retry mechanism at the worst possible moment. Use `PunctuationType.WALL_CLOCK_TIME`.
+
+**2. Dispatch timestamp and stale sweeper.** Crash mid-call, restore from the changelog, and an `IN_FLIGHT` record has no call in flight and no owner — the HTTP client that owned it no longer exists. Without a `dispatchedAt` timestamp and a sweep that resets stale `IN_FLIGHT` back to `PENDING`, those records strand permanently. The same happens on partition migration during a rebalance. This is the single most common bug in hand-rolled versions of this pattern and it is invisible until the first production restart during a backlog.
+
+**3. Circuit breaker.** Without one, every tick during an outage dispatches the whole due set at a dead PCSS, all of them fail, and every attempt counter increments. That is a retry storm aimed at a service that is already down. Status tracking does not prevent it; it only records it happening.
+
+**4. Explicit headers on forward.** A punctuator has no input record, so timestamps and headers are not inherited. `correlationId` and `workId` must be set by hand on every forward or traceability breaks.
+
+**5. Backlog gauge and eviction.** Work in a topic shows up as consumer lag on dashboards and alerts you already have. Work in RocksDB shows up nowhere unless you build a custom gauge. During an incident, "how deep is the hole and is it draining" is the only question anyone will ask. Terminal entries also need deleting or expiring, or the store grows without bound.
+
+### The bounded tick
+
+Since the punctuator runs on the StreamThread, each tick must process at most K items or at most T milliseconds and then return unconditionally so `poll()` runs.
+
+Two consequences to price in:
+
+- Throughput ceiling becomes K items per punctuation interval per partition. K and T become production tuning knobs with non-obvious interactions that nobody will remember the reasoning for in six months.
+- Latency floor is roughly half the punctuation interval even when PCSS is healthy and the queue is empty, because nothing moves until the next tick.
+
+### Finding due items
+
+Keyed by `workId`, finding due items means a full range scan every punctuation — over a backlog that is largest exactly when you are most behind. The alternative is a second store keyed by `dueAt`, kept consistent with the first. Both writes land in the same transaction so consistency is guaranteed, but it is another store to restore and another thing to get wrong.
+
+Every attempt-count increment is a write to the primary store plus a delete and insert in the index, all of which hit the changelog. Write amplification peaks during the outage.
+
+### If you keep the async worker pool
+
+The completion path is the dangerous part. **Never touch the state store or call `forward()` from the HTTP completion thread.** State stores are not thread-safe, and forwarding from a foreign thread corrupts the topology in ways that surface as bizarre, non-reproducible errors.
+
+The worker pushes onto a concurrent completion queue. The *next* punctuation drains it and performs the store writes and the forwards. Nothing touches the store except the StreamThread. This is mandatory structure, not a detail.
+
+An uncaught exception in `punctuate()` propagates up and kills the StreamThread, so PCSS error handling must be comprehensive and inside the punctuator.
+
+### Restoration
+
+During an outage the store accumulates the backlog. If a node then restarts or a rebalance fires, RocksDB must restore that backlog from the changelog before processing resumes — precisely when the system is already behind. With a work topic, a reassigned consumer just starts reading from an offset: no restoration, no warm-up. Standby replicas mitigate this at the cost of memory and disk on every node.
+
+At 22K entries this is seconds, not minutes, so it is a minor concern at current volume. It scales badly.
+
+---
+
+## Comparison
+
+| | Approach 1 — work topic | Approach 2 — state store |
+|---|---|---|
+| Deployables | One (two poll loops in one app) | One |
+| Where pending work lives | Durable work topic | RocksDB + changelog (also a topic) |
+| Retry, backoff, DLT | Configuration | Hand-written |
+| Backpressure during outage | Container pause and resume | Hand-written breaker + skip logic |
+| Backlog visibility | Standard consumer lag | Custom gauge only |
+| Restart with backlog | Read from offset | Restore RocksDB from changelog |
+| Enrichment concurrency | Independent of input partitions | Welded to input partition count |
+| Throughput ceiling | Scales by adding partitions to work topic | ~26 advices/sec at six partitions, serial |
+| Code you own | Dedupe, mapping, validation | Dedupe, mapping, validation, scheduler, sweeper, breaker, index, eviction, completion queue |
+
+Both use a state store for source-event dedup — that is a keyed lookup against recent history, exactly the access pattern RocksDB is built for. They differ only in whether the *work queue* also lives there, which is a queue access pattern, and Kafka topics are very good queues.
+
+"State store instead of a topic" is really "one topic, plus RocksDB, plus a hand-rolled queue runtime, instead of one topic." A changelog is a topic, so the infrastructure is not avoided — only the tooling around it.
+
+## Recommendation
+
+**Approach 1**, with both stages in a single Spring Boot application.
+
+At 200K/day the performance difference is irrelevant and the maintenance difference is not. Approach 1 gets backoff, concurrency limiting, pause-and-resume, and dead-lettering from configuration; Approach 2 gets a status field and you write the scheduler around it. Since both now run as one deployable, avoiding a second artifact is no longer a reason to prefer the state store.
+
+Approach 2 is a legitimate choice if adding a topic is a real organisational cost — approval workflows, naming standards, capacity review. If it is a few lines of Terraform, take the topic.
+
+**Explicitly rejected:** synchronous PCSS calls inside the Streams processor, with or without blocking retry. Under a sustained outage it either stalls past the poll interval into a rebalance storm, or fails fast to a DLT and forces manual replay — which directly violates the "resumes automatically without reingestion" requirement.
+
+---
+
+## Worth checking before building either
+
+Ask whether PCSS can publish a change feed for the account and office reference data. If it can, mirror it into a compacted topic, join it as a `GlobalKTable`, and the synchronous REST call disappears from the hot path entirely — along with the timeouts, the circuit breaker, the work topic, and most of this document.
+
+That would beat both designs above by a wide margin. It only fails if PCSS data is genuinely request-specific or too large to mirror, so it is worth five minutes with the PCSS owners before building any of this.
+
+## Open questions
+
+1. Does PWSSP carry a producer-stable unique event id, or must the dedupe key be a canonical hash? If the latter, which fields are in the canonical form?
+2. Does PCSS 404 mean bad data (permanent) or replication lag (retryable)?
+3. Does "advices can go next day" have a hard downstream cutoff — dispatch batch, regulatory clock — that is the real deadline?
+4. What is the actual hourly arrival distribution within the 08:00–17:00 window?
+5. Can PCSS publish account and office reference data as a change feed?
