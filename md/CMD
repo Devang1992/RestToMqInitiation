@@ -1,0 +1,1200 @@
+PWSSP → PCSS → PANTS_PROCESSED
+
+Kafka Integration Design Options
+
+1. Problem Statement
+
+The upstream application consumes events from PWSSP_PDM_PUBLIC and ultimately produces one or more advice records to PANTS_PROCESSED.
+
+The processing flow includes:
+
+Consume a PWSSP event from Kafka.
+
+Filter events that are not relevant.
+
+Deduplicate previously processed source events.
+
+Perform deterministic field mapping / normalization.
+
+Determine whether one or multiple advice records must be created.
+
+Derive the account number, office, and other fields required for PCSS.
+
+Call the PCSS REST GET API when required.
+
+In some cases, perform two PCSS lookups for one source event or advice.
+
+Perform structured-to-unstructured address mapping where required.
+
+Apply preference-specific mapping.
+
+Add preference and engine headers.
+
+Perform required business validation.
+
+Produce the final advice record(s) to PANTS_PROCESSED.
+
+The architecture must also handle the following reliability requirements:
+
+Duplicate source events must not create duplicate business output.
+
+One source event may legitimately create multiple advice records, so deduplication cannot incorrectly remove valid fan-out outputs.
+
+PCSS may return transient failures such as timeouts, connection failures, HTTP 429, or HTTP 5xx.
+
+PCSS may be unavailable for an extended period, for example one hour or longer.
+
+Pending PCSS work must resume automatically when PCSS recovers without re-ingesting the original PWSSP event.
+
+Application or node restarts must not lose pending work.
+
+Long PCSS outages must not block Kafka Streams processing threads.
+
+Retryable technical failures should be separated from permanent/business failures.
+
+Kafka exactly-once guarantees should be used where applicable, while recognizing that an external REST API cannot participate in a Kafka transaction.
+
+The design must support traceability using stable source, advice, and lookup identifiers.
+
+Two main approaches are considered below.
+
+2. Common Design Principles
+
+Regardless of which approach is chosen, the following principles should remain the same.
+
+2.1 Stable identifiers
+
+Every record should carry stable identifiers through the complete flow.
+
+Recommended identifiers:
+
+sourceEventId   -> identifies the original PWSSP event, normally MID or equivalent
+adviceId        -> identifies one logical advice generated from the source event
+pcssLookupId    -> identifies one PCSS lookup associated with the advice
+correlationId   -> used across logs/topics/traces
+
+Example:
+
+Source event:
+MID-12345
+
+Advice 1:
+MID-12345-MAIL-PRIMARY
+
+Advice 2:
+MID-12345-MAIL-SECONDARY
+
+PCSS lookup 1:
+MID-12345-MAIL-PRIMARY-PCSS-1
+
+PCSS lookup 2:
+MID-12345-MAIL-PRIMARY-PCSS-2
+
+The actual IDs do not need to be concatenated strings, but they should be deterministic whenever possible.
+
+A retry of the same business work should produce the same adviceId / pcssLookupId, not a new random identifier.
+
+2.2 Source-event deduplication and advice deduplication are different
+
+Kafka exactly-once processing does not automatically solve duplicate business events sent by an upstream producer.
+
+Therefore the application may require both:
+
+Kafka EOS
++
+Business deduplication
+
+A source-event dedupe key might be:
+
+MID
+
+or, if required by the business model:
+
+MID + version/type/sequence
+
+However, the final advice cannot necessarily be deduplicated only by MID because one input may legitimately generate multiple advice records.
+
+Example:
+
+MID-12345
+   |
+   +--> Advice A
+   |
+   +--> Advice B
+
+The dedupe key for an advice should therefore represent the business identity of that advice.
+
+2.3 PCSS GET calls are safer to retry than external POST side effects
+
+Because PCSS is a GET lookup, repeating the request should normally have no external side effect.
+
+Therefore the system can safely use at-least-once PCSS invocation, assuming the PCSS GET endpoint is functionally idempotent.
+
+A crash may cause the same lookup to happen twice:
+
+GET PCSS
+   |
+   +--> 200 OK
+   |
+application crashes before Kafka state/output is committed
+   |
+Kafka redelivers
+   |
+GET PCSS again
+
+This is normally acceptable for a read-only GET operation.
+
+2.4 Kafka exactly-once does not include PCSS
+
+Kafka Streams can use:
+
+processing.guarantee=exactly_once_v2
+
+This can atomically coordinate Kafka operations such as:
+
+consume Kafka record
++
+update Kafka Streams state store
++
+produce Kafka output record
++
+commit consumed offsets
+
+PCSS cannot participate in that Kafka transaction.
+
+Therefore this cannot become one atomic operation:
+
+Kafka consume
++
+HTTP GET PCSS
++
+Kafka produce
+
+The realistic processing model is:
+
+Exactly-once Kafka state transitions where possible
++
+At-least-once PCSS invocation
++
+Business dedupe/idempotency
+
+2.5 Technical retry and business workflow retry should be separated
+
+Examples of technical failures:
+
+connection timeout
+connection refused
+HTTP 408
+HTTP 429
+HTTP 500
+HTTP 502
+HTTP 503
+HTTP 504
+
+These should generally be classified as retryable.
+
+Examples of permanent/business failures:
+
+invalid request data
+required field missing
+business validation failure
+known permanent 4xx response
+
+These should not be endlessly retried.
+
+A suggested classification is:
+
+Situation
+
+Suggested handling
+
+Connect/read timeout
+
+Retry
+
+DNS/network issue
+
+Retry
+
+HTTP 408
+
+Retry
+
+HTTP 429
+
+Retry with backoff
+
+HTTP 500/502/503/504
+
+Retry
+
+Circuit breaker open
+
+Retry later without calling PCSS
+
+HTTP 400
+
+Usually permanent; validate response semantics
+
+HTTP 401/403
+
+Configuration/authentication issue; alert and avoid infinite retry
+
+Required business data missing
+
+Business rejection
+
+Malformed PCSS response
+
+Short retry, then technical failure
+
+Retry horizon exceeded
+
+Parking/DLQ + alert
+
+3. Approach 1 — Intermediate Kafka Topic
+
+3.1 Overview
+
+In this design, Kafka Streams performs the deterministic Kafka-side processing and then creates a durable PCSS work item on an intermediate Kafka topic.
+
+A separate Spring Kafka consumer performs the PCSS REST call.
+
+High-level flow:
+
+PWSSP_PDM_PUBLIC
+        |
+        v
+Kafka Streams - Stage A
+  - filter
+  - dedupe
+  - map/normalize
+  - determine advice(s)
+  - derive PCSS request(s)
+        |
+        v
+PCSS_LOOKUP_REQUEST
+        |
+        v
+Spring Kafka PCSS Worker
+        |
+        v
+GET PCSS
+   /         \
+SUCCESS     RETRYABLE FAILURE
+   |              |
+   v              v
+PCSS_RESULT   retry topics / delayed retry
+   |
+   v
+Kafka Streams - Stage B
+  - combine required lookups
+  - address/preference mapping
+  - headers
+  - business validation
+  - final advice mapping
+   |
+   v
+PANTS_PROCESSED
+
+The intermediate topic acts as a durable checkpoint between the Kafka-only processing and external I/O.
+
+3.2 Sequence diagram
+
+sequenceDiagram
+    participant U as Upstream Producer
+    participant I as PWSSP_PDM_PUBLIC
+    participant S1 as Kafka Streams Stage A
+    participant D as Dedupe State Store
+    participant W as PCSS_LOOKUP_REQUEST
+    participant C as PCSS Worker
+    participant P as PCSS API
+    participant R as PCSS_RESULT
+    participant S2 as Kafka Streams Stage B
+    participant O as PANTS_PROCESSED
+
+    U->>I: Produce PWSSP event
+    I->>S1: Consume event
+    S1->>S1: Filter / map / determine advice(s)
+    S1->>D: Check sourceEventId
+
+    alt Duplicate source event
+        D-->>S1: Already processed
+        S1->>S1: Drop duplicate
+    else New source event
+        D-->>S1: Not processed
+        S1->>D: Store sourceEventId
+        S1->>W: Produce PCSS work item(s)
+    end
+
+    W->>C: Consume PCSS work
+    C->>P: GET PCSS(account, office)
+
+    alt PCSS success
+        P-->>C: 200 + response
+        C->>R: Produce successful lookup result
+    else Retryable PCSS failure
+        P-->>C: timeout / 429 / 5xx
+        C->>C: Classify error + backoff
+        C->>W: Retry later via retry mechanism
+    else Permanent failure
+        P-->>C: non-retryable response
+        C->>C: Send to rejection/DLQ path
+    end
+
+    R->>S2: Consume PCSS result
+    S2->>S2: Aggregate required lookup(s)
+    S2->>S2: Address mapping / headers / validation
+    S2->>O: Produce final advice(s)
+
+3.3 Exactly-once behavior in Stage A
+
+Stage A can use Kafka Streams EOS v2.
+
+Conceptually:
+
+BEGIN Kafka transaction
+
+consume PWSSP event
+update dedupe state
+produce PCSS work record(s)
+commit input offset
+
+COMMIT
+
+If the Streams instance fails before commit, the complete Kafka transaction is aborted and the source record can be processed again.
+
+This prevents a dangerous state such as:
+
+dedupe says MID processed
+but
+PCSS work record was never created
+
+The desired result is:
+
+both dedupe state + work event committed
+or
+neither committed
+
+3.4 PCSS worker behavior
+
+The PCSS worker should be a normal Spring Kafka consumer, for example an @KafkaListener using its own consumer group.
+
+Its responsibilities are:
+
+consume PCSS work
+call PCSS
+apply HTTP timeout
+apply circuit breaker
+apply concurrency/bulkhead limits
+classify response
+produce result or schedule retry
+commit Kafka work atomically where possible
+
+The PCSS call itself is outside Kafka's transaction.
+
+For a successful response, the Kafka side can still atomically perform:
+
+produce PCSS_RESULT
++
+commit PCSS_LOOKUP_REQUEST offset
+
+If the application crashes after PCSS returned 200 but before the Kafka transaction commits, Kafka may redeliver the PCSS request and the GET may occur again.
+
+Because this is a GET, this should normally be safe.
+
+3.5 Retry strategy
+
+Avoid performing large retry loops inside the Kafka listener thread.
+
+A small immediate retry may be reasonable for very short transient network errors, but long outages should move work out of the active consumer call path.
+
+Conceptually:
+
+Initial PCSS call
+     |
+     +--> success -> PCSS_RESULT
+     |
+     +--> transient failure
+              |
+              v
+         retry after 30s
+              |
+              v
+         retry after 2m
+              |
+              v
+         retry after 10m
+              |
+              v
+         retry after 30m
+
+The exact timing should be based on operational requirements and PCSS SLAs.
+
+Potential retry topics could be:
+
+pcss-retry-30s
+pcss-retry-2m
+pcss-retry-10m
+pcss-retry-30m
+
+or another delayed-retry implementation supported by the platform.
+
+3.6 PCSS outage scenario
+
+Assume PCSS is unavailable from 10:00 to 11:00.
+
+10:00 PCSS request -> 503
+10:01 retry -> 503
+10:05 retry -> 503
+10:15 retry -> 503
+10:45 retry -> 503
+11:05 retry -> 200
+
+The original PWSSP event does not need to be replayed.
+
+The durable work already exists in Kafka.
+
+When PCSS recovers, the PCSS worker resumes draining the pending retry backlog.
+
+This provides a natural recovery model:
+
+Original source processing
+        |
+        v
+PCSS work topic  <--- durable checkpoint
+        |
+        v
+PCSS worker can fail/restart/retry independently
+
+3.7 Circuit breaker and bulkhead
+
+A circuit breaker is useful if PCSS is unavailable.
+
+Without it:
+
+large backlog
+   |
+   v
+thousands of requests
+   |
+   v
+all hit unavailable PCSS
+
+With a circuit breaker:
+
+several failures
+   |
+   v
+Circuit OPEN
+   |
+   v
+stop calling PCSS temporarily
+   |
+   v
+work remains durable for later retry
+
+When the cool-down period expires:
+
+HALF_OPEN
+   |
+small number of test calls
+   |
+PCSS healthy
+   |
+CLOSED
+
+A bulkhead / concurrency limit should also control the number of simultaneous PCSS calls when a backlog is draining after an outage.
+
+Example:
+
+Kafka backlog = 100,000
+PCSS concurrency = 5
+
+This prevents PCSS from being overloaded immediately after recovery.
+
+3.8 Handling one or two PCSS calls
+
+There are two possible designs.
+
+Simple design
+
+One advice-work record contains both lookup requests:
+
+{
+  "sourceEventId": "MID-123",
+  "adviceId": "MID-123-MAIL",
+  "pcssLookups": [
+    {"lookupId": "...-1", "account": "123", "office": "001"},
+    {"lookupId": "...-2", "account": "456", "office": "002"}
+  ]
+}
+
+The PCSS worker performs both calls.
+
+If the first succeeds and the second fails, the work item can be retried. The successful GET may occur again, which is normally acceptable because it is read-only.
+
+This is simpler and may be sufficient for moderate volume.
+
+More granular design
+
+Create one work record per PCSS lookup:
+
+Advice A
+   |
+   +--> PCSS Lookup 1
+   |
+   +--> PCSS Lookup 2
+
+Results are then aggregated by adviceId before final output.
+
+This avoids re-running successful lookups but requires an aggregation state store or equivalent correlation mechanism.
+
+3.9 Advantages
+
+External REST latency does not block Kafka Streams threads.
+
+Pending PCSS work is durable in Kafka.
+
+PCSS can be down for an extended period without losing work.
+
+No original PWSSP replay is required after PCSS recovery.
+
+Retry backlog is naturally represented as Kafka records.
+
+Consumer groups provide scalable work distribution.
+
+PCSS worker can scale independently from Kafka Streams preprocessing.
+
+Kafka Streams remains focused on deterministic event processing.
+
+Kafka EOS can protect Kafka-only state transitions.
+
+Clear operational separation between processing stages.
+
+Easier to monitor backlog using consumer lag.
+
+3.10 Disadvantages
+
+Additional Kafka topics are required.
+
+More services/components or at least more logical consumers are involved.
+
+More message schemas must be governed.
+
+Cross-stage tracing must be implemented carefully.
+
+Ordering may change during retries unless specifically preserved.
+
+4. Approach 2 — State Store as Pending PCSS Workflow
+
+4.1 Overview
+
+In this design, no intermediate Kafka topic is used for PCSS work.
+
+Kafka Streams stores pending PCSS requests and retry state in a persistent state store.
+
+A punctuator periodically inspects pending records and submits due PCSS calls to a bounded worker pool.
+
+High-level flow:
+
+PWSSP_PDM_PUBLIC
+        |
+        v
+Kafka Streams
+  - filter
+  - dedupe
+  - map
+  - determine advice(s)
+        |
+        v
+Pending PCSS State Store
+  status = PENDING / RETRY_WAIT / SUCCESS / FAILED
+  nextAttemptAt
+  attemptCount
+        |
+        v
+Punctuator
+        |
+        v
+bounded PCSS worker pool
+        |
+        v
+GET PCSS
+        |
+        v
+worker-result queue
+        |
+        v
+Streams thread updates state store
+        |
+        v
+final mapping/validation
+        |
+        v
+PANTS_PROCESSED
+
+The state store becomes both the workflow state repository and the durable source of pending work.
+
+4.2 Important distinction: a state store is not a queue
+
+A Kafka Streams state store is essentially:
+
+key -> value
+
+Example:
+
+lookup-A -> PENDING
+lookup-B -> RETRY_WAIT
+lookup-C -> SUCCESS
+
+It does not automatically mean:
+
+process A
+then process B
+then process C
+
+The application must implement scheduling logic to find which records are due for execution.
+
+4.3 Suggested state model
+
+Example value:
+
+{
+  "sourceEventId": "MID-123",
+  "adviceId": "MID-123-MAIL",
+  "pcssLookupId": "MID-123-MAIL-PCSS-1",
+  "status": "RETRY_WAIT",
+  "attempt": 3,
+  "nextAttemptAt": "2026-09-18T14:30:00Z",
+  "lastError": "HTTP_503",
+  "response": null
+}
+
+Possible states:
+
+PENDING
+IN_FLIGHT
+RETRY_WAIT
+SUCCESS
+FAILED
+
+If an advice requires multiple PCSS lookups, the advice-level state might contain:
+
+{
+  "adviceId": "MID-123-MAIL",
+  "lookup1": "SUCCESS",
+  "lookup2": "PENDING"
+}
+
+The final advice is produced only when all required lookups are complete.
+
+4.4 Sequence diagram
+
+sequenceDiagram
+    participant U as Upstream Producer
+    participant I as PWSSP_PDM_PUBLIC
+    participant S as Kafka Streams
+    participant D as Dedupe State Store
+    participant PSS as Pending PCSS State Store
+    participant X as PCSS Worker Pool
+    participant P as PCSS API
+    participant O as PANTS_PROCESSED
+
+    U->>I: Produce PWSSP event
+    I->>S: Consume event
+    S->>S: Filter / map / determine advice(s)
+    S->>D: Check sourceEventId
+
+    alt Duplicate source event
+        D-->>S: Already processed
+        S->>S: Drop duplicate
+    else New source event
+        D-->>S: Not processed
+        S->>D: Store sourceEventId
+        S->>PSS: Store pending PCSS lookup(s)
+    end
+
+    loop Periodic punctuator
+        S->>PSS: Find due records (nextAttemptAt <= now)
+        PSS-->>S: Due lookup(s)
+        S->>X: Submit bounded async PCSS work
+        X->>P: GET PCSS(account, office)
+
+        alt Success
+            P-->>X: 200 + response
+            X-->>S: Queue success result
+            S->>PSS: status=SUCCESS + save response
+        else Retryable failure
+            P-->>X: timeout / 429 / 5xx
+            X-->>S: Queue retryable result
+            S->>PSS: status=RETRY_WAIT, increment attempt, set nextAttemptAt
+        else Permanent failure
+            P-->>X: permanent response
+            X-->>S: Queue failure result
+            S->>PSS: status=FAILED
+        end
+    end
+
+    S->>PSS: Check whether all required lookups succeeded
+    PSS-->>S: Lookup completion state
+    S->>S: Address mapping / headers / validation
+    S->>O: Produce final advice(s)
+
+4.5 Do not block the Kafka Streams thread with PCSS calls
+
+A naive state-store design would do this:
+
+for (PendingJob job : dueJobs) {
+    pcssClient.get(job);
+}
+
+This is risky because the Kafka Streams thread is blocked while waiting for PCSS.
+
+If PCSS takes 10 seconds per timeout:
+
+Job A -> wait 10 sec
+Job B -> wait 10 sec
+Job C -> wait 10 sec
+
+The StreamThread becomes an HTTP polling worker instead of processing Kafka records.
+
+Therefore the stronger state-store design requires a bounded asynchronous worker pool.
+
+4.6 Safe threading model
+
+Recommended pattern:
+
+Kafka StreamThread
+      |
+      +--> read/update state store
+      |
+      +--> submit work to bounded PCSS executor
+                      |
+                      v
+                  GET PCSS
+                      |
+                      v
+                result queue
+                      |
+                      v
+Kafka StreamThread / punctuator consumes result
+      |
+      v
+update Kafka Streams state store
+
+Worker threads should not directly mutate Kafka Streams state stores.
+
+The StreamThread / processor context should own state-store mutation.
+
+This introduces additional implementation complexity compared with the intermediate-topic design.
+
+4.7 Retry scheduling
+
+The state store must store the retry schedule explicitly.
+
+Example:
+
+status        = RETRY_WAIT
+attempt       = 3
+nextAttemptAt = 10:40
+
+The punctuator periodically looks for due records:
+
+nextAttemptAt <= now
+AND
+status in (PENDING, RETRY_WAIT)
+
+Possible retry sequence:
+
+10:00 initial request
+10:01 retry
+10:05 retry
+10:15 retry
+10:45 retry
+11:15 retry
+
+When PCSS becomes healthy, the next due attempt succeeds.
+
+No original PWSSP event needs to be reingested because the state store still contains the pending workflow.
+
+4.8 Recovery after node restart
+
+A persistent Kafka Streams state store uses a changelog topic.
+
+Conceptually:
+
+Node dies
+   |
+local RocksDB unavailable
+   |
+new/restarted Streams task
+   |
+restores state from changelog topic
+   |
+pending PCSS records are recovered
+
+This can provide durable recovery as long as the state-store/changelog configuration and retention model meet the business requirements.
+
+4.9 The difficult IN_FLIGHT problem
+
+The state-store design must define what happens when a worker is in the middle of a PCSS call and the application crashes.
+
+Example:
+
+StateStore = IN_FLIGHT
+       |
+GET PCSS
+       |
+application dies
+
+On restart, the system must not leave that record permanently stuck as IN_FLIGHT.
+
+Typical recovery logic might treat stale IN_FLIGHT records as retryable:
+
+if status == IN_FLIGHT
+and inFlightSince < now - recoveryThreshold
+then
+    status = RETRY_WAIT
+
+Because PCSS is a GET, retrying the lookup should normally be safe.
+
+This is another piece of workflow logic the application must own.
+
+4.10 Backlog handling
+
+Assume PCSS is down for six hours and 100,000 pending lookups accumulate.
+
+The state store contains the backlog, but Kafka Streams does not automatically schedule that backlog like a Kafka consumer group would.
+
+The application must implement:
+
+selection of due records
+batch size
+worker concurrency
+fairness
+retry ordering
+rate limiting
+backpressure
+stale IN_FLIGHT recovery
+
+For example:
+
+punctuator every 10 seconds
+find max 100 due records
+submit max 5 concurrent PCSS requests
+
+This is feasible, but it effectively turns the application into a small workflow scheduler.
+
+4.11 Advantages
+
+No intermediate PCSS work topic is required.
+
+Workflow state is visible in one state store.
+
+Kafka Streams changelog can recover pending workflow state after restart.
+
+Good fit when overall volume is small.
+
+Good fit if the team wants the entire workflow owned by one Kafka Streams application.
+
+State store can naturally represent partial completion such as lookup 1 successful and lookup 2 pending.
+
+4.12 Disadvantages
+
+State store is not naturally a work queue.
+
+Retry scheduling must be built manually.
+
+Punctuator logic is required.
+
+A bounded worker executor is required to avoid blocking StreamThreads.
+
+Worker-to-StreamThread result coordination is required.
+
+Stale IN_FLIGHT recovery must be implemented.
+
+Backpressure and backlog draining must be designed manually.
+
+Store scanning can become expensive at large scale unless due-work indexing is carefully designed.
+
+Concurrency is more complicated.
+
+Operational understanding is harder than normal Kafka consumer lag.
+
+The application begins to behave like a custom workflow engine.
+
+5. Comparison
+
+Area
+
+Intermediate Topic
+
+State Store Workflow
+
+Pending work storage
+
+Kafka topic
+
+RocksDB + changelog
+
+Natural work queue
+
+Yes
+
+No
+
+REST processing
+
+Separate consumer
+
+Worker pool inside Streams app
+
+Blocks StreamThread
+
+No
+
+Must be carefully avoided
+
+Retry scheduling
+
+Kafka retry mechanism / topics
+
+Custom nextAttemptAt + punctuator
+
+Long PCSS outage
+
+Natural backlog in Kafka
+
+Pending state accumulated in store
+
+Restart recovery
+
+Kafka offsets/topic
+
+Changelog restore + workflow recovery
+
+Backpressure
+
+Kafka consumer naturally provides it
+
+Must be implemented
+
+Scaling PCSS calls
+
+Consumer-group concurrency
+
+Custom worker concurrency
+
+Dedupe
+
+State store
+
+State store
+
+Multiple PCSS lookups
+
+Work items + aggregation
+
+Natural state representation but custom scheduling
+
+Kafka EOS
+
+Strong between Kafka stages
+
+Strong for Kafka/store operations
+
+External REST exactly-once
+
+No
+
+No
+
+Operational visibility
+
+Consumer lag + topic metrics
+
+Custom state-store metrics needed
+
+Complexity
+
+Moderate
+
+Higher
+
+Best fit
+
+Resilient external-I/O workflows
+
+Low-volume tightly controlled workflow
+
+6. Recommended Separation of Responsibilities
+
+A useful rule for this design is:
+
+State Store = what we know / current business state
+Kafka Topic = what needs to happen
+
+This suggests a hybrid model:
+
+PWSSP_PDM_PUBLIC
+        |
+        v
+Kafka Streams
+        |
+        +--> Dedupe State Store
+        |
+        +--> Advice/Aggregation State Store if needed
+        |
+        v
+PCSS_LOOKUP_REQUEST
+        |
+        v
+PCSS Worker
+        |
+        v
+PCSS_RESULT
+        |
+        v
+Kafka Streams finalization
+        |
+        v
+PANTS_PROCESSED
+
+State stores remain extremely useful for:
+
+source-event deduplication;
+
+tracking completion of multiple lookups for one advice;
+
+aggregation;
+
+storing deterministic business state.
+
+Kafka topics remain better suited for:
+
+pending external work;
+
+retryable work;
+
+durable handoff between stages;
+
+backlog management;
+
+independent scaling.
+
+7. Failure-Scenario Comparison
+
+Failure
+
+Intermediate Topic
+
+State Store
+
+Duplicate source PWSSP event
+
+Dedupe state store
+
+Dedupe state store
+
+Streams crashes before commit
+
+EOS reprocesses source
+
+EOS reprocesses source
+
+PCSS timeout
+
+Retry work topic
+
+Update state to RETRY_WAIT
+
+PCSS 500 for one hour
+
+Work remains/retries in Kafka
+
+Pending records remain in store
+
+PCSS comes back
+
+Consumers resume retry backlog
+
+Punctuator eventually finds due work
+
+PCSS returns 200, app crashes immediately after
+
+GET may repeat; Kafka redelivery
+
+GET may repeat after stale in-flight recovery
+
+Node hosting state store dies
+
+Kafka work still independent
+
+Store restored from changelog before resuming
+
+Large retry backlog
+
+Kafka queue naturally holds it
+
+App must scan/schedule backlog
+
+Need to limit PCSS concurrency
+
+Listener concurrency / bulkhead
+
+Custom executor / bulkhead
+
+One source produces two advices
+
+Separate deterministic adviceIds
+
+Separate deterministic adviceIds
+
+One advice requires two lookups
+
+Two work items or grouped request
+
+Track both lookup states in store
+
+8. Questions to Resolve Before Final Design
+
+The following business/technical decisions should be confirmed before implementation:
+
+What is the authoritative source-event dedupe key: MID only, or MID plus another field?
+
+How long can upstream legitimately replay an event?
+
+How long must dedupe state be retained?
+
+What uniquely identifies two legitimate advices produced from the same source event?
+
+Can one advice be produced if one of its two PCSS lookups succeeds and the other fails, or must both succeed?
+
+What PCSS responses mean "not found but valid" versus technical failure?
+
+What is the maximum acceptable retry horizon for PCSS outages?
+
+Is ordering between final advice records important?
+
+What is the expected PCSS throughput and concurrency limit?
+
+What is PCSS's normal latency / P95 / P99 so HTTP timeouts can be configured appropriately?
+
+Should PCSS retry indefinitely, retry for a fixed duration, or move to a parking/DLQ topic after a defined horizon?
+
+Do downstream consumers of transactional Kafka output use isolation.level=read_committed?
+
+Is there any scenario where PCSS GET is not truly read-only or returns time-dependent values that affect replay behavior?
+
+What monitoring and alerting thresholds are required for retry backlog, circuit breaker state, DLQ volume, and oldest pending request age?
+
+9. Summary
+
+Both approaches are technically possible.
+
+The intermediate-topic design treats pending PCSS calls as durable work. Kafka is responsible for holding and distributing that work, while a separate consumer handles PCSS I/O, timeouts, retries, circuit breaking, and backlog draining. This keeps Kafka Streams focused on Kafka/stateful transformations and provides a clean recovery model during extended PCSS outages.
+
+The state-store design keeps the entire workflow inside the Kafka Streams application. It can survive restarts through RocksDB/changelog recovery and can represent detailed workflow state, but the application must implement its own scheduler, retry timestamps, punctuator, bounded worker pool, in-flight recovery, backlog handling, and worker-to-StreamThread coordination.
+
+For a design where PCSS may be unavailable for extended periods and work must recover automatically without re-ingesting the original PWSSP event, the intermediate-topic design generally provides the simpler operational model. A state store still remains valuable for deduplication and aggregation in either approach.
