@@ -1,0 +1,323 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>RightFax delivery flow with state store steps</title>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);
+--bg:#fafafa;--ink:#222;--muted:#555;--ln:#444;--proc:#d9ead3;--procS:#6aa84f;--dec:#e4dcf3;--decS:#8e7cc3;--nb:#f6c9cf;--nbS:#c66b78;--bl:#f9dcc4;--blS:#cf8a4f;--store:#efefef;--storeS:#888;--note:#fff;--alert:#cdeccd;--alertS:#3c9a3c;--bk:#cf8a4f;--cont:#9a9a9a;}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#1c1c1e;--ink:#e8e8e8;--muted:#b0b0b0;--ln:#bbb;--proc:#26391f;--procS:#7fbf63;--dec:#2f2742;--decS:#a594d6;--nb:#4a242b;--nbS:#e08a96;--bl:#47311f;--blS:#e2a36c;--store:#2c2c2e;--storeS:#999;--note:#232325;--alert:#1f3d1f;--alertS:#6cc46c;--bk:#e2a36c;--cont:#777;}}
+:root[data-theme="dark"]{--bg:#1c1c1e;--ink:#e8e8e8;--muted:#b0b0b0;--ln:#bbb;--proc:#26391f;--procS:#7fbf63;--dec:#2f2742;--decS:#a594d6;--nb:#4a242b;--nbS:#e08a96;--bl:#47311f;--blS:#e2a36c;--store:#2c2c2e;--storeS:#999;--note:#232325;--alert:#1f3d1f;--alertS:#6cc46c;--bk:#e2a36c;--cont:#777;}
+html,body{margin:0;background:var(--bg);color:var(--ink);font-family:"Segoe UI",system-ui,-apple-system,Helvetica,Arial,sans-serif}
+h1{font-size:18px;font-weight:600;margin:16px 20px 4px}
+p{margin:0 20px 12px;color:var(--muted);font-size:14px;max-width:80ch}
+.wrap{overflow-x:auto;padding:0 12px 16px}
+svg{display:block;width:100%;min-width:1400px;height:auto}
+.t{fill:var(--ink)} .lbl{fill:var(--muted)}
+.proc{fill:var(--proc);stroke:var(--procS);stroke-width:1}
+.dec{fill:var(--dec);stroke:var(--decS);stroke-width:1}
+.nb{fill:var(--nb);stroke:var(--nbS);stroke-width:1}
+.bl{fill:var(--bl);stroke:var(--blS);stroke-width:1}
+.store{fill:var(--store);stroke:var(--storeS);stroke-width:1}
+.note{fill:var(--note);stroke:var(--storeS);stroke-width:1}
+.alert{fill:var(--alert);stroke:var(--alertS);stroke-width:1}
+.topic{fill:var(--note);stroke:var(--ln);stroke-width:1}
+.topicarc{stroke:var(--ln);stroke-width:1}
+.ln{stroke:var(--ln);stroke-width:1.2}
+.eb{stroke:var(--nbS);stroke-width:1.2;stroke-dasharray:2 3}
+.eb2{stroke:var(--muted);stroke-width:1;stroke-dasharray:3 3}
+.bk{stroke:var(--bk);stroke-width:1.2;stroke-dasharray:6 4}
+.bkhead{fill:var(--bk)}
+.cont{fill:none;stroke:var(--cont);stroke-width:1;stroke-dasharray:6 5}
+</style></head><body>
+<h1>RightFax delivery flow with state store steps</h1>
+<p>Kafka Streams topology: fax filter, dedup, mapping and PDF generation, then a punctuator-driven state machine for the RightFax calls (login session, upload, send job, status poll) behind a circuit breaker.</p>
+<div class="wrap"><svg viewBox="0 0 2130 1140" role="img" aria-label="End-to-end flow diagram">
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--ln)"/></marker></defs>
+<rect class="bl" x="200" y="24" width="1900" height="24" rx="4"/>
+<text class="t" x="1150.0" y="36.0" text-anchor="middle" dominant-baseline="central" font-size="12">Uncaught error</text>
+<rect class="nb" x="300" y="56" width="1700" height="24" rx="4"/>
+<text class="t" x="1150.0" y="68.0" text-anchor="middle" dominant-baseline="central" font-size="12">App stream error</text>
+<rect class="bl" x="30" y="120" width="170" height="38" rx="4" stroke-dasharray="5 4"/>
+<text class="t" x="115.0" y="132.0" text-anchor="middle" dominant-baseline="central" font-size="11">Config load error</text>
+<text class="t" x="115.0" y="146.0" text-anchor="middle" dominant-baseline="central" font-size="11">RightFax URL, creds</text>
+<rect class="topic" x="30" y="205" width="110" height="50" rx="25.0"/>
+<path class="topicarc" d="M55.0 205 A12.5 25.0 0 0 1 55.0 255" fill="none"/>
+<text class="t" x="92.5" y="230.0" text-anchor="middle" dominant-baseline="central" font-size="13">Source</text>
+<rect class="proc" x="165" y="205" width="115" height="50" rx="4"/>
+<text class="t" x="222.5" y="230.0" text-anchor="middle" dominant-baseline="central" font-size="13">Deserialization</text>
+<polygon class="dec" points="360,195.0 415.0,230 360,265.0 305.0,230"/>
+<text class="t" x="360" y="222.5" text-anchor="middle" dominant-baseline="central" font-size="12">Channel</text>
+<text class="t" x="360" y="237.5" text-anchor="middle" dominant-baseline="central" font-size="12">= Fax?</text>
+<rect class="store" x="305" y="122" width="110" height="38" rx="4"/>
+<text class="t" x="360.0" y="134.0" text-anchor="middle" dominant-baseline="central" font-size="11">Not a fax</text>
+<text class="t" x="360.0" y="148.0" text-anchor="middle" dominant-baseline="central" font-size="11">skip, commit</text>
+<path class="ln" d="M360 195 L360 162" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="368" y="180.0" text-anchor="start" dominant-baseline="central" font-size="12">No</text>
+<rect class="proc" x="445" y="205" width="120" height="50" rx="4"/>
+<text class="t" x="505.0" y="230.0" text-anchor="middle" dominant-baseline="central" font-size="13">Dedup by MID</text>
+<path class="store" d="M462 118 L462 154 A43.0 8 0 0 0 548 154 L548 118"/>
+<ellipse class="store" cx="505.0" cy="118" rx="43.0" ry="8"/>
+<text class="t" x="505.0" y="133.5" text-anchor="middle" dominant-baseline="central" font-size="12">Dedup</text>
+<text class="t" x="505.0" y="148.5" text-anchor="middle" dominant-baseline="central" font-size="12">store</text>
+<path class="ln" d="M505 162 L505 205" fill="none"/>
+<rect class="proc" x="595" y="205" width="120" height="50" rx="4"/>
+<text class="t" x="655.0" y="222.0" text-anchor="middle" dominant-baseline="central" font-size="13">Map to</text>
+<text class="t" x="655.0" y="238.0" text-anchor="middle" dominant-baseline="central" font-size="13">fax model</text>
+<rect class="proc" x="745" y="205" width="120" height="50" rx="4"/>
+<text class="t" x="805.0" y="230.0" text-anchor="middle" dominant-baseline="central" font-size="13">Generate PDF</text>
+<rect class="proc" x="895" y="205" width="165" height="50" rx="4"/>
+<text class="t" x="977.5" y="223.0" text-anchor="middle" dominant-baseline="central" font-size="11">Create pending entry</text>
+<text class="t" x="977.5" y="237.0" text-anchor="middle" dominant-baseline="central" font-size="11">state UPLOAD, due now</text>
+<path class="ln" d="M140 230 L163 230" fill="none" marker-end="url(#ah)"/>
+<path class="ln" d="M280 230 L303 230" fill="none" marker-end="url(#ah)"/>
+<path class="ln" d="M415 230 L443 230" fill="none" marker-end="url(#ah)"/>
+<path class="ln" d="M565 230 L593 230" fill="none" marker-end="url(#ah)"/>
+<path class="ln" d="M715 230 L743 230" fill="none" marker-end="url(#ah)"/>
+<path class="ln" d="M865 230 L893 230" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="429" y="220.0" text-anchor="middle" dominant-baseline="central" font-size="11">Yes</text>
+<rect class="nb" x="167" y="285" width="111" height="34" rx="4"/>
+<text class="t" x="222.5" y="295.0" text-anchor="middle" dominant-baseline="central" font-size="11">Deserialization</text>
+<text class="t" x="222.5" y="309.0" text-anchor="middle" dominant-baseline="central" font-size="11">error</text>
+<path class="ln" d="M222 255 L222 283" fill="none" marker-end="url(#ah)"/>
+<rect class="nb" x="455" y="285" width="100" height="34" rx="4"/>
+<text class="t" x="505.0" y="295.0" text-anchor="middle" dominant-baseline="central" font-size="11">Duplicate</text>
+<text class="t" x="505.0" y="309.0" text-anchor="middle" dominant-baseline="central" font-size="11">error</text>
+<path class="ln" d="M505 255 L505 283" fill="none" marker-end="url(#ah)"/>
+<rect class="nb" x="605" y="285" width="100" height="34" rx="4"/>
+<text class="t" x="655.0" y="295.0" text-anchor="middle" dominant-baseline="central" font-size="11">Mapping</text>
+<text class="t" x="655.0" y="309.0" text-anchor="middle" dominant-baseline="central" font-size="11">error</text>
+<path class="ln" d="M655 255 L655 283" fill="none" marker-end="url(#ah)"/>
+<rect class="nb" x="750" y="285" width="110" height="34" rx="4"/>
+<text class="t" x="805.0" y="295.0" text-anchor="middle" dominant-baseline="central" font-size="11">PDF generation</text>
+<text class="t" x="805.0" y="309.0" text-anchor="middle" dominant-baseline="central" font-size="11">error</text>
+<path class="ln" d="M805 255 L805 283" fill="none" marker-end="url(#ah)"/>
+<path class="eb" d="M222 319 L222 345" fill="none"/>
+<path class="eb" d="M505 319 L505 345" fill="none"/>
+<path class="eb" d="M655 319 L655 345" fill="none"/>
+<path class="eb" d="M805 319 L805 345" fill="none"/>
+<path class="eb" d="M222 345 L805 345" fill="none"/>
+<path class="eb" d="M675 345 L675 403" fill="none" marker-end="url(#ah)"/>
+<rect class="topic" x="600" y="405" width="150" height="42" rx="21.0"/>
+<path class="topicarc" d="M621.0 405 A10.5 21.0 0 0 1 621.0 447" fill="none"/>
+<text class="t" x="681.3" y="426.0" text-anchor="middle" dominant-baseline="central" font-size="13">Error topic</text>
+<text class="lbl" x="675" y="465.0" text-anchor="middle" dominant-baseline="central" font-size="12">All pink errors land here,</text>
+<text class="lbl" x="675" y="481.0" text-anchor="middle" dominant-baseline="central" font-size="12">offset committed, stream moves on</text>
+<rect class="cont" x="1110" y="108" width="1000" height="235" rx="8"/>
+<text class="lbl" x="1125" y="124.0" text-anchor="start" dominant-baseline="central" font-size="12">RightFax session manager: shared by every call, cookie held in memory only</text>
+<rect class="proc" x="1130" y="190" width="120" height="50" rx="4"/>
+<text class="t" x="1190.0" y="207.5" text-anchor="middle" dominant-baseline="central" font-size="12">Any RightFax</text>
+<text class="t" x="1190.0" y="222.5" text-anchor="middle" dominant-baseline="central" font-size="12">call</text>
+<polygon class="dec" points="1345,180.0 1405.0,215 1345,250.0 1285.0,215"/>
+<text class="t" x="1345" y="208.0" text-anchor="middle" dominant-baseline="central" font-size="11">Cookie cached</text>
+<text class="t" x="1345" y="222.0" text-anchor="middle" dominant-baseline="central" font-size="11">and fresh?</text>
+<path class="ln" d="M1250 215 L1283 215" fill="none" marker-end="url(#ah)"/>
+<rect class="proc" x="1440" y="190" width="150" height="50" rx="4"/>
+<text class="t" x="1515.0" y="207.5" text-anchor="middle" dominant-baseline="central" font-size="12">Call with</text>
+<text class="t" x="1515.0" y="222.5" text-anchor="middle" dominant-baseline="central" font-size="12">rf-session cookie</text>
+<path class="ln" d="M1405 215 L1438 215" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="1422" y="205.0" text-anchor="middle" dominant-baseline="central" font-size="11">Yes</text>
+<polygon class="dec" points="1665,180.0 1720.0,215 1665,250.0 1610.0,215"/>
+<text class="t" x="1665" y="208.0" text-anchor="middle" dominant-baseline="central" font-size="11">401 session</text>
+<text class="t" x="1665" y="222.0" text-anchor="middle" dominant-baseline="central" font-size="11">expired?</text>
+<path class="ln" d="M1590 215 L1608 215" fill="none" marker-end="url(#ah)"/>
+<rect class="proc" x="1760" y="190" width="140" height="50" rx="4"/>
+<text class="t" x="1830.0" y="207.5" text-anchor="middle" dominant-baseline="central" font-size="12">Result back</text>
+<text class="t" x="1830.0" y="222.5" text-anchor="middle" dominant-baseline="central" font-size="12">to the step</text>
+<path class="ln" d="M1720 215 L1758 215" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="1739" y="205.0" text-anchor="middle" dominant-baseline="central" font-size="11">No</text>
+<rect class="proc" x="1285" y="275" width="120" height="45" rx="4"/>
+<text class="t" x="1345.0" y="290.0" text-anchor="middle" dominant-baseline="central" font-size="12">Login call</text>
+<text class="t" x="1345.0" y="305.0" text-anchor="middle" dominant-baseline="central" font-size="12">get rf-session</text>
+<path class="ln" d="M1345 250 L1345 273" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="1353" y="262.0" text-anchor="start" dominant-baseline="central" font-size="11">No</text>
+<path class="ln" d="M1405 297 L1515 297 L1515 242" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="1460" y="312.0" text-anchor="middle" dominant-baseline="central" font-size="11">cache, single-flight</text>
+<path class="ln" d="M1665 250 L1665 330 L1345 330 L1345 322" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="1673" y="268.0" text-anchor="start" dominant-baseline="central" font-size="11">Yes: drop cookie,</text>
+<text class="lbl" x="1673" y="284.0" text-anchor="start" dominant-baseline="central" font-size="11">re-login, repeat once</text>
+<text class="lbl" x="1673" y="300.0" text-anchor="start" dominant-baseline="central" font-size="11">(not counted as attempt)</text>
+<text class="lbl" x="1840" y="275.0" text-anchor="start" dominant-baseline="central" font-size="11">Login fails (creds, 403,</text>
+<text class="lbl" x="1840" y="291.0" text-anchor="start" dominant-baseline="central" font-size="11">TLS) → blocking → breaker</text>
+<text class="lbl" x="1915" y="208.0" text-anchor="start" dominant-baseline="central" font-size="11">Never stored in the</text>
+<text class="lbl" x="1915" y="224.0" text-anchor="start" dominant-baseline="central" font-size="11">state store or logged</text>
+<path class="bk" d="M1110 320 L1080 320 L1080 360 L470 360 L470 498" fill="none"/>
+<text class="lbl" x="700" y="372.0" text-anchor="start" dominant-baseline="central" font-size="12">All RightFax calls use the breaker</text>
+<rect class="cont" x="790" y="455" width="1320" height="635" rx="8"/>
+<text class="lbl" x="995" y="470.0" text-anchor="start" dominant-baseline="central" font-size="12">Fax processor: one wall-clock punctuator every 1s, next step chosen by each entry&#x27;s state and dueAt</text>
+<path class="store" d="M815 503 L815 549 A97.5 8 0 0 0 1010 549 L1010 503"/>
+<ellipse class="store" cx="912.5" cy="503" rx="97.5" ry="8"/>
+<text class="t" x="912.5" y="524.0" text-anchor="middle" dominant-baseline="central" font-size="11">Pending fax store</text>
+<text class="t" x="912.5" y="538.0" text-anchor="middle" dominant-baseline="central" font-size="11">MID → state, attempts, ids</text>
+<path class="store" d="M1030 503 L1030 549 A60.0 8 0 0 0 1150 549 L1150 503"/>
+<ellipse class="store" cx="1090.0" cy="503" rx="60.0" ry="8"/>
+<text class="t" x="1090.0" y="524.0" text-anchor="middle" dominant-baseline="central" font-size="11">Due index</text>
+<text class="t" x="1090.0" y="538.0" text-anchor="middle" dominant-baseline="central" font-size="11">dueAt | MID</text>
+<path class="ln" d="M977 255 L977 493" fill="none" marker-end="url(#ah)"/>
+<rect class="proc" x="815" y="615" width="115" height="50" rx="4"/>
+<text class="t" x="872.5" y="632.0" text-anchor="middle" dominant-baseline="central" font-size="13">Punctuator</text>
+<text class="t" x="872.5" y="648.0" text-anchor="middle" dominant-baseline="central" font-size="13">tick 1s</text>
+<polygon class="dec" points="1010,605.0 1060.0,640 1010,675.0 960.0,640"/>
+<text class="t" x="1010" y="632.5" text-anchor="middle" dominant-baseline="central" font-size="12">Breaker</text>
+<text class="t" x="1010" y="647.5" text-anchor="middle" dominant-baseline="central" font-size="12">open?</text>
+<path class="ln" d="M930 640 L958 640" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="1010" y="690.0" text-anchor="middle" dominant-baseline="central" font-size="11">Yes: skip tick</text>
+<rect class="proc" x="1085" y="615" width="120" height="50" rx="4"/>
+<text class="t" x="1145.0" y="632.5" text-anchor="middle" dominant-baseline="central" font-size="12">Scan due ≤ now</text>
+<text class="t" x="1145.0" y="647.5" text-anchor="middle" dominant-baseline="central" font-size="12">max N per tick</text>
+<path class="ln" d="M1060 640 L1083 640" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="1071" y="630.0" text-anchor="middle" dominant-baseline="central" font-size="11">No</text>
+<path class="ln" d="M1090 559 L1090 595 L1145 595 L1145 613" fill="none" marker-end="url(#ah)"/>
+<polygon class="dec" points="1290,605.0 1345.0,640 1290,675.0 1235.0,640"/>
+<text class="t" x="1290" y="633.0" text-anchor="middle" dominant-baseline="central" font-size="11">Dispatch</text>
+<text class="t" x="1290" y="647.0" text-anchor="middle" dominant-baseline="central" font-size="11">by state</text>
+<path class="ln" d="M1205 640 L1233 640" fill="none" marker-end="url(#ah)"/>
+<path class="ln" d="M1290 675 L1290 950" fill="none"/>
+<path class="ln" d="M1345 640 L1378 640" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="1362" y="630.0" text-anchor="middle" dominant-baseline="central" font-size="10">UPLOAD</text>
+<path class="ln" d="M1290 790 L1378 790" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="1334" y="780.0" text-anchor="middle" dominant-baseline="central" font-size="10">SEND</text>
+<path class="ln" d="M1290 950 L1378 950" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="1334" y="940.0" text-anchor="middle" dominant-baseline="central" font-size="10">POLL</text>
+<rect class="proc" x="1380" y="615" width="140" height="50" rx="4"/>
+<text class="t" x="1450.0" y="632.5" text-anchor="middle" dominant-baseline="central" font-size="12">Upload attachment</text>
+<text class="t" x="1450.0" y="647.5" text-anchor="middle" dominant-baseline="central" font-size="12">PDF</text>
+<rect class="proc" x="1555" y="615" width="180" height="50" rx="4"/>
+<text class="t" x="1645.0" y="633.0" text-anchor="middle" dominant-baseline="central" font-size="11">Save temp URL, drop PDF</text>
+<text class="t" x="1645.0" y="647.0" text-anchor="middle" dominant-baseline="central" font-size="11">state SEND, due +1s</text>
+<path class="ln" d="M1520 640 L1553 640" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="1537" y="630.0" text-anchor="middle" dominant-baseline="central" font-size="10">2xx</text>
+<polygon class="dec" points="1440,755.0 1500.0,790 1440,825.0 1380.0,790"/>
+<text class="t" x="1440" y="783.5" text-anchor="middle" dominant-baseline="central" font-size="10">Already sent?</text>
+<text class="t" x="1440" y="796.5" text-anchor="middle" dominant-baseline="central" font-size="10">lookup by MID</text>
+<rect class="proc" x="1530" y="765" width="140" height="50" rx="4"/>
+<text class="t" x="1600.0" y="783.0" text-anchor="middle" dominant-baseline="central" font-size="11">Send job</text>
+<text class="t" x="1600.0" y="797.0" text-anchor="middle" dominant-baseline="central" font-size="11">temp URL, ref = MID</text>
+<path class="ln" d="M1500 790 L1528 790" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="1514" y="780.0" text-anchor="middle" dominant-baseline="central" font-size="10">No</text>
+<rect class="proc" x="1700" y="765" width="180" height="50" rx="4"/>
+<text class="t" x="1790.0" y="783.0" text-anchor="middle" dominant-baseline="central" font-size="11">Save jobId</text>
+<text class="t" x="1790.0" y="797.0" text-anchor="middle" dominant-baseline="central" font-size="11">state POLL, due +5–7s</text>
+<path class="ln" d="M1670 790 L1698 790" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="1685" y="780.0" text-anchor="middle" dominant-baseline="central" font-size="10">2xx</text>
+<path class="ln" d="M1440 755 L1440 735 L1790 735 L1790 763" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="1615" y="725.0" text-anchor="middle" dominant-baseline="central" font-size="11">Yes: reuse existing jobId</text>
+<text class="lbl" x="1600" y="832.0" text-anchor="middle" dominant-baseline="central" font-size="11">4xx URL expired → state UPLOAD</text>
+<rect class="proc" x="1380" y="925" width="130" height="50" rx="4"/>
+<text class="t" x="1445.0" y="942.5" text-anchor="middle" dominant-baseline="central" font-size="12">Get job status</text>
+<text class="t" x="1445.0" y="957.5" text-anchor="middle" dominant-baseline="central" font-size="12">jobId</text>
+<polygon class="dec" points="1590,915.0 1645.0,950 1590,985.0 1535.0,950"/>
+<text class="t" x="1590" y="942.5" text-anchor="middle" dominant-baseline="central" font-size="12">Fax</text>
+<text class="t" x="1590" y="957.5" text-anchor="middle" dominant-baseline="central" font-size="12">status?</text>
+<path class="ln" d="M1510 950 L1533 950" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="1590" y="898.0" text-anchor="middle" dominant-baseline="central" font-size="11">↻ Pending: due +5–7s, back off to 30s</text>
+<rect class="proc" x="1680" y="925" width="140" height="50" rx="4"/>
+<text class="t" x="1750.0" y="942.5" text-anchor="middle" dominant-baseline="central" font-size="12">Delivered</text>
+<text class="t" x="1750.0" y="957.5" text-anchor="middle" dominant-baseline="central" font-size="12">delete entry</text>
+<path class="ln" d="M1645 950 L1678 950" fill="none" marker-end="url(#ah)"/>
+<path class="ln" d="M1590 985 L1590 1000" fill="none"/>
+<path class="ln" d="M1470 1000 L1850 1000" fill="none"/>
+<path class="ln" d="M1470 1000 L1470 1013" fill="none" marker-end="url(#ah)"/>
+<path class="ln" d="M1665 1000 L1665 1013" fill="none" marker-end="url(#ah)"/>
+<path class="ln" d="M1850 1000 L1850 1013" fill="none" marker-end="url(#ah)"/>
+<rect class="proc" x="1380" y="1015" width="180" height="40" rx="4"/>
+<text class="t" x="1470.0" y="1028.0" text-anchor="middle" dominant-baseline="central" font-size="11">Busy / no answer</text>
+<text class="t" x="1470.0" y="1042.0" text-anchor="middle" dominant-baseline="central" font-size="11">state SEND, max M resends</text>
+<rect class="nb" x="1585" y="1015" width="160" height="40" rx="4"/>
+<text class="t" x="1665.0" y="1028.0" text-anchor="middle" dominant-baseline="central" font-size="11">Invalid number etc.</text>
+<text class="t" x="1665.0" y="1042.0" text-anchor="middle" dominant-baseline="central" font-size="11">FAILED → error topic</text>
+<rect class="store" x="1770" y="1015" width="165" height="40" rx="4"/>
+<text class="t" x="1852.5" y="1028.0" text-anchor="middle" dominant-baseline="central" font-size="11">No final status in 30m</text>
+<text class="t" x="1852.5" y="1042.0" text-anchor="middle" dominant-baseline="central" font-size="11">alert, check manually</text>
+<rect class="topic" x="1960" y="760" width="135" height="60" rx="30.0"/>
+<path class="topicarc" d="M1990.0 760 A15.0 30.0 0 0 1 1990.0 820" fill="none"/>
+<text class="t" x="2036.5" y="782.5" text-anchor="middle" dominant-baseline="central" font-size="12">Fax status</text>
+<text class="t" x="2036.5" y="797.5" text-anchor="middle" dominant-baseline="central" font-size="12">topic</text>
+<path class="eb2" d="M1735 640 L2027 640" fill="none"/>
+<path class="eb2" d="M2027 640 L2027 758" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="1880" y="630.0" text-anchor="middle" dominant-baseline="central" font-size="10">UPLOADED</text>
+<path class="eb2" d="M1880 790 L1958 790" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="1919" y="780.0" text-anchor="middle" dominant-baseline="central" font-size="10">SUBMITTED</text>
+<path class="eb2" d="M1820 950 L2027 950" fill="none"/>
+<path class="eb2" d="M2027 950 L2027 822" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="1925" y="940.0" text-anchor="middle" dominant-baseline="central" font-size="10">DELIVERED</text>
+<text class="lbl" x="2027" y="845.0" text-anchor="middle" dominant-baseline="central" font-size="10">+ FAILED, UNKNOWN</text>
+<rect class="proc" x="815" y="725" width="140" height="46" rx="4"/>
+<text class="t" x="885.0" y="741.0" text-anchor="middle" dominant-baseline="central" font-size="11">Step call failed</text>
+<text class="t" x="885.0" y="755.0" text-anchor="middle" dominant-baseline="central" font-size="11">any of the 4 calls</text>
+<polygon class="dec" points="1060,716.0 1120.0,748 1060,780.0 1000.0,748"/>
+<text class="t" x="1060" y="741.0" text-anchor="middle" dominant-baseline="central" font-size="11">Classify</text>
+<text class="t" x="1060" y="755.0" text-anchor="middle" dominant-baseline="central" font-size="11">error</text>
+<path class="ln" d="M955 748 L998 748" fill="none" marker-end="url(#ah)"/>
+<path class="ln" d="M1060 780 L1060 1035" fill="none"/>
+<rect class="dec" x="830" y="795" width="200" height="40" rx="4"/>
+<text class="t" x="930.0" y="808.0" text-anchor="middle" dominant-baseline="central" font-size="11">Transient: 5xx, 429, timeout</text>
+<text class="t" x="930.0" y="822.0" text-anchor="middle" dominant-baseline="central" font-size="11">attempts+1, backoff, same state</text>
+<path class="ln" d="M1060 815 L1032 815" fill="none" marker-end="url(#ah)"/>
+<rect class="nb" x="830" y="850" width="200" height="40" rx="4"/>
+<text class="t" x="930.0" y="863.0" text-anchor="middle" dominant-baseline="central" font-size="11">Attempts ≥ max</text>
+<text class="t" x="930.0" y="877.0" text-anchor="middle" dominant-baseline="central" font-size="11">DLQ topic + alert</text>
+<path class="ln" d="M1060 870 L1032 870" fill="none" marker-end="url(#ah)"/>
+<rect class="nb" x="830" y="905" width="200" height="40" rx="4"/>
+<text class="t" x="930.0" y="918.0" text-anchor="middle" dominant-baseline="central" font-size="11">4xx data: bad PDF, bad number</text>
+<text class="t" x="930.0" y="932.0" text-anchor="middle" dominant-baseline="central" font-size="11">error topic, delete entry</text>
+<path class="ln" d="M1060 925 L1032 925" fill="none" marker-end="url(#ah)"/>
+<rect class="bl" x="830" y="960" width="200" height="40" rx="4"/>
+<text class="t" x="930.0" y="973.0" text-anchor="middle" dominant-baseline="central" font-size="11">Login fail, 403, TLS</text>
+<text class="t" x="930.0" y="987.0" text-anchor="middle" dominant-baseline="central" font-size="11">blocking → breaker</text>
+<path class="ln" d="M1060 980 L1032 980" fill="none" marker-end="url(#ah)"/>
+<rect class="store" x="830" y="1015" width="200" height="40" rx="4"/>
+<text class="t" x="930.0" y="1028.0" text-anchor="middle" dominant-baseline="central" font-size="11">Breaker refused the call</text>
+<text class="t" x="930.0" y="1042.0" text-anchor="middle" dominant-baseline="central" font-size="11">entry untouched, no attempt</text>
+<path class="ln" d="M1060 1035 L1032 1035" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="805" y="1078.0" text-anchor="start" dominant-baseline="central" font-size="11">Every state change, forward and status event commits in one exactly-once transaction.</text>
+<rect class="note" x="30" y="385" width="300" height="58" rx="4"/>
+<text class="t" x="180.0" y="407.0" text-anchor="middle" dominant-baseline="central" font-size="11">Breaker counts: 5xx, 429, timeouts, login fails.</text>
+<text class="t" x="180.0" y="421.0" text-anchor="middle" dominant-baseline="central" font-size="11">Ignores 4xx data errors and a single 401.</text>
+<rect class="note" x="600" y="520" width="120" height="30" rx="4"/>
+<text class="t" x="660.0" y="535.0" text-anchor="middle" dominant-baseline="central" font-size="11">Connection config</text>
+<rect class="note" x="600" y="558" width="120" height="30" rx="4"/>
+<text class="t" x="660.0" y="573.0" text-anchor="middle" dominant-baseline="central" font-size="11">Slow call config</text>
+<rect class="bl" x="380" y="500" width="180" height="50" rx="4"/>
+<text class="t" x="470.0" y="517.0" text-anchor="middle" dominant-baseline="central" font-size="13">Circuit breaker</text>
+<text class="t" x="470.0" y="533.0" text-anchor="middle" dominant-baseline="central" font-size="13">closed</text>
+<polygon class="dec" points="470,605.0 520.0,640 470,675.0 420.0,640"/>
+<text class="t" x="470" y="640.0" text-anchor="middle" dominant-baseline="central" font-size="12">Open?</text>
+<path class="ln" d="M470 550 L470 603" fill="none" marker-end="url(#ah)"/>
+<rect class="proc" x="280" y="620" width="115" height="42" rx="4"/>
+<text class="t" x="337.5" y="633.5" text-anchor="middle" dominant-baseline="central" font-size="12">Shut down</text>
+<text class="t" x="337.5" y="648.5" text-anchor="middle" dominant-baseline="central" font-size="12">all bindings</text>
+<path class="ln" d="M420 640 L397 640" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="408" y="630.0" text-anchor="middle" dominant-baseline="central" font-size="11">Yes</text>
+<polygon class="dec" points="160,605.0 210.0,640 160,675.0 110.0,640"/>
+<text class="t" x="160" y="632.5" text-anchor="middle" dominant-baseline="central" font-size="12">Half</text>
+<text class="t" x="160" y="647.5" text-anchor="middle" dominant-baseline="central" font-size="12">open</text>
+<path class="ln" d="M280 640 L212 640" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="246" y="630.0" text-anchor="middle" dominant-baseline="central" font-size="11">10 min</text>
+<text class="lbl" x="160" y="592.0" text-anchor="middle" dominant-baseline="central" font-size="11">Fail: open again</text>
+<rect class="proc" x="100" y="710" width="120" height="44" rx="4"/>
+<text class="t" x="160.0" y="724.5" text-anchor="middle" dominant-baseline="central" font-size="12">Start bindings</text>
+<text class="t" x="160.0" y="739.5" text-anchor="middle" dominant-baseline="central" font-size="12">small N probe</text>
+<path class="ln" d="M160 675 L160 708" fill="none" marker-end="url(#ah)"/>
+<path class="ln" d="M100 732 L60 732 L60 525 L378 525" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="220" y="515.0" text-anchor="middle" dominant-baseline="central" font-size="11">Probe succeeds: closed</text>
+<polygon class="dec" points="470,755.0 525.0,790 470,825.0 415.0,790"/>
+<text class="t" x="470" y="790.0" text-anchor="middle" dominant-baseline="central" font-size="12">Flaking?</text>
+<path class="ln" d="M470 675 L470 753" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="478" y="715.0" text-anchor="start" dominant-baseline="central" font-size="11">Opens &gt; X per hour</text>
+<rect class="alert" x="300" y="772" width="80" height="36" rx="4"/>
+<text class="t" x="340.0" y="790.0" text-anchor="middle" dominant-baseline="central" font-size="12">Alert</text>
+<path class="ln" d="M415 790 L382 790" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="398" y="780.0" text-anchor="middle" dominant-baseline="central" font-size="11">Yes</text>
+<rect class="store" x="190" y="772" width="80" height="36" rx="4"/>
+<text class="t" x="230.0" y="790.0" text-anchor="middle" dominant-baseline="central" font-size="12">Support</text>
+<path class="ln" d="M300 790 L272 790" fill="none" marker-end="url(#ah)"/>
+<text class="lbl" x="30" y="860.0" text-anchor="start" dominant-baseline="central" font-size="12">Bindings stopped → punctuator stops too.</text>
+<text class="lbl" x="30" y="878.0" text-anchor="start" dominant-baseline="central" font-size="12">Pending store stays on disk; no attempts burned while open.</text>
+<rect class="nb" x="900" y="1110" width="16" height="16" rx="3"/>
+<text class="lbl" x="922" y="1118.0" text-anchor="start" dominant-baseline="central" font-size="11">Non-blocking error → error topic</text>
+<rect class="bl" x="1120" y="1110" width="16" height="16" rx="3"/>
+<text class="lbl" x="1142" y="1118.0" text-anchor="start" dominant-baseline="central" font-size="11">Blocking error → breaker</text>
+<rect class="dec" x="1340" y="1110" width="16" height="16" rx="3"/>
+<text class="lbl" x="1362" y="1118.0" text-anchor="start" dominant-baseline="central" font-size="11">Decision / retriable</text>
+<rect class="proc" x="1560" y="1110" width="16" height="16" rx="3"/>
+<text class="lbl" x="1582" y="1118.0" text-anchor="start" dominant-baseline="central" font-size="11">Processing</text>
+</svg></div></body></html>
