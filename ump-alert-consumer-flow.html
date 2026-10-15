@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UMP alert consumer flow</title>
+<style>
+:root{--bg:#ffffff;--text:#2C2C2A;--muted:#5F5E5A;--line:#888780;--box-fill:#F1EFE8;--box-stroke:#B4B2A9;--teal-fill:#E1F5EE;--teal-stroke:#0F6E56;--teal-t:#085041;--teal-s:#0F6E56;--coral-fill:#FAECE7;--coral-stroke:#993C1D;--coral-t:#712B13;--coral-s:#993C1D;color-scheme:light}
+@media (prefers-color-scheme: dark){:root{--bg:#1f1f1e;--text:#F1EFE8;--muted:#B4B2A9;--line:#888780;--box-fill:#2C2C2A;--box-stroke:#5F5E5A;--teal-fill:#085041;--teal-stroke:#5DCAA5;--teal-t:#E1F5EE;--teal-s:#9FE1CB;--coral-fill:#712B13;--coral-stroke:#F0997B;--coral-t:#FAECE7;--coral-s:#F5C4B3;color-scheme:dark}}
+body{margin:0;background:var(--bg);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:24px}
+.wrap{overflow-x:auto}
+svg{display:block;min-width:1100px;width:100%;height:auto}
+.th{font-size:14px;font-weight:500;fill:var(--text)}
+.ts{font-size:12px;fill:var(--muted)}
+.box{fill:var(--box-fill);stroke:var(--box-stroke)}
+.teal rect{fill:var(--teal-fill);stroke:var(--teal-stroke)}
+.teal .th{fill:var(--teal-t)}.teal .ts{fill:var(--teal-s)}
+.coral rect{fill:var(--coral-fill);stroke:var(--coral-stroke)}
+.coral .th{fill:var(--coral-t)}.coral .ts{fill:var(--coral-s)}
+.arr,.ln{stroke:var(--line);stroke-width:1.5;fill:none}
+.mk{stroke:var(--line)}
+.frame{fill:none;stroke:var(--line);stroke-width:1;stroke-dasharray:5 4}
+</style>
+</head>
+<body>
+<div class="wrap">
+<svg viewBox="0 0 1470 690" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>UMP alert consumer with circuit breaker, left to right</title>
+<desc>Records from pants_real_time_processed are filtered to preference EMAIL, mapped to the CND template and posted to UMP /alertevent through retry and a circuit breaker. Responses are classified into success, 400, auth failure and transient failure. Transient and auth failures feed a per-pod circuit breaker that pauses the consumer.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path class="mk" d="M2 1L8 5L2 9" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g text-anchor="middle" dominant-baseline="central">
+
+<rect class="box" x="40" y="122" width="240" height="56" rx="8" stroke-width="0.5"/><text class="th" x="160" y="140">pants_real_time_processed</text><text class="ts" x="160" y="160">Source topic</text>
+<line x1="280" y1="150" x2="318" y2="150" class="arr" marker-end="url(#arrow)"/>
+<rect class="box" x="320" y="122" width="180" height="56" rx="8" stroke-width="0.5"/><text class="th" x="410" y="140">Filter preference</text><text class="ts" x="410" y="160">EMAIL only</text>
+<line x1="500" y1="150" x2="538" y2="150" class="arr" marker-end="url(#arrow)"/>
+<rect class="box" x="540" y="122" width="200" height="56" rx="8" stroke-width="0.5"/><text class="th" x="640" y="140">Map to CND template</text><text class="ts" x="640" y="160">Alert event payload</text>
+<line x1="740" y1="150" x2="778" y2="150" class="arr" marker-end="url(#arrow)"/>
+<rect class="box" x="780" y="122" width="210" height="56" rx="8" stroke-width="0.5"/><text class="th" x="885" y="140">POST UMP /alertevent</text><text class="ts" x="885" y="160">Via retry and breaker</text>
+<line x1="990" y1="150" x2="1028" y2="150" class="arr" marker-end="url(#arrow)"/>
+<rect class="box" x="1030" y="122" width="160" height="56" rx="8" stroke-width="0.5"/><text class="th" x="1110" y="140">Classify response</text><text class="ts" x="1110" y="160">By HTTP status</text>
+
+<line x1="410" y1="178" x2="410" y2="220" class="arr" marker-end="url(#arrow)"/>
+<rect class="box" x="320" y="222" width="180" height="56" rx="8" stroke-width="0.5"/><text class="th" x="410" y="240">Skip, commit</text><text class="ts" x="410" y="260">Not EMAIL</text>
+<line x1="640" y1="178" x2="640" y2="220" class="arr" marker-end="url(#arrow)"/>
+<g class="coral"><rect x="540" y="222" width="200" height="56" rx="8" stroke-width="0.5"/><text class="th" x="640" y="240">Mapping error</text><text class="ts" x="640" y="260">Log, commit</text></g>
+
+<path class="ln" d="M1190 150 L1205 150"/><path class="ln" d="M1205 58 L1205 274"/>
+<line x1="1205" y1="58" x2="1223" y2="58" class="arr" marker-end="url(#arrow)"/>
+<line x1="1205" y1="130" x2="1223" y2="130" class="arr" marker-end="url(#arrow)"/>
+<line x1="1205" y1="202" x2="1223" y2="202" class="arr" marker-end="url(#arrow)"/>
+<line x1="1205" y1="274" x2="1223" y2="274" class="arr" marker-end="url(#arrow)"/>
+<g class="teal"><rect x="1225" y="30" width="170" height="56" rx="8" stroke-width="0.5"/><text class="th" x="1310" y="48">2xx success</text><text class="ts" x="1310" y="68">Log alert id, commit</text></g>
+<g class="coral"><rect x="1225" y="102" width="170" height="56" rx="8" stroke-width="0.5"/><text class="th" x="1310" y="120">400</text><text class="ts" x="1310" y="140">Log, commit</text></g>
+<g class="coral"><rect x="1225" y="174" width="170" height="56" rx="8" stroke-width="0.5"/><text class="th" x="1310" y="192">401 / 403</text><text class="ts" x="1310" y="212">Force open, alert</text></g>
+<g class="coral"><rect x="1225" y="246" width="170" height="56" rx="8" stroke-width="0.5"/><text class="th" x="1310" y="264">Transient</text><text class="ts" x="1310" y="284">5xx 429 timeout</text></g>
+<line x1="1310" y1="302" x2="1310" y2="328" class="arr" marker-end="url(#arrow)"/>
+<g class="coral"><rect x="1225" y="330" width="170" height="56" rx="8" stroke-width="0.5"/><text class="th" x="1310" y="348">Retries exhausted</text><text class="ts" x="1310" y="368">Seek back, no commit</text></g>
+<line x1="1310" y1="386" x2="1310" y2="418" class="arr" marker-end="url(#arrow)"/>
+<path class="arr" d="M1395 202 L1412 202 L1412 418" marker-end="url(#arrow)"/>
+
+<rect class="frame" x="40" y="420" width="1390" height="230" rx="12"/>
+<text class="th" x="60" y="446" text-anchor="start">Circuit breaker, per pod</text>
+<g class="teal"><rect x="60" y="482" width="160" height="56" rx="8" stroke-width="0.5"/><text class="th" x="140" y="500">Closed</text><text class="ts" x="140" y="520">Normal flow</text></g>
+<line x1="220" y1="510" x2="258" y2="510" class="arr" marker-end="url(#arrow)"/>
+<g class="coral"><rect x="260" y="482" width="180" height="56" rx="8" stroke-width="0.5"/><text class="th" x="350" y="500">Open</text><text class="ts" x="350" y="520">Pause container</text></g>
+<line x1="440" y1="510" x2="478" y2="510" class="arr" marker-end="url(#arrow)"/>
+<rect class="box" x="480" y="482" width="170" height="56" rx="8" stroke-width="0.5"/><text class="th" x="565" y="500">Wait 5 min</text><text class="ts" x="565" y="520">Kafka buffers</text>
+<line x1="650" y1="510" x2="688" y2="510" class="arr" marker-end="url(#arrow)"/>
+<rect class="box" x="690" y="482" width="180" height="56" rx="8" stroke-width="0.5"/><text class="th" x="780" y="500">Half-open</text><text class="ts" x="780" y="520">Resume, N probes</text>
+<path class="ln" d="M870 510 L895 510"/><path class="ln" d="M895 470 L895 550"/>
+<line x1="895" y1="470" x2="918" y2="470" class="arr" marker-end="url(#arrow)"/>
+<line x1="895" y1="550" x2="918" y2="550" class="arr" marker-end="url(#arrow)"/>
+<g class="teal"><rect x="920" y="442" width="190" height="56" rx="8" stroke-width="0.5"/><text class="th" x="1015" y="460">Probes pass</text><text class="ts" x="1015" y="480">↻ close, drain lag</text></g>
+<g class="coral"><rect x="920" y="522" width="190" height="56" rx="8" stroke-width="0.5"/><text class="th" x="1015" y="540">Probes fail</text><text class="ts" x="1015" y="560">↻ back to open</text></g>
+<line x1="350" y1="538" x2="350" y2="572" class="arr" marker-end="url(#arrow)"/>
+<g class="coral"><rect x="255" y="574" width="190" height="56" rx="8" stroke-width="0.5"/><text class="th" x="350" y="592">Page support</text><text class="ts" x="350" y="612">Open 30m+, or flapping</text></g>
+</g>
+</svg>
+</div>
+</body>
+</html>
