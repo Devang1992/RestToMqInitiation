@@ -1,0 +1,9 @@
+Todo: close the ticket 
+
+Ump: will be using Ckafka, for the failure, and will log and alert on the failed one
+
+Righfax: same the one that can not be copleted, will be alerted and logged
+
+
+UMP exponentially back off
+Righfax save in state store. 
