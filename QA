@@ -1,0 +1,79 @@
+Create detailed flow diagrams for our <FLOW NAME> flows. Accuracy matters more than looks: draw ONLY what the code and config actually do, and read the code first. Use the real values (timeouts, intervals, retry counts, statuses) from the code/config. Anything you are unsure about goes in the diagram as "ASSUMPTION:" text.
+
+Tooling
+- If docs/diagrams/svgkit.py exists in the repo, reuse it: write a new <flow>_flow.py with a build() function, plus a generate.py that writes <flow>-flow.svg.
+- Otherwise write a small dependency-free Python module that emits SVG. Give it helpers for: box (rounded rect), pill (rounded-end rect for outcomes), diamond (decision), cylinder (Kafka topic / state store), group (dashed panel with a title), arrow (orthogonal polyline with an arrowhead and an optional label on a background chip), note (text lines supporting **bold** segments), legend.
+- Text inside shapes is multi-line: first line bold, the rest smaller. Font: "Segoe UI, Inter, Helvetica Neue, Arial, sans-serif", 11-13px.
+- Place every coordinate by hand on a rough grid. Do not use auto-layout; it makes unreadable diagrams for flows like this.
+- Output SVG (opens in any browser; can be embedded in HTML or markdown). If an HTML page is wanted, wrap the SVG inline in a single self-contained HTML file.
+
+Visual language (dark theme, colour = meaning, keep it consistent)
+- background #17181d
+- processing step: fill #1d3527, stroke #4caf6a
+- decision (diamond): fill #2a2342, stroke #9b87d6
+- HTTP / external call: fill #1a2a40, stroke #6aa9f0
+- terminal failure, logged ERROR: fill #3b1c27, stroke #e0637f
+- success / outcome log: fill #14333a, stroke #3fb6c2
+- retry / deferred / backoff: fill #332d14, stroke #d8bd4c
+- circuit breaker: fill #3b2717, stroke #e8913f
+- state store: fill #262b33, stroke #9aa6b6
+- Kafka topic: fill #16273b, stroke #4f8fd6
+- note: fill #202228, stroke #4b5160
+- edges:
+  - normal flow: #a3acba solid
+  - failure: #e0637f solid
+  - retry/loop: #d8bd4c dashed 6,4
+  - breaker event: #e8913f dashed
+  - store read/write: #7f8a9b dashed 4,4
+  - success: #4caf6a
+
+Layout recipe
+- Title (26px bold) plus a one-line subtitle stating the key guarantees (e.g. delivery semantics, "no DLQ: failures are logged with ...").
+- Top row, left to right: the happy path from the Kafka topic to the final success outcome.
+- Failures drop straight down from the step that produces them into error boxes. Merge them into a single terminal outcome pill where they share the same handling.
+- Below the main row: the retry / error-handling section, with the loop drawn back to where processing resumes.
+- A separate panel for the circuit breaker state machine: CLOSED -> OPEN -> HALF_OPEN -> CLOSED/OPEN, with what each state does to the flow (pause consumer, park records, skip punctuation...).
+- For Kafka Streams: the state store as a cylinder, and a punctuator panel showing tick, checks, scan, per-stage dispatch, each outcome, and reschedule.
+- A notes panel with settings and guarantees: commit mode, timeouts, poll interval, offset reset, shutdown, and the config knobs that change behaviour.
+- Legend at the bottom.
+- Every decision diamond has every branch labelled ("yes"/"no", status codes). Every branch ends in a terminal outcome or a loop; nothing dangles.
+- Outcome pills show the log outcome name and level, e.g. "FINAL_TIMEOUT (ERROR)".
+
+Verification loop (do not skip)
+- Render the SVG to PNG (cairosvg, or a headless browser) and look at it.
+- Fix overlapping boxes, text running outside its shape, arrows crossing through boxes, labels sitting on lines, and panels overlapping each other.
+- Repeat until clean. Then re-check every element against the code once more: no invented steps, no missing branches.
+
+Please answer these about our RightFax Kafka Streams flow. For each answer give the actual value and the file or config property where it is set. If something is not configured, say "default" and name the default.
+
+Kafka Streams settings
+1. processing.guarantee: at_least_once or exactly_once_v2?
+2. If exactly_once_v2: what is the producer transaction.timeout.ms? (Streams defaults it to 10s under EOS; a blocking call longer than that aborts the transaction and the record is reprocessed.)
+3. max.poll.interval.ms and max.poll.records for the main consumer.
+4. commit.interval.ms (at_least_once default is 30s).
+5. num.stream.threads, num.standby.replicas, and the StreamsUncaughtExceptionHandler response (REPLACE_THREAD / SHUTDOWN_CLIENT / SHUTDOWN_APPLICATION).
+6. Is a processing exception handler or deserialization exception handler configured? Which one?
+
+The 3-call unit (login, upload attachment, send job)
+7. For each call: connect timeout, response/read timeout, and any overall per-call timeout. Where do the "60s" and "30s" values we have come from, and what does each one control?
+8. Where does the retry/backoff run: inline inside process() (Spring Retry, Reactor retryWhen, a loop with sleep), or is the failed record parked in the state store and retried later by the punctuator?
+9. Max attempts, backoff intervals, and the maximum total time one record can spend inside process() including all retries. Compare that number to max.poll.interval.ms and (if EOS) transaction.timeout.ms.
+10. On retry, does it restart from login/upload (fresh temp URL), or does it only repeat the call that failed?
+11. Is login done on every attempt, or is the rf-session cookie cached? If cached: TTL, and what happens on a 401.
+12. Which failures are retried? List HTTP statuses and exception types (connect refused, read timeout, 500, 502/503/504, 4xx).
+13. What happens when retries are exhausted: log and drop, store for later, or throw out of process()?
+14. If send-job returns 2xx but the job id cannot be read from the response, what happens? (A retry here guarantees a duplicate fax.)
+15. Is there a circuit breaker? Which calls does it wrap, what counts as a failure, and what happens to new records while it is open?
+
+Temp URL
+16. How long is the OpenText temp attachment URL valid? Can a retry delay ever push the send-job call past that?
+
+State store and punctuator
+17. Store name and type (persistent/in-memory), changelog on/off, key, and what the value contains.
+18. Punctuation type (WALL_CLOCK_TIME or STREAM_TIME) and interval (30s?).
+19. Per tick: are all stored jobs polled every time, or does each job have its own next-poll time / backoff? Is there a limit on calls or time per tick?
+20. Status GET: timeout, retry behaviour inside the punctuator, and which statuses are treated as final success / final failure.
+21. Max age before giving up on a job (2-3h?), and what is logged and deleted when it is reached.
+
+Logging
+22. On each terminal outcome (sent, failed, timed out, dropped), what is logged, and does the line include the MID, topic/partition/offset and the Kafka headers?
