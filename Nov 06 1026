@@ -1,0 +1,86 @@
+STORE RULE
+- Normal case (breaker closed, submit ok): store ONLY the POLL entry with jobId.
+- SUBMIT entry is created ONLY when: breaker is OPEN, or the submit failed transiently/ambiguously.
+- Permanent failure: store nothing, ERROR log.
+- Final status: log + delete. Store = pending work only.
+
+FAX FLOW - KAFKA STREAMS BASE DESIGN
+
+TOPOLOGY
+source topic -> filter (header PREFERENCE=FAX) -> FaxProcessor [store: fax-store]
+non-FAX -> drop (counter only)
+
+STORE  fax-store  (one store, changelog on)
+key   = source topic-partition-offset (or MID)
+value = stage            SUBMIT | POLL_JOB | POLL_DOCS
+        mid, origin      for logs
+        payload          original message (SUBMIT only, removed after send)
+        firstSeenAt      record timestamp -> submit deadline
+        attempt, ambiguousSends
+        jobId, submittedAt -> poll deadline
+        nextAttemptAt
+        lastStatus, lastError
+Store = pending work only. Final result -> log + delete entry.
+
+PROCESS() - new message
+1. breaker OPEN?          -> store SUBMIT (nextAttemptAt=now), no call
+2. try submit:
+   session cookie -> upload attachment -> sendJob (back to back, temp URL never stored)
+   ok                     -> store POLL_JOB (jobId, nextAttemptAt=now+30s)
+   transient              -> store SUBMIT (nextAttemptAt=now+backoff)
+   sendJob outcome unknown-> store SUBMIT, ambiguousSends+1 (log POSSIBLE_DUPLICATE)
+   permanent / bad data   -> ERROR log, store nothing
+3. never throw for a classified failure (no thread kill)
+
+PUNCTUATOR - WALL_CLOCK every 15-30s
+1. breaker OPEN?          -> skip tick
+2. collect due entries (nextAttemptAt <= now), close iterator before any HTTP call
+3. order: SUBMIT first, then POLL, oldest first
+4. loop until time budget (e.g. 60s) or call cap:
+   SUBMIT:
+     past submit deadline        -> ERROR SUBMIT_EXPIRED, delete
+     ambiguousSends >= 2         -> ERROR SUBMISSION_UNCERTAIN, delete
+     retry submit (same as process step 2), update entry right after the call
+   POLL_JOB / POLL_DOCS:
+     GET job (+ GET documents when job succeeded, same step)
+     all docs Succeeded          -> INFO DELIVERED, delete
+     Failed / Canceled           -> ERROR FAILED_FINAL_STATUS, delete
+     pending / transient error   -> past poll deadline? ERROR FINAL_TIMEOUT, delete
+                                    else nextAttemptAt = now + poll delay
+     404 / 4xx                   -> 404 within 2m of submit: recheck; else ERROR, delete
+
+SESSION (shared, thread-safe)
+- login once, cache rf-session cookie, reuse for every call
+- 401 / redirect / HTML page -> re-login once, repeat call
+- fails again -> credential error -> auth breaker (no login for 10m, avoids account lockout)
+- single-flight login (one thread logs in, others wait)
+
+BACKOFF
+retry: min(10m, 30s x 2^attempt) x random(0.7-1.3)
+breaker OPEN wait: 60s -> 2m -> 4m ... cap 10m, jittered
+
+ERROR CLASSES
+not processed (retry):  connect refused/timeout, 408, 429, 503
+ambiguous (retry, count): response timeout, reset, 500, 502, 504
+permanent (no retry):   other 4xx, bad data, template/PDF error
+2xx without jobId:      ERROR, never retry (would duplicate)
+
+LIMITS / CONFIG
+processing.guarantee  exactly_once_v2 (store + offset atomic)
+transaction.timeout   5m
+max.poll.interval     10m
+punctuation budget    60s (must stay well under both)
+submit deadline       e.g. 4h (business)
+poll deadline         e.g. 2h (business)
+max ambiguous sends   2
+
+LOGGING
+one line per outcome: outcome, MID, origin offset, stage, attempt, jobId, error
+terminal = DELIVERED or ERROR; retries = INFO
+metrics: store entries per stage, breaker state
+
+DO NOT
+- throw to retry (thread replace = no backoff + rebalance)
+- keep final results in the store
+- reset the Streams app while entries are pending
+- retry sendJob blindly after a 2xx without jobId
