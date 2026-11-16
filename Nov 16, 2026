@@ -1,0 +1,9 @@
+Quick follow-up on your suggestion to use Flux for the debtor/creditor preference calls. Setup again: Kafka Streams processor, one payload, two WebClient calls to the same endpoint (debtor account and creditor account) run in parallel. If the first endpoint returns no preference for an account, I call a second fallback endpoint for that account. Then I map the debtor result and the creditor result separately.
+
+Please answer each question in 1 to 2 sentences, numbered, no code unless it's essential.
+
+1. Why Flux over Mono.zip when there are exactly two calls and each result is handled differently? With flatMap the results come back in whatever order they finish, so how do you know which one is the debtor's and which is the creditor's?
+2. Where does the fallback call sit in your approach: per account inside each call, or after both primary calls return? Does the debtor's fallback have to wait for the creditor's call to finish?
+3. If one side comes back empty or throws an error, what happens to the other side's result?
+4. Kafka Streams handles each record synchronously, so how are you getting the result out: block(), with what timeout, and how does that fit with max.poll.interval.ms?
+5. Is there anything concrete that Flux gives here that Mono.zip doesn't?
