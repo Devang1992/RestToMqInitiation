@@ -1,0 +1,64 @@
+This list is ready to paste into your work AI. While writing it I found one issue I missed earlier, and it's the most serious, so it's item 1: a failed re-login or a 403 is classified PERMANENT, so a credential problem would delete every fax.
+
+Review planned-retry-low-level-design.md (RightFax planned retry flow) against the concerns below. For each one, answer: what the design does today, whether that is acceptable and why, and what change you would make, naming the section and class it touches. If my scenario is wrong for our code, say so and explain why.
+
+Must resolve before implementation
+
+1. Auth and systemic 4xx failures delete every fax (sections 9, 10, 11). If re-login plus the repeated call fails, section 9 classifies the result as PERMANENT, and 403 is also PERMANENT. PERMANENT means an ERROR log and a delete, and it doesn't count toward the availability breaker. So a rotated password, a locked service account or a permission change would turn every fax into a deleted ERROR within minutes, with no way to replay. The same applies to any 4xx caused by configuration rather than the record, such as a 404 or 415 on a submit endpoint. Questions: Should a failed re-login be BLOCKING (entry stays pending, no attempt charged, auth breaker opens, alert fires) instead of PERMANENT? If the repeated call fails for a non-auth reason, is it classified by that failure instead of defaulting to PERMANENT? Which 4xx codes are truly record-level (for example 413 for an oversized document) and which are systemic? Should a spike in PERMANENT results open a breaker instead of deleting entries?
+
+2. Crash after a successful send, before commit (sections 3, 12). POST /SendJobs returns a jobId, then the app crashes, rebalances or has its transaction aborted before the store write and offset commit. The transaction rolls back, and the record replays with no store entry and ambiguousSends at 0, so the fax is sent again. The ambiguity cap never sees this, because the send looked successful. Questions: Can RightFax ExternalJobId (deferred item 2) be used as a lookup or idempotency key before every submit? If yes, should that be required for this release instead of deferred? If not, what is the fallback, for example a marker written outside Kafka before POST /SendJobs?
+
+3. Transaction scope of a punctuator tick (sections 6, 12). Section 12 says the punctuator runs in separate Kafka transactions, and rule 8 says each result is written immediately. Written is not the same as committed. As far as I know, store writes made in a punctuation commit with the stream task's transaction after the punctuation returns, and context.commit() only requests a commit. If so, a crash late in a 60-second tick rolls back every SUBMIT to POLL_JOB transition in that tick, and each of those faxes is sent again. Questions: What is the real commit granularity? How many submits can one tick contain at the call cap? Should submits per tick be capped separately to limit the damage until item 2 is solved?
+
+4. Thread and transaction time budget (sections 12, 15 items 1 and 7). Inline submission blocks the StreamThread for login, upload and send, and a punctuator tick can block it for 60 seconds. Questions: What are the connect and read timeouts per call? What is the worst case for one inline record (all timeouts plus one re-login) and for one tick? Show that the longest gap between commits stays under transaction.timeout.ms (5 min) and the longest gap between polls stays under max.poll.interval.ms (10 min), including when RightFax is slow but the breaker hasn't opened yet. Exceeding either aborts the transaction or rebalances the group, which causes the duplicates in items 2 and 3. Define max-calls and chunk-size, and derive max.poll.records from these numbers instead of measuring it later. 10 to 20 looks high; 5 seems safer.
+
+5. Terminal outcomes are log-only (sections 1, 10). DELIVERED, FAILED_FINAL_STATUS, SUBMISSION_UNCERTAIN, DEADLINE_EXPIRED and permanent failures all end with a log line and a delete, and the source bytes go with the entry. Questions: Is log-only a deliberate decision, and who approved it? How does support resend a fax that expired or was uncertain? How does anything downstream learn the outcome? Would a status topic for every terminal outcome, plus a DLQ carrying the source for failures, be acceptable? Both would be topology sinks committed in the same transaction. If log-only stays, document the recovery procedure, for example replaying the source topic from the topic-partition-offset in the log line.
+
+6. 2xx from POST /SendJobs without a jobId (sections 3, 4, 9). This is logged as a permanent failure and never retried. Not retrying is right, but RightFax may have created the job, so the fax may still go out. Questions: Should this be its own uncertain outcome with an alert rather than a failure? Can ExternalJobId resolve it to a real jobId so it can be polled?
+
+7. Deadline expiry semantics (section 10). The four-hour deadline keeps running while the breaker is open and during polling. That causes two problems. An outage longer than the remaining window expires every pending fax at once on recovery. And a fax accepted at 3h50 gets ten minutes of polling, then ends as ERROR DEADLINE_EXPIRED even though it was probably delivered. Questions: Should expiry during polling (delivery unconfirmed) be a separate outcome from expiry before submit (never sent)? Is mass expiry after a long outage the intended business result? Confirm that no expiry path ever triggers an automatic resend.
+
+8. Polling starvation during recovery (section 6, rules 4 and 5). SUBMIT entries always come before polls. After an outage, a large SUBMIT backlog can use up every tick's budget, so accepted faxes go unpolled and drift toward the deadline. Questions: Should part of each tick's budget be reserved for POLL_JOB and POLL_DOCS? How long would a realistic backlog take to drain at the call cap?
+
+9. Auth breaker open behavior and login storms (section 11, deferred item 6). Questions: When rightfax-auth is open, what happens on the inline path, to SUBMIT entries in the punctuator, and to polls, which also need a session? Does it stop bindings like the availability breaker, or only block logins? Is the cookie refresh single-flight across all stream threads, so that many threads getting a 401 at once trigger one login rather than one per thread? Is the auth breaker threshold safely below RightFax's account lockout policy?
+
+Should resolve
+
+10. Duplicate input (deferred item 3). The store is keyed by topic-partition-offset, so the same MID at a different offset is a separate entry and a second fax. An offset reset or replay of the source topic would resend everything still in retention. Questions: When does the MID + ADVICE_SIDE dedup land, and until then is upstream guaranteed to send no duplicates? Is there a guard against a source-topic replay?
+
+11. Worst case under the ambiguity cap (sections 7, 9). With the cap at 2, a customer can receive two faxes from observed ambiguity, plus any crash duplicates from items 2 and 3. Questions: Has the business accepted that bound? Who is alerted on POSSIBLE_DUPLICATE and SUBMISSION_UNCERTAIN, and what do they do?
+
+12. Re-render on retry (section 7). A SUBMIT retry re-renders the document from the source. If a deploy changes the template or renderer during the four-hour window, or the template uses the current date or time, the retried fax differs from the first attempt. Question: Is that acceptable, or should the render inputs be pinned?
+
+13. Memory during the scan (section 6). Sorting due entries means holding every due entry in memory, and SUBMIT entries carry source bytes. After an outage that could be thousands of payloads per tick. Question: Does the scan collect only keys and sort fields, then load each entry when it's processed?
+
+14. PII in the changelog (deferred item 5). Source payloads sit in the changelog and in standby replicas while entries are pending, and deleted entries remain until compaction. Questions: What are the changelog's retention and compaction settings, who can read the topic, and who signs off?
+
+15. Retry-After on 503 (section 7). Only 429 honors Retry-After, but RightFax may send it with 503 too. Question: Should a valid Retry-After be honored for 503 as well, with the same 10-minute clamp?
+
+16. Observability is the only signal (observability section). Because outcomes are log-only, metrics and alerts are the only way anyone learns of failures, so they shouldn't be a follow-up. Question: Are there metrics and alerts for store size by stage, oldest pending age, breaker and auth breaker state, and the counts of DEADLINE_EXPIRED, SUBMISSION_UNCERTAIN, POSSIBLE_DUPLICATE and FAILED_FINAL_STATUS?
+
+17. Testing the crash windows. TopologyTestDriver can't simulate a transaction abort after an external call. Question: What integration test, against a real broker with an instance killed mid-send and mid-tick, will prove the behavior in items 2 and 3?
+
+## Notification service
+
+Making every PCSS call a GET helps a lot. Repeating a PCSS call has no side effects, so the hardest RightFax problems don't exist here. There's no ambiguity to track, no duplicate sends to an external system, and retrying the whole record is free. Every timeout and 5xx is just transient. Kafka Streams exactly-once covers the output topics, so the core design is sound.
+
+The risk moves to your output topics: an advice going out twice, or not at all. Five places to check:
+
+1. **The retry service needs transactions.** Retried records skip the MID dedup, so nothing catches a duplicate the retry service creates. If it produces to the retry topic and crashes before committing its offset, the record goes through twice and the customer gets two advices. Run consume, produce and commit in one Kafka transaction, or dedup retries on MID + RETRY_COUNT.
+2. **One error topic with mixed delays blocks itself.** If the retry service pauses until the head record is due, a record waiting 10 minutes holds up records behind it that are due in 30 seconds. Use one topic per delay tier, which is what Spring's `@RetryableTopic` does.
+3. **The 1-hour dedup purge must outlast retries.** If a record is still retrying when its MID is purged, an upstream duplicate arriving after that is processed too, and both go out. Keep the total retry window under an hour (30s, 1m, 2m, 5m and 10m is about 18 minutes), or refresh the MID on each retry.
+4. **A DLQ replay gets dropped by the dedup.** A DLQ record replayed within the hour is dropped as E02003. Replay into the retry topic, or with a header that bypasses dedup, and write that procedure down.
+5. **Breaker refusals must not use up retries.** The retry service increments RETRY_COUNT, so the error record needs a "not permitted" header that the retry service honors. Otherwise a single outage pushes everything to the DLQ.
+
+Two decisions to make on purpose:
+
+- **Partial failure.** If the debit side resolves and the credit side hits a non-transient error, the whole record goes to the DLQ, and the debit customer gets nothing until someone replays it. That may be right, but decide it deliberately.
+- **Systemic 4xx.** RightFax item 1 applies here too. A 401 or 403 from PCSS after a credential change would send every record to the DLQ. Treat those as blocking, so the breaker opens and an alert fires.
+
+Because PCSS calls are safe to repeat, there's also a cheap improvement: one or two quick in-thread retries, a few hundred milliseconds apart, before using the error topic. Most blips clear without a trip through the retry service.
+
+If you ever want fewer moving parts, the state-store approach from RightFax fits this service even better, since nothing here is unsafe to repeat. It would remove the retry service and retry topic, and with them items 1, 2 and 5. The error-topic design also works once those five are handled.
+
+If you want, I can turn the notification service points into a paste-ready list for your work AI as well.
